@@ -4,3 +4,4 @@ boto3
 psycopg2-binary
 httpx
 python-dotenv
+pandas

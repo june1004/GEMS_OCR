@@ -9,7 +9,7 @@ from typing import List, Optional
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
 from pydantic import BaseModel
-from sqlalchemy import create_backend_engine, Column, String, Integer, Float, DateTime, JSON, create_engine
+from sqlalchemy import Column, String, Integer, Float, DateTime, JSON, create_engine
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from botocore.config import Config

@@ -1,7 +1,8 @@
 fastapi
 uvicorn
-boto3
+sqlalchemy
 psycopg2-binary
+boto3
 httpx
-python-dotenv
 pandas
+python-dotenv

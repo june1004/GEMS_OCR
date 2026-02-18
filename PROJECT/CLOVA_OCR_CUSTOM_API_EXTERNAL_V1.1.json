@@ -1,0 +1,86 @@
+{
+  "swagger" : "2.0",
+  "info" : {
+    "description" : "",
+    "version" : "2020-09-17T10:00:59Z",
+    "title" : "external"
+  },
+  "host" : "",
+  "basePath" : "",
+  "schemes" : [ "https" ],
+  "security" : [ {
+    "x-ncp-apigw-api-key" : [ ]
+  } ],
+  "paths" : {
+    "/" : { },
+    "/{path+}" : {
+      "post" : {
+        "tags" : [ "aa" ],
+        "description" : "The path is the API path",
+        "consumes" : [ "application/json" ],
+        "produces" : [ "application/json" ],
+        "parameters" : [ {
+          "name" : "path+",
+          "in" : "path",
+          "description" : "path",
+          "required" : true,
+          "type" : "string",
+          "x-ncp-apigw-extended-variables" : true
+        }, {
+          "in" : "body",
+          "name" : "requestBody",
+          "description" : "custom api spec request body",
+          "required" : true,
+          "schema" : { }
+        }, {
+          "name" : "X-OCR-SECRET",
+          "in" : "header",
+          "description" : "The custom secret key",
+          "required" : true,
+          "type" : "string",
+          "x-ncp-parameter-is-logged" : false
+        } ],
+        "responses" : {
+          "200" : {
+            "description" : "success"
+          },
+          "400" : {
+            "description" : "request invalid"
+          },
+          "500" : {
+            "description" : "service error"
+          }
+        },
+        "x-ncp-apigw-use-body-when-formdata" : false,
+        "x-ncp-apigateway-filters" : {
+          "valid" : {
+            "type" : "NONE"
+          },
+          "apiKey" : {
+            "required" : false
+          },
+          "auth" : {
+            "platform" : "NONE"
+          }
+        },
+        "x-ncp-apigateway-endpoint" : {
+          "HTTP" : {
+            "stream" : true,
+            "method" : "POST",
+            "url" : "/{path}"
+          }
+        }
+      }
+    }
+  },
+  "securityDefinitions" : {
+    "x-ncp-apigw-api-key" : {
+      "type" : "apiKey",
+      "name" : "x-ncp-apigw-api-key",
+      "in" : "header"
+    }
+  },
+  "definitions" : {
+    "empty" : { }
+  }
+}

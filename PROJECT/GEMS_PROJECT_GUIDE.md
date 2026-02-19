@@ -12,7 +12,8 @@
 ## 3. 백엔드(FastAPI) 개발 단계
 ### Phase 1: 인프라 연동
 - [x] Coolify를 통한 PostgreSQL, MinIO 설치 및 도메인 연결
-- [x] MinIO CORS 설정 (easy.gwd.go.kr 허용)
+- [x] MinIO CORS 설정 (easy.gwd.go.kr 허용)  
+  - **로컬 개발 시**: storage-api.nanum.online 버킷(gems-receipts) CORS에 `http://localhost:5173` Origin 추가 필요. 없으면 presigned URL로 PUT 시 브라우저 CORS 에러 발생.
 
 ### Phase 2: API 엔드포인트 구현 (Missing Endpoints)
 1. `POST /api/v1/receipts/presigned-url`: S3 업로드 URL 생성

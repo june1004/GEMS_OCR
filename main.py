@@ -6,7 +6,7 @@ from datetime import datetime
 from typing import List, Optional, Union
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Depends
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, JSON, Boolean
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
@@ -78,8 +78,24 @@ class TourData(BaseModel):
 class CompleteRequest(BaseModel):
     receiptId: str
     userUuid: str
-    type: str # STAY or TOUR
+    type: str  # STAY or TOUR
     data: Union[StayData, TourData]
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_data_by_type(cls, v):
+        """type에 따라 data를 StayData 또는 TourData로 검증 (밸리데이션 에러 명확화)"""
+        if not isinstance(v, dict) or "data" not in v or "type" not in v:
+            return v
+        t = v.get("type")
+        inner = v.get("data")
+        if not isinstance(inner, dict):
+            return v
+        if t == "STAY":
+            v["data"] = StayData.model_validate(inner)
+        elif t == "TOUR":
+            v["data"] = TourData.model_validate(inner)
+        return v
 
 # 5. API 엔드포인트
 app = FastAPI()

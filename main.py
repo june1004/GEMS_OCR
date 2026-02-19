@@ -21,6 +21,12 @@ load_dotenv()
 app = FastAPI(title="GEMS OCR API", version="1.0.0")
 
 DATABASE_URL = os.getenv("DATABASE_URL")
+# Coolify/Heroku 등 postgres:// URL → SQLAlchemy 2.x 호환 (postgresql+psycopg2)
+if DATABASE_URL:
+    if DATABASE_URL.startswith("postgres://"):
+        DATABASE_URL = "postgresql+psycopg2://" + DATABASE_URL[11:]  # postgres:// 제거 후 붙임
+    elif DATABASE_URL.startswith("postgresql://") and "+psycopg2" not in DATABASE_URL:
+        DATABASE_URL = DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 S3_ENDPOINT = os.getenv("S3_ENDPOINT")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")

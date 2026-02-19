@@ -4,12 +4,12 @@ import os
 
 # 쿨리파이 환경변수를 자동으로 가져옵니다.
 DB_URL = os.getenv("DATABASE_URL") 
-FILE_NAME = '강원특별자치도_일반음식점 현황_20251217.csv'
+FILE_NAME = "gangwon_20251217.csv"  # UTF-8 (원본 CP949에서 변환)
 
 def run():
     try:
-        # 1. 데이터 읽기
-        df = pd.read_csv(FILE_NAME)
+        # 1. 데이터 읽기 (UTF-8)
+        df = pd.read_csv(FILE_NAME, encoding="utf-8")
         
         # 2. DB 컬럼명 매핑
         df_db = pd.DataFrame()

@@ -146,6 +146,12 @@ async def get_presigned_url(fileName: str, contentType: str, userUuid: str, type
     return {"uploadUrl": url, "receiptId": receipt_id, "objectKey": object_key}
 
 
+@app.post("/api/proxy/presigned-url", response_model=PresignedUrlResponse, include_in_schema=False)
+async def get_presigned_url_proxy(fileName: str, contentType: str, userUuid: str, type: str, db: Session = Depends(get_db)):
+    """프론트엔드 프록시 경로: /api/v1/receipts/presigned-url 와 동일"""
+    return await get_presigned_url(fileName, contentType, userUuid, type, db)
+
+
 @app.post("/api/v1/receipts/upload", response_model=PresignedUrlResponse)
 async def upload_receipt_via_api(
     file: UploadFile = File(...),

@@ -3,7 +3,13 @@ from sqlalchemy import create_engine
 import os
 
 # 쿨리파이 환경변수를 자동으로 가져옵니다.
-DB_URL = os.getenv("DATABASE_URL") 
+DB_URL = os.getenv("DATABASE_URL")
+# Coolify/Heroku 등 postgres:// → SQLAlchemy 2.x 호환 (postgresql+psycopg2)
+if DB_URL:
+    if DB_URL.startswith("postgres://"):
+        DB_URL = "postgresql+psycopg2://" + DB_URL[11:]
+    elif DB_URL.startswith("postgresql://") and "+psycopg2" not in DB_URL:
+        DB_URL = DB_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
 FILE_NAME = "gangwon_20251217.csv"  # UTF-8 (원본 CP949에서 변환)
 
 def run():

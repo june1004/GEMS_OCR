@@ -1,4 +1,6 @@
 import os
+from datetime import datetime
+
 import pandas as pd
 from sqlalchemy import create_engine, text
 from urllib.parse import urlparse
@@ -44,7 +46,10 @@ def run():
         # 시군구: 공백 기준 두 번째 토큰 (춘천시, 강릉시 등)
         addr = df["도로명주소"].astype(str)
         df_db["city_county"] = addr.str.split(n=2).str[1].fillna("")
-        
+        # DDL 호환: 사업자 상태·업데이트 시간 (PROJECT/migrations/master_stores_trigger.sql 참고)
+        df_db["hometax_status"] = "UNKNOWN"
+        df_db["last_updated"] = datetime.utcnow()
+
         engine = create_engine(DB_URL)
         print(f"📌 연결 DB: {_db_info(DB_URL)}")
         

@@ -6,7 +6,8 @@ from urllib.parse import urlparse
 from dotenv import load_dotenv
 load_dotenv()
 
-# 쿨리파이 환경변수를 자동으로 가져옵니다.
+# 쿨리파이 환경변수. DATABASE_URL 경로 끝 DB 이름이 실제 데이터 위치입니다 (예: .../gems).
+# psql 기본 접속은 시스템 DB(postgres)이므로, 데이터 확인 시 '\c gems' 로 전환 후 조회하세요.
 DB_URL = os.getenv("DATABASE_URL")
 # Coolify/Heroku 등 postgres:// → SQLAlchemy 2.x 호환 (postgresql+psycopg2)
 if DB_URL:
@@ -34,12 +35,15 @@ def run():
         # 1. 데이터 읽기 (UTF-8)
         df = pd.read_csv(FILE_NAME, encoding="utf-8")
         
-        # 2. DB 컬럼명 매핑
+        # 2. DB 컬럼명 매핑 (도로명주소에서 시·군 추출: "강원특별자치도 춘천시 ..." → "춘천시")
         df_db = pd.DataFrame()
         df_db["store_name"] = df["업소명"]
         df_db["category_large"] = df["업종"]
         df_db["category_small"] = df["업태"]
         df_db["road_address"] = df["도로명주소"]
+        # 시군구: 공백 기준 두 번째 토큰 (춘천시, 강릉시 등)
+        addr = df["도로명주소"].astype(str)
+        df_db["city_county"] = addr.str.split(n=2).str[1].fillna("")
         
         engine = create_engine(DB_URL)
         print(f"📌 연결 DB: {_db_info(DB_URL)}")

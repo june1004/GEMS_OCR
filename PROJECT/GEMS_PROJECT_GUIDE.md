@@ -94,8 +94,12 @@
 - React 기반 관리자 대시보드 구축
 
 ## 4. 환경 변수 설정 (.env)
+- **DATABASE_URL**: Coolify에서 PostgreSQL 생성 시 만든 **사용자 DB 이름(`gems`)** 을 사용해야 합니다.  
+  `psql -U postgres` 로 접속하면 기본적으로 **시스템 DB `postgres`** 에 연결되므로, 앱/마이그레이션 데이터는 **`gems`** DB에 있음을 유의하세요.  
+  데이터 확인: `psql -U postgres` 후 `\c gems` 로 전환 → `SELECT count(*) FROM master_stores;`
+
 ```text
-DATABASE_URL=postgresql://user:password@gems-db:5432/postgres
+DATABASE_URL=postgresql://postgres:password@gems-db:5432/gems
 S3_ENDPOINT=https://storage-api.nanum.online
 S3_ACCESS_KEY=gems_master
 S3_SECRET_KEY=your_secret

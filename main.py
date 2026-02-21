@@ -2,11 +2,14 @@ import os
 import re
 import time
 import uuid
+import json
 import httpx
 import boto3
 from datetime import datetime
-from typing import List, Optional, Union
+from typing import List, Optional, Union, Tuple
 from dotenv import load_dotenv
+from dateutil import parser as dateutil_parser
+from rapidfuzz import fuzz
 from sqlalchemy import text as sql_text
 from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -50,7 +53,7 @@ class Receipt(Base):
     receipt_id = Column(String, primary_key=True, index=True)
     user_uuid = Column(String, index=True)
     type = Column(String) # STAY or TOUR
-    status = Column(String, default="PENDING") # PENDING, FIT, UNFIT, DUPLICATE
+    status = Column(String, default="PENDING")  # PENDING → PROCESSING → VERIFYING → FIT | UNFIT | DUPLICATE | ERROR
     amount = Column(Integer)
     pay_date = Column(String)
     store_name = Column(String)
@@ -200,6 +203,15 @@ class StatusResponse(BaseModel):
     address: Optional[str] = None  # 가맹점 주소(시군 또는 주소)
     cardPrefix: Optional[str] = None  # 카드 앞 4자리(비식별화)
 
+def _sanitize_receipt_id(raw: str) -> str:
+    """FE/프록시에서 잘못 붙은 문자가 있을 수 있음 (예: 'uuid HTTP/1.1\" 404...'). UUID만 추출."""
+    if not raw:
+        return ""
+    s = raw.strip()
+    match = re.match(r"^([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})", s)
+    return match.group(1) if match else s.split()[0] if s.split() else s
+
+
 @app.get(
     "/api/v1/receipts/{receiptId}/status",
     response_model=StatusResponse,
@@ -207,7 +219,8 @@ class StatusResponse(BaseModel):
 )
 async def get_status(receiptId: str, db: Session = Depends(get_db)):
     """4단계: 최종 결과 조회 (데이터 자산화: address, cardPrefix 포함)"""
-    receipt = db.query(Receipt).filter(Receipt.receipt_id == receiptId).first()
+    receipt_id = _sanitize_receipt_id(receiptId)
+    receipt = db.query(Receipt).filter(Receipt.receipt_id == receipt_id).first()
     if not receipt:
         raise HTTPException(status_code=404, detail="Receipt not found")
     address = (receipt.address or receipt.location or receipt.store_name or "").strip() or None
@@ -247,12 +260,39 @@ async def get_status_proxy(receiptId: str, db: Session = Depends(get_db)):
 # 참고: https://api.ncloud-docs.com/docs/ai-application-service-ocr-ocrdocumentocr-receipt
 # - 저장된 이미지(1단계 Presigned PUT → MinIO)를 Get Presigned URL로 Naver에 전달
 def _get_presigned_get_url(object_key: str, expires: int = 60) -> str:
-    """Naver OCR이 MinIO에 저장된 이미지에 접근할 수 있도록 Get Presigned URL (1분)"""
+    """Naver OCR이 MinIO에 저장된 이미지에 접근할 수 있도록 Get Presigned URL (60초 권장)."""
     return s3_client.generate_presigned_url(
         "get_object",
         Params={"Bucket": S3_BUCKET, "Key": object_key},
         ExpiresIn=expires,
     )
+
+
+def _normalize_and_validate_2026_date(date_text: str) -> Tuple[bool, Optional[str]]:
+    """
+    OCR 날짜 정규화 후 2026년 유효성 검사.
+    Step1: 구분자(., /, 공백)를 '-'로 치환
+    Step2: 2026 또는 26으로 시작하는지 확인
+    Step3: dateutil.parser로 파싱 후 유효한 날짜인지 검증
+    반환: (2026년 유효 여부, 정규화된 날짜 문자열 또는 None)
+    """
+    if not date_text or not isinstance(date_text, str):
+        return False, None
+    s = date_text.strip()
+    s = re.sub(r"[/.\s]+", "-", s)
+    s = re.sub(r"-+", "-", s).strip("- ")
+    if not re.match(r"^(2026|26)", s):
+        return False, None
+    if s.startswith("26"):
+        s = "20" + s
+    try:
+        parsed = dateutil_parser.parse(s)
+        if parsed.year != 2026:
+            return False, None
+        normalized = parsed.strftime("%Y-%m-%d")
+        return True, normalized
+    except (ValueError, TypeError):
+        return False, None
 
 
 async def _call_naver_ocr(image_url: str, receipt_id: str) -> dict:
@@ -323,26 +363,43 @@ def _check_duplicate_receipt(db: Session, store_name: str, pay_date: str, amount
     return q.first() is not None
 
 
-def _check_store_in_master(db: Session, store_name: str, city_county: str) -> bool:
-    """master_stores에 상호+시군 존재 여부 (BIZ_004/OCR_003)"""
+# 유흥업소 등 부적격 업태 키워드 (BIZ_008)
+FORBIDDEN_BUSINESS_KEYWORDS = ("단란주점", "유흥주점", "유흥주점영업", "무도장", "사교춤장")
+
+
+def _ocr_contains_forbidden_business(ocr_data: dict) -> bool:
+    """OCR 결과 전체 텍스트에서 부적격 업태 키워드 포함 여부. 포함 시 True."""
     try:
-        if city_county:
-            r = db.execute(
-                sql_text(
-                    "SELECT 1 FROM master_stores WHERE store_name = :sn AND (city_county = :cc OR road_address LIKE :addr)"
-                ),
-                {"sn": store_name, "cc": city_county, "addr": f"%{city_county}%"},
-            )
-        else:
-            r = db.execute(sql_text("SELECT 1 FROM master_stores WHERE store_name = :sn"), {"sn": store_name})
-        return r.scalar() is not None
+        text = json.dumps(ocr_data, ensure_ascii=False)
+        return any(kw in text for kw in FORBIDDEN_BUSINESS_KEYWORDS)
     except Exception:
         return False
 
 
-# 2026년 날짜 여부 (숫자 2026 포함)
-def _is_2026_date(date_text: str) -> bool:
-    return bool(re.search(r"2026", date_text or ""))
+def _check_store_in_master(db: Session, store_name: str, city_county: str) -> bool:
+    """
+    master_stores 대조: 1차 시군(city_county) 필터 → 2차 상호명 매칭(정확/유사 90% 이상).
+    """
+    if not store_name or not store_name.strip():
+        return False
+    sn = store_name.strip()
+    try:
+        if city_county and city_county.strip():
+            cc = city_county.strip()
+            rows = db.execute(
+                sql_text(
+                    "SELECT store_name FROM master_stores WHERE city_county = :cc OR road_address LIKE :addr"
+                ),
+                {"cc": cc, "addr": f"%{cc}%"},
+            ).fetchall()
+        else:
+            rows = db.execute(sql_text("SELECT store_name FROM master_stores")).fetchall()
+        for (ms_name,) in rows:
+            if ms_name and (ms_name.strip() == sn or fuzz.ratio(ms_name.strip(), sn) >= 90):
+                return True
+        return False
+    except Exception:
+        return False
 
 
 async def analyze_receipt_task(req: CompleteRequest):
@@ -393,35 +450,44 @@ async def analyze_receipt_task(req: CompleteRequest):
             db.close()
             return
 
+        _, normalized_date = _normalize_and_validate_2026_date(pay_date or "")
+        pay_date_stored = normalized_date or (pay_date or "")
         receipt.amount = amount
-        receipt.pay_date = pay_date or ""
+        receipt.pay_date = pay_date_stored
         receipt.store_name = store_name or ""
         receipt.address = address or ""
         receipt.location = location or getattr(req.data, "location", None) or ""
         receipt.card_prefix = req.data.cardPrefix
         receipt.ocr_raw = ocr_data
 
-        # 3) PRD 검증
+        # 상태: 검증 단계 (VERIFYING)
+        receipt.status = "VERIFYING"
+        db.commit()
+
+        # 3) PRD 검증 엔진 (순서: 중복 → 강원 → 날짜 → 금액 정합성 → 최소금액 → 유흥업소 → 마스터)
         fail_reason = None
-        if req.data.amount != (amount or 0):
-            fail_reason = "BIZ_007 (Amount Mismatch)"
-        elif not _is_2026_date(pay_date or ""):
-            fail_reason = "BIZ_002 (Not 2026)"
-        elif req.type == "STAY" and (amount or 0) < 60000:
-            fail_reason = "BIZ_003 (Stay Min Amount)"
-        elif req.type == "TOUR" and (amount or 0) < 50000:
-            fail_reason = "BIZ_003 (Tour Min Amount)"
-        elif address and "강원특별자치도" not in address:
-            fail_reason = "BIZ_004 (Not Gangwon address)"
-        elif not _check_store_in_master(db, store_name or "", location or ""):
-            fail_reason = "OCR_003 (Store not in master_stores)"
-        elif _check_duplicate_receipt(db, store_name or "", pay_date or "", amount or 0, req.data.cardPrefix):
+        if _check_duplicate_receipt(db, store_name or "", pay_date_stored, amount or 0, req.data.cardPrefix):
             receipt.status = "DUPLICATE"
-            receipt.fail_reason = "BIZ_001 (Duplicate receipt)"
+            receipt.fail_reason = "BIZ_001 (중복 등록 - 동일 영수증)"
             receipt.amount = amount
             db.commit()
             db.close()
             return
+        # BIZ_004: 강원 지역 필터 (키워드 '강원' 없으면 API 비용 절감을 위해 조기 부적합)
+        if address and "강원" not in address:
+            fail_reason = "BIZ_004 (강원특별자치도 외 지역)"
+        elif not normalized_date:
+            fail_reason = "BIZ_002 (2026년 결제일 아님)"
+        elif req.data.amount != (amount or 0):
+            fail_reason = "BIZ_007 (입력 금액과 OCR 금액 불일치)"
+        elif req.type == "STAY" and (amount or 0) < 60000:
+            fail_reason = "BIZ_003 (숙박 최소 60,000원 미달)"
+        elif req.type == "TOUR" and (amount or 0) < 50000:
+            fail_reason = "BIZ_003 (관광 최소 50,000원 미달)"
+        elif _ocr_contains_forbidden_business(ocr_data):
+            fail_reason = "BIZ_008 (유흥업소 등 부적격 업종)"
+        elif not _check_store_in_master(db, store_name or "", location or ""):
+            fail_reason = "OCR_003 (마스터 상호 미등록)"
 
         receipt.status = "FIT" if not fail_reason else "UNFIT"
         receipt.fail_reason = fail_reason

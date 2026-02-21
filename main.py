@@ -133,12 +133,14 @@ def get_db():
 
 @app.post("/api/v1/receipts/presigned-url", response_model=PresignedUrlResponse)
 async def get_presigned_url(fileName: str, contentType: str, userUuid: str, type: str, db: Session = Depends(get_db)):
-    """1단계: 업로드 URL 발행 및 초기 레코드 생성 (receiptId, objectKey 반환)"""
+    """1단계: 고객 영수증 업로드용 Presigned URL 발급 (10분 유효) → FE가 이 URL로 PUT하여 MinIO에 저장"""
     receipt_id = str(uuid.uuid4())
     object_key = f"receipts/{receipt_id}_{fileName}"
-    
+    # 설계안: 업로드 URL 10분 유효 (PROJECT/전 단계 JSON API 설계안.md)
     url = s3_client.generate_presigned_url(
-        'put_object', Params={'Bucket': S3_BUCKET, 'Key': object_key, 'ContentType': contentType}, ExpiresIn=600
+        "put_object",
+        Params={"Bucket": S3_BUCKET, "Key": object_key, "ContentType": contentType},
+        ExpiresIn=600,  # 10분
     )
     
     db.add(Receipt(receipt_id=receipt_id, user_uuid=userUuid, type=type, status="PENDING"))
@@ -230,9 +232,11 @@ async def get_status_proxy(receiptId: str, db: Session = Depends(get_db)):
     return await get_status(receiptId, db)
 
 
-# 6. Naver OCR 연동 및 영수증 분석 (PRD 반영)
+# 6. Naver 영수증 OCR 연동 (CLOVA Document OCR > 영수증)
+# 참고: https://api.ncloud-docs.com/docs/ai-application-service-ocr-ocrdocumentocr-receipt
+# - 저장된 이미지(1단계 Presigned PUT → MinIO)를 Get Presigned URL로 Naver에 전달
 def _get_presigned_get_url(object_key: str, expires: int = 60) -> str:
-    """Naver OCR이 MinIO 이미지에 접근할 수 있도록 Get Presigned URL (기본 1분)"""
+    """Naver OCR이 MinIO에 저장된 이미지에 접근할 수 있도록 Get Presigned URL (1분)"""
     return s3_client.generate_presigned_url(
         "get_object",
         Params={"Bucket": S3_BUCKET, "Key": object_key},
@@ -241,7 +245,7 @@ def _get_presigned_get_url(object_key: str, expires: int = 60) -> str:
 
 
 async def _call_naver_ocr(image_url: str, receipt_id: str) -> dict:
-    """Naver OCR API 호출 (Presigned Get URL 전달, timestamp ms)"""
+    """CLOVA OCR 영수증 API 호출 (MinIO 이미지 Get Presigned URL 전달). X-OCR-SECRET, V2, timestamp 필수."""
     headers = {
         "X-OCR-SECRET": NAVER_OCR_SECRET,
         "Content-Type": "application/json",

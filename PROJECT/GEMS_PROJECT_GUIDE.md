@@ -15,14 +15,18 @@
 - [x] MinIO CORS 설정 (easy.gwd.go.kr 허용)  
   - **로컬 개발 시**: storage-api.nanum.online 버킷(gems-receipts) CORS에 `http://localhost:5173` Origin 추가 필요. 없으면 presigned URL로 PUT 시 브라우저 CORS 에러 발생.
 
-### Phase 2: API 엔드포인트 구현 (Missing Endpoints)
-1. `POST /api/v1/receipts/presigned-url`: S3 업로드 URL 생성
-2. `POST /api/v1/receipts/complete`:
-   - S3 이미지 -> Naver OCR 호출
-   - 결과값 DB 저장
-   - CSV(음식점 현황) 비교 로직 수행
-   - Gemini API를 이용한 업종 검증 (유흥주점 필터링)
-3. `GET /api/v1/receipts/{receiptId}/status`: 결과 반환
+### Phase 2: API 엔드포인트 구현 및 서비스 플로우
+**고객 영수증 업로드 이미지는 Presigned URL(10분 유효)로 저장되고, 저장된 이미지는 네이버 영수증 OCR API와 연동됩니다.**
+
+| 단계 | URL / 동작 | 설명 |
+|------|------------|------|
+| 1 | `POST /api/v1/receipts/presigned-url` | 업로드용 **Presigned URL 발급 (10분 유효)**. `receiptId`, `objectKey` 반환. |
+| 2 | `PUT {{uploadUrl}}` (FE → MinIO) | 고객이 이미지 이진 데이터를 스토리지에 직접 업로드. |
+| 3 | `POST /api/v1/receipts/complete` | 저장된 이미지 Key 기준으로 **Naver 영수증 OCR** 호출(Get Presigned URL 전달), 검증 후 DB 저장. |
+| 4 | `GET /api/v1/receipts/{receiptId}/status` | OCR·검증 결과 조회 (Polling). |
+
+- **Naver OCR 연동**: [CLOVA OCR Document OCR > 영수증](https://api.ncloud-docs.com/docs/ai-application-service-ocr-ocrdocumentocr-receipt). `X-OCR-SECRET`, `Content-Type: application/json`, `version: V2`, `timestamp`(ms) 필수.
+- 상세 요청/응답 스키마: `PROJECT/전 단계 JSON API 설계안.md` 참고.
 
 ================
 

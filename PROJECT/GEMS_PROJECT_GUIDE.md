@@ -27,7 +27,8 @@
 
 - **Naver OCR 연동**: [CLOVA OCR Document OCR > 영수증](https://api.ncloud-docs.com/docs/ai-application-service-ocr-ocrdocumentocr-receipt). **multipart(바이너리)** + **리사이징(최대 2000px)/JPEG 압축(quality 80)** 적용 — 영수증·**A4 이내 거래명세서** 등 모든 이미지에 동일 적용. MinIO 읽기 → BE 리사이즈·압축 → `message`+`file` 전송. 전송량·호출 비용 절감. 타임아웃 30초.
 - **상태 흐름**: `PENDING` → `PROCESSING`(OCR 호출 중) → `VERIFYING`(검증 중) → `FIT` | `UNFIT` | `DUPLICATE` | `ERROR`.
-- **검증 체크리스트**: BIZ_001 중복(상호+결제일+금액+카드앞4자리), BIZ_004 강원 주소, BIZ_002 2026년 날짜, BIZ_007 금액 정합성, BIZ_003 최소금액(숙박 6만/관광 5만), BIZ_008 유흥업소 필터, OCR_003 master_stores 시군 1차 필터+유사도 90% 매칭.
+- **검증·매칭**: `processor.py` — 시군구 필터 → 상호명 유사도(`token_sort_ratio` 85%) → 비즈니스 검증 → **캠페인 필터**(지역·기간). BIZ_001 중복, BIZ_008 유흥업소는 main에서 선처리.
+- **캠페인 필터**: `campaigns` 테이블의 `target_city_county`(시군 제한), `start_date`/`end_date`(기간), `is_active`로 검증. BIZ_005(기간 아님), BIZ_006(대상 지역 아님). `POST /complete` 요청에 `campaignId`(기본 1) 포함.
 - 상세 요청/응답 스키마: `PROJECT/전 단계 JSON API 설계안.md` 참고.
 
 ================

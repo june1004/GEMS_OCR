@@ -11,8 +11,9 @@ from datetime import datetime
 from typing import List, Optional, Union, Tuple
 from dotenv import load_dotenv
 from dateutil import parser as dateutil_parser
-from rapidfuzz import fuzz
 from sqlalchemy import text as sql_text
+
+from processor import validate_and_match, validate_campaign_rules
 from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
@@ -98,6 +99,7 @@ class CompleteRequest(BaseModel):
     receiptId: str
     userUuid: str
     type: str  # STAY or TOUR
+    campaignId: int = 1  # 캠페인 필터(지역·기간) 적용, 기본 1
     data: Union[StayData, TourData]
 
     @model_validator(mode="before")
@@ -368,10 +370,11 @@ def _parse_ocr_result(ocr_data: dict) -> tuple[Optional[int], Optional[str], Opt
         result = receipt.get("result")
         if not result:
             return (None, None, None, None, None)
-        # 결제 금액
+        # 결제 금액 (₩, 콤마, 원 등 제거 후 숫자만 추출)
         price_text = (result.get("totalPrice") or {}).get("price") or {}
-        amount_str = (price_text.get("text") or "0").replace(",", "").strip()
-        amount = int(amount_str) if amount_str.isdigit() else None
+        raw_price = (price_text.get("text") or "0").strip()
+        amount_str = re.sub(r"[^0-9]", "", raw_price)
+        amount = int(amount_str) if amount_str else None
         # 결제 날짜
         payment_info = result.get("paymentInfo") or {}
         date_obj = payment_info.get("date") or {}
@@ -414,32 +417,6 @@ def _ocr_contains_forbidden_business(ocr_data: dict) -> bool:
     try:
         text = json.dumps(ocr_data, ensure_ascii=False)
         return any(kw in text for kw in FORBIDDEN_BUSINESS_KEYWORDS)
-    except Exception:
-        return False
-
-
-def _check_store_in_master(db: Session, store_name: str, city_county: str) -> bool:
-    """
-    master_stores 대조: 1차 시군(city_county) 필터 → 2차 상호명 매칭(정확/유사 90% 이상).
-    """
-    if not store_name or not store_name.strip():
-        return False
-    sn = store_name.strip()
-    try:
-        if city_county and city_county.strip():
-            cc = city_county.strip()
-            rows = db.execute(
-                sql_text(
-                    "SELECT store_name FROM master_stores WHERE city_county = :cc OR road_address LIKE :addr"
-                ),
-                {"cc": cc, "addr": f"%{cc}%"},
-            ).fetchall()
-        else:
-            rows = db.execute(sql_text("SELECT store_name FROM master_stores")).fetchall()
-        for (ms_name,) in rows:
-            if ms_name and (ms_name.strip() == sn or fuzz.ratio(ms_name.strip(), sn) >= 90):
-                return True
-        return False
     except Exception:
         return False
 
@@ -517,7 +494,7 @@ async def analyze_receipt_task(req: CompleteRequest):
         receipt.status = "VERIFYING"
         db.commit()
 
-        # 3) PRD 검증 엔진 (순서: 중복 → 강원 → 날짜 → 금액 정합성 → 최소금액 → 유흥업소 → 마스터)
+        # 3) PRD 검증 엔진: 중복 → 유흥업소 → processor(날짜/금액/지역/상점 매칭)
         fail_reason = None
         if _check_duplicate_receipt(db, store_name or "", pay_date_stored, amount or 0, req.data.cardPrefix):
             receipt.status = "DUPLICATE"
@@ -526,21 +503,44 @@ async def analyze_receipt_task(req: CompleteRequest):
             db.commit()
             db.close()
             return
-        # BIZ_004: 강원 지역 필터 (키워드 '강원' 없으면 API 비용 절감을 위해 조기 부적합)
-        if address and "강원" not in address:
-            fail_reason = "BIZ_004 (강원특별자치도 외 지역)"
-        elif not normalized_date:
-            fail_reason = "BIZ_002 (2026년 결제일 아님)"
-        elif req.data.amount != (amount or 0):
-            fail_reason = "BIZ_007 (입력 금액과 OCR 금액 불일치)"
-        elif req.type == "STAY" and (amount or 0) < 60000:
-            fail_reason = "BIZ_003 (숙박 최소 60,000원 미달)"
-        elif req.type == "TOUR" and (amount or 0) < 50000:
-            fail_reason = "BIZ_003 (관광 최소 50,000원 미달)"
-        elif _ocr_contains_forbidden_business(ocr_data):
+        if _ocr_contains_forbidden_business(ocr_data):
             fail_reason = "BIZ_008 (유흥업소 등 부적격 업종)"
-        elif not _check_store_in_master(db, store_name or "", location or ""):
-            fail_reason = "OCR_003 (마스터 상호 미등록)"
+        else:
+            status_from_processor, fail_code = validate_and_match(
+                db,
+                store_name or "",
+                address or "",
+                pay_date or "",
+                amount or 0,
+                location or "",
+                req.data.amount,
+                req.type,
+                is_2026_date=bool(normalized_date),
+            )
+            if fail_code:
+                _msg = {
+                    "BIZ_002": "BIZ_002 (2026년 결제일 아님)",
+                    "BIZ_003": "BIZ_003 (숙박/관광 최소 금액 미달)",
+                    "BIZ_004": "BIZ_004 (강원특별자치도 외 지역)",
+                    "BIZ_005": "BIZ_005 (캠페인 기간 아님)",
+                    "BIZ_006": "BIZ_006 (캠페인 대상 지역 아님)",
+                    "BIZ_007": "BIZ_007 (입력 금액과 OCR 금액 불일치)",
+                    "OCR_002": "OCR_002 (결제일 형식 오류)",
+                    "OCR_003": "OCR_003 (마스터 상호 미등록)",
+                }
+                fail_reason = _msg.get(fail_code, fail_code)
+            elif req.campaignId:
+                # 캠페인 필터: 지역·기간 검증 (상점 매칭 성공 후)
+                is_campaign_ok, camp_fail = validate_campaign_rules(
+                    db, req.campaignId, location or "", pay_date_stored
+                )
+                if not is_campaign_ok and camp_fail:
+                    _msg = {
+                        "BIZ_005": "BIZ_005 (캠페인 기간 아님)",
+                        "BIZ_006": "BIZ_006 (캠페인 대상 지역 아님)",
+                        "OCR_002": "OCR_002 (결제일 형식 오류)",
+                    }
+                    fail_reason = _msg.get(camp_fail, camp_fail)
 
         receipt.status = "FIT" if not fail_reason else "UNFIT"
         receipt.fail_reason = fail_reason

@@ -25,7 +25,7 @@
 | 3 | `POST /api/v1/receipts/complete` | 저장된 이미지 Key 기준으로 **Naver 영수증 OCR** 호출(Get Presigned URL 전달), 검증 후 DB 저장. |
 | 4 | `GET /api/v1/receipts/{receiptId}/status` | OCR·검증 결과 조회 (Polling). |
 
-- **Naver OCR 연동**: [CLOVA OCR Document OCR > 영수증](https://api.ncloud-docs.com/docs/ai-application-service-ocr-ocrdocumentocr-receipt). `X-OCR-SECRET`, `Content-Type: application/json`, `version: V2`, `timestamp`(ms) 필수. `requestId`에는 DB `receiptId` 전달(로그 매칭용). 이미지 접근용 Get Presigned URL 만료 60초 권장.
+- **Naver OCR 연동**: [CLOVA OCR Document OCR > 영수증](https://api.ncloud-docs.com/docs/ai-application-service-ocr-ocrdocumentocr-receipt). **multipart(바이너리)** + **리사이징(최대 2000px)/JPEG 압축(quality 80)** 적용 — 영수증·**A4 이내 거래명세서** 등 모든 이미지에 동일 적용. MinIO 읽기 → BE 리사이즈·압축 → `message`+`file` 전송. 전송량·호출 비용 절감. 타임아웃 30초.
 - **상태 흐름**: `PENDING` → `PROCESSING`(OCR 호출 중) → `VERIFYING`(검증 중) → `FIT` | `UNFIT` | `DUPLICATE` | `ERROR`.
 - **검증 체크리스트**: BIZ_001 중복(상호+결제일+금액+카드앞4자리), BIZ_004 강원 주소, BIZ_002 2026년 날짜, BIZ_007 금액 정합성, BIZ_003 최소금액(숙박 6만/관광 5만), BIZ_008 유흥업소 필터, OCR_003 master_stores 시군 1차 필터+유사도 90% 매칭.
 - 상세 요청/응답 스키마: `PROJECT/전 단계 JSON API 설계안.md` 참고.

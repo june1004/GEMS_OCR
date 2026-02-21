@@ -1,3 +1,4 @@
+import io
 import os
 import re
 import time
@@ -5,6 +6,7 @@ import uuid
 import json
 import httpx
 import boto3
+from PIL import Image
 from datetime import datetime
 from typing import List, Optional, Union, Tuple
 from dotenv import load_dotenv
@@ -257,15 +259,48 @@ async def get_status_proxy(receiptId: str, db: Session = Depends(get_db)):
 
 
 # 6. Naver 영수증 OCR 연동 (CLOVA Document OCR > 영수증)
-# 참고: https://api.ncloud-docs.com/docs/ai-application-service-ocr-ocrdocumentocr-receipt
-# - 저장된 이미지(1단계 Presigned PUT → MinIO)를 Get Presigned URL로 Naver에 전달
-def _get_presigned_get_url(object_key: str, expires: int = 60) -> str:
-    """Naver OCR이 MinIO에 저장된 이미지에 접근할 수 있도록 Get Presigned URL (60초 권장)."""
-    return s3_client.generate_presigned_url(
-        "get_object",
-        Params={"Bucket": S3_BUCKET, "Key": object_key},
-        ExpiresIn=expires,
-    )
+# - 권장: multipart(바이너리) + 리사이징/압축으로 전송량·비용 절감
+MAX_OCR_DIMENSION = 2000
+JPEG_QUALITY = 80
+
+
+def _get_image_bytes_from_s3(object_key: str) -> Tuple[bytes, str]:
+    """MinIO에서 이미지 바이너리 직접 읽기. 반환: (bytes, content_type)."""
+    resp = s3_client.get_object(Bucket=S3_BUCKET, Key=object_key)
+    body = resp["Body"].read()
+    content_type = (resp.get("ContentType") or "image/jpeg").lower()
+    return body, content_type
+
+
+def _resize_and_compress_for_ocr(
+    image_bytes: bytes, content_type: str
+) -> Tuple[bytes, str]:
+    """
+    리사이징(가로/세로 최대 2000px) + JPEG 압축(quality 80). 전송량·OCR 비용 절감.
+    실패 시 원본 반환. 반환: (bytes, content_type).
+    """
+    try:
+        img = Image.open(io.BytesIO(image_bytes))
+        if img.mode in ("RGBA", "P"):
+            img = img.convert("RGB")
+        elif img.mode != "RGB":
+            img = img.convert("RGB")
+        w, h = img.size
+        if w > MAX_OCR_DIMENSION or h > MAX_OCR_DIMENSION:
+            ratio = min(MAX_OCR_DIMENSION / w, MAX_OCR_DIMENSION / h)
+            img = img.resize((int(w * ratio), int(h * ratio)), Image.Resampling.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        return buf.getvalue(), "image/jpeg"
+    except Exception:
+        return image_bytes, content_type
+
+
+def _image_format_from_content_type(content_type: str) -> str:
+    """Content-Type → 네이버 OCR format (jpg|png)."""
+    if "png" in content_type:
+        return "png"
+    return "jpg"
 
 
 def _normalize_and_validate_2026_date(date_text: str) -> Tuple[bool, Optional[str]]:
@@ -295,20 +330,27 @@ def _normalize_and_validate_2026_date(date_text: str) -> Tuple[bool, Optional[st
         return False, None
 
 
-async def _call_naver_ocr(image_url: str, receipt_id: str) -> dict:
-    """CLOVA OCR 영수증 API 호출 (MinIO 이미지 Get Presigned URL 전달). X-OCR-SECRET, V2, timestamp 필수."""
-    headers = {
-        "X-OCR-SECRET": NAVER_OCR_SECRET,
-        "Content-Type": "application/json",
-    }
-    payload = {
-        "images": [{"format": "jpg", "name": "receipt_sample", "url": image_url}],
-        "requestId": receipt_id,
+async def _call_naver_ocr_binary(
+    image_binary: bytes, receipt_id: str, image_format: str = "jpg"
+) -> dict:
+    """
+    CLOVA OCR 영수증 API — multipart/form-data(바이너리) 전송.
+    Base64 대비 용량·메모리 효율적이며 네이버 권장 방식.
+    """
+    message = {
         "version": "V2",
+        "requestId": receipt_id,
         "timestamp": int(time.time() * 1000),
+        "images": [{"format": image_format, "name": "receipt"}],
     }
+    mime = "image/jpeg" if image_format == "jpg" else "image/png"
+    files = {
+        "file": ("receipt.jpg" if image_format == "jpg" else "receipt.png", image_binary, mime),
+        "message": (None, json.dumps(message), "application/json"),
+    }
+    headers = {"X-OCR-SECRET": NAVER_OCR_SECRET}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(NAVER_OCR_URL, headers=headers, json=payload)
+        response = await client.post(NAVER_OCR_URL, headers=headers, files=files)
         response.raise_for_status()
         return response.json()
 
@@ -423,11 +465,22 @@ async def analyze_receipt_task(req: CompleteRequest):
             db.close()
             return
 
-        image_url = _get_presigned_get_url(target_key, expires=60)
-
-        # 2) Naver OCR 호출
+        # 2) MinIO 바이너리 읽기 → 리사이징/압축 → 네이버 OCR multipart 전송
         try:
-            ocr_data = await _call_naver_ocr(image_url, req.receiptId)
+            image_bytes, content_type = _get_image_bytes_from_s3(target_key)
+        except Exception as e:
+            receipt.status = "ERROR"
+            receipt.fail_reason = f"OCR_001 (이미지 로드 실패: {e})"
+            db.commit()
+            db.close()
+            return
+
+        image_bytes, content_type = _resize_and_compress_for_ocr(image_bytes, content_type)
+        image_format = _image_format_from_content_type(content_type)
+        try:
+            ocr_data = await _call_naver_ocr_binary(
+                image_bytes, req.receiptId, image_format
+            )
         except httpx.HTTPStatusError as e:
             receipt.status = "ERROR"
             receipt.fail_reason = f"OCR_001 (OCR API error: {e.response.status_code})"
@@ -444,7 +497,7 @@ async def analyze_receipt_task(req: CompleteRequest):
         amount, pay_date, store_name, address, location = _parse_ocr_result(ocr_data)
         if amount is None and not store_name:
             receipt.status = "UNFIT"
-            receipt.fail_reason = "OCR_001 (영수증 판독 불가 - 다시 촬영 권장)"
+            receipt.fail_reason = "OCR_001 (영수증 판독 불가 - 평평하게 펴서 다시 촬영해 주세요)"
             receipt.ocr_raw = ocr_data
             db.commit()
             db.close()

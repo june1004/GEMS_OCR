@@ -222,6 +222,17 @@ async def get_status(receiptId: str, db: Session = Depends(get_db)):
 
 
 @app.get(
+    "/api/v1/receipts/status/{receiptId}",
+    response_model=StatusResponse,
+    responses={404: {"description": "Receipt not found"}},
+    include_in_schema=False,
+)
+async def get_status_alt(receiptId: str, db: Session = Depends(get_db)):
+    """경로 별칭: FE가 /api/v1/receipts/status/{id} 로 호출할 때"""
+    return await get_status(receiptId, db)
+
+
+@app.get(
     "/api/proxy/status/{receiptId}",
     response_model=StatusResponse,
     responses={404: {"description": "Receipt not found"}},

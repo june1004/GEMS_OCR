@@ -26,3 +26,7 @@ Thumbs.db
 
 # History (optional)
 .history/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/

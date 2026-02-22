@@ -31,6 +31,13 @@
 - **캠페인 필터**: `campaigns` 테이블의 `target_city_county`(시군 제한), `start_date`/`end_date`(기간), `is_active`로 검증. BIZ_005(기간 아님), BIZ_006(대상 지역 아님). `POST /complete` 요청에 `campaignId`(기본 1) 포함.
 - 상세 요청/응답 스키마: `PROJECT/전 단계 JSON API 설계안.md` 참고.
 
+### Phase 3: 프론트엔드 (Dynamic Entry)
+- **위치**: `frontend/` (Vite + React + TypeScript + Tailwind)
+- **상태**: `receiptEntries` 배열 — 영수증 한 장 = 하나의 엔트리(id, image, objectKey, receiptId, metadata, status). 1:1, 1:최대3, 이미지 단독 전송 등 시나리오 확장 가능.
+- **업로드**: 이미지 선택 즉시 Presigned URL 발급 → 스토리지 PUT (제출 전 업로드 완료).
+- **검증**: 숙박(STAY)=소재지 필수, 관광(TOUR)=상호명 필수. 제출 시 엔트리별 `complete` 호출 후 결과 Polling.
+- 실행: `cd frontend && npm i && npm run dev` → http://localhost:5173
+
 ================
 
 `https://api.nanum.online/docs#/` (FastAPI Swagger UI) 페이지에 접속하여, 내부 설계안 및 API 테스트 가이드와 대조했을 때 확인 및 수정해야 할 주요 사항을 정리해 드립니다.

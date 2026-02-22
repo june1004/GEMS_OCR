@@ -62,6 +62,8 @@ class Receipt(Base):
     store_name = Column(String)
     address = Column(String)  # OCR 가맹점 주소 전체 (강원특별자치도 검증용)
     location = Column(String)  # 시군 정보 (데이터 자산화)
+    image_key = Column(String)  # MinIO 객체 키 (영수증 이미지 경로)
+    business_num = Column(String)  # 사업자등록번호 (OCR 추출)
     card_prefix = Column(String)  # 카드 앞 4자리
     fail_reason = Column(String)
     ocr_raw = Column(JSON)
@@ -396,6 +398,24 @@ def _parse_ocr_result(ocr_data: dict) -> tuple[Optional[int], Optional[str], Opt
         return (None, None, None, None, None)
 
 
+def _extract_business_num(ocr_data: dict) -> Optional[str]:
+    """
+    OCR 결과에서 사업자등록번호(bizNum) 텍스트 추출. 실패 시 None.
+    """
+    try:
+        images = ocr_data.get("images") or []
+        if not images:
+            return None
+        receipt = images[0].get("receipt") or {}
+        result = receipt.get("result") or {}
+        store_info = result.get("storeInfo") or {}
+        biz_obj = store_info.get("bizNum") or {}
+        biz = (biz_obj.get("text") or "").strip()
+        return biz or None
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
 def _check_duplicate_receipt(db: Session, store_name: str, pay_date: str, amount: int, card_prefix: str) -> bool:
     """동일 상호명+결제날짜+금액+카드앞4자리 존재 시 True (BIZ_001)"""
     q = db.query(Receipt).filter(
@@ -487,6 +507,8 @@ async def analyze_receipt_task(req: CompleteRequest):
         receipt.store_name = store_name or ""
         receipt.address = address or ""
         receipt.location = location or getattr(req.data, "location", None) or ""
+        receipt.image_key = target_key
+        receipt.business_num = _extract_business_num(ocr_data)
         receipt.card_prefix = req.data.cardPrefix
         receipt.ocr_raw = ocr_data
 

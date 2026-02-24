@@ -113,6 +113,10 @@ class UnregisteredStore(Base):
     tel = Column(String(64))
     status = Column(String(32), default="TEMP_VALID")  # TEMP_VALID | APPROVED | REJECTED
     source_submission_id = Column(String, index=True)
+    occurrence_count = Column(Integer, default=1)  # 동일 상점 영수증 접수 횟수
+    first_detected_at = Column(DateTime)
+    recent_receipt_id = Column(String(64), index=True)  # 증거 확인용 최근 submission_id
+    predicted_category = Column(String(64))  # OCR/분류용 (nullable)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
@@ -515,6 +519,14 @@ class StatusResponse(SubmissionStatusResponse):
     address: Optional[str] = None
     cardPrefix: Optional[str] = None
 
+def _parse_city_county_from_address(address: Optional[str]) -> Optional[str]:
+    """주소에서 시군 구 추출. '강원특별자치도 춘천시 중앙로 123' -> '춘천시'."""
+    if not address or not isinstance(address, str):
+        return None
+    parts = address.strip().split()
+    return parts[1] if len(parts) >= 2 else None
+
+
 def _sanitize_receipt_id(raw: str) -> str:
     """FE/프록시에서 잘못 붙은 문자가 있을 수 있음 (예: 'uuid HTTP/1.1\" 404...'). UUID만 추출."""
     if not raw:
@@ -530,11 +542,12 @@ def _sanitize_receipt_id(raw: str) -> str:
     responses={404: {"description": "Receipt not found"}},
 )
 async def get_status(receiptId: str, db: Session = Depends(get_db)):
-    """4단계: 최종 결과 조회 (데이터 자산화: address, cardPrefix 포함)"""
+    """4단계: 최종 결과 조회 (데이터 자산화: address, cardPrefix 포함). submission 필드는 DB 기준 최신값 사용."""
     receipt_id = _sanitize_receipt_id(receiptId)
     submission = db.query(Submission).filter(Submission.submission_id == receipt_id).first()
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
+    db.refresh(submission)
     item_rows = (
         db.query(ReceiptItem)
         .filter(ReceiptItem.submission_id == receipt_id)
@@ -606,6 +619,126 @@ async def get_status_alt(receiptId: str, db: Session = Depends(get_db)):
 async def get_status_proxy(receiptId: str, db: Session = Depends(get_db)):
     """프론트엔드 프록시 경로: /api/v1/receipts/{id}/status 와 동일 응답"""
     return await get_status(receiptId, db)
+
+
+# 5-2. 신규 상점 후보군(Unregistered Stores) 관리 API
+class CandidateStoreItem(BaseModel):
+    """후보 상점 한 건 (관리자 리스트용)."""
+    candidate_id: str = Field(..., description="후보 ID (unregistered_stores.id)")
+    store_name: Optional[str] = None
+    biz_num: Optional[str] = None
+    address: Optional[str] = None
+    tel: Optional[str] = None
+    occurrence_count: int = Field(1, description="해당 상점 영수증 접수 횟수")
+    predicted_category: Optional[str] = None
+    first_detected_at: Optional[str] = None  # ISO format
+    recent_receipt_id: Optional[str] = Field(None, description="증거 확인용 submission_id")
+    status: str = Field("PENDING_REVIEW", description="TEMP_VALID → PENDING_REVIEW 노출")
+
+
+class CandidatesListResponse(BaseModel):
+    total_candidates: int
+    items: List[CandidateStoreItem] = Field(default_factory=list)
+
+
+class ApproveCandidatesRequest(BaseModel):
+    candidate_ids: List[str] = Field(..., min_length=1, description="승인할 후보 ID 목록")
+    target_category: str = Field(..., description="마스터에 넣을 카테고리 (예: TOUR_SIGHTSEEING)")
+    is_premium: bool = Field(False, description="프리미엄 상점 여부 (선택)")
+
+
+class ApproveCandidatesResponse(BaseModel):
+    approved_count: int
+    failed_ids: List[str] = Field(default_factory=list, description="승인 실패한 candidate_id")
+
+
+@app.get(
+    "/api/v1/admin/stores/candidates",
+    response_model=CandidatesListResponse,
+    summary="신규 상점 후보군 목록",
+    description="마스터에 없으나 OCR로 유효 판별된 상점을 빈도순/최신순으로 조회. 증거(recent_receipt_id)로 영수증 확인 가능.",
+)
+async def list_candidate_stores(
+    city_county: Optional[str] = None,
+    min_occurrence: Optional[int] = None,
+    sort_by: Optional[str] = "occurrence_count",
+    db: Session = Depends(get_db),
+):
+    """관리자: 후보 상점 리스트 (시군구 필터, 최소 빈도, 정렬)."""
+    q = db.query(UnregisteredStore).filter(UnregisteredStore.status == "TEMP_VALID")
+    rows = q.all()
+    # 시군구 필터: 주소에서 두 번째 토큰(춘천시 등)으로 필터
+    if city_county and city_county.strip():
+        city = city_county.strip()
+        rows = [r for r in rows if _parse_city_county_from_address(r.address) == city]
+    if min_occurrence is not None and min_occurrence > 0:
+        rows = [r for r in rows if (r.occurrence_count or 0) >= min_occurrence]
+    # 정렬: occurrence_count 내림차순 또는 created_at 내림차순
+    if sort_by == "created_at":
+        rows = sorted(rows, key=lambda r: (r.created_at or datetime.min), reverse=True)
+    else:
+        rows = sorted(rows, key=lambda r: (r.occurrence_count or 0), reverse=True)
+    items = [
+        CandidateStoreItem(
+            candidate_id=r.id,
+            store_name=r.store_name,
+            biz_num=r.biz_num,
+            address=r.address,
+            tel=r.tel,
+            occurrence_count=r.occurrence_count or 1,
+            predicted_category=r.predicted_category,
+            first_detected_at=r.first_detected_at.isoformat() if r.first_detected_at else None,
+            recent_receipt_id=r.recent_receipt_id or r.source_submission_id,
+            status="PENDING_REVIEW",
+        )
+        for r in rows
+    ]
+    return CandidatesListResponse(total_candidates=len(items), items=items)
+
+
+@app.post(
+    "/api/v1/admin/stores/candidates/approve",
+    response_model=ApproveCandidatesResponse,
+    summary="후보 상점 마스터 편입",
+    description="선택한 후보를 master_stores로 이관. 이후 해당 상점 영수증은 FIT 판정.",
+)
+async def approve_candidate_stores(
+    body: ApproveCandidatesRequest,
+    db: Session = Depends(get_db),
+):
+    """관리자: 후보 → master_stores 이관 후 status=APPROVED 처리."""
+    approved = 0
+    failed_ids: List[str] = []
+    for cid in body.candidate_ids:
+        cand = db.query(UnregisteredStore).filter(
+            UnregisteredStore.id == cid,
+            UnregisteredStore.status == "TEMP_VALID",
+        ).first()
+        if not cand:
+            failed_ids.append(cid)
+            continue
+        try:
+            # master_stores에 삽입 (store_name, category_large, road_address → 트리거로 city_county 자동)
+            db.execute(
+                sql_text(
+                    "INSERT INTO master_stores (store_name, category_large, category_small, road_address) "
+                    "VALUES (:store_name, :category_large, :category_small, :road_address)"
+                ),
+                {
+                    "store_name": cand.store_name or "",
+                    "category_large": body.target_category,
+                    "category_small": body.target_category,
+                    "road_address": cand.address or "",
+                },
+            )
+            cand.status = "APPROVED"
+            cand.updated_at = datetime.utcnow()
+            approved += 1
+        except Exception as e:
+            logger.warning("approve candidate %s failed: %s", cid, e)
+            failed_ids.append(cid)
+    db.commit()
+    return ApproveCandidatesResponse(approved_count=approved, failed_ids=failed_ids)
 
 
 # 6. Naver 영수증 OCR 연동 (CLOVA Document OCR > 영수증)
@@ -683,6 +816,28 @@ def _normalize_and_validate_2026_date(date_text: str) -> Tuple[bool, Optional[st
         return True, normalized
     except (ValueError, TypeError):
         return False, None
+
+
+def _normalize_pay_date_canonical(raw: Optional[str]) -> Optional[str]:
+    """
+    결제일자를 YYYY-MM-DD 형식으로 통일. (26/01/10 → 2026-01-10, 2026.1.10 → 2026-01-10)
+    파싱 실패 시 원문 반환(또는 None). receipt_item 저장·API 응답에 사용.
+    """
+    if not raw or not isinstance(raw, str):
+        return raw
+    s = raw.strip()
+    if not s:
+        return None
+    s = re.sub(r"[/.\s]+", "-", s)
+    s = re.sub(r"-+", "-", s).strip("- ")
+    # 26-01-10 → 2026-01-10
+    if len(s) >= 2 and s[:2] == "26" and (len(s) == 2 or s[2] in "-."):
+        s = "20" + s
+    try:
+        parsed = dateutil_parser.parse(s)
+        return parsed.strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        return raw if raw.strip() else None
 
 
 async def _call_naver_ocr_binary(
@@ -925,6 +1080,7 @@ def _register_new_candidate_store(db: Session, submission_id: str, parsed: Dict[
     """
     마스터 미등록 상점을 임시 등록(TEMP_VALID).
     biz_num+address+tel 조합 우선으로 중복 등록 방지.
+    동일 상점 재발견 시 occurrence_count 증가, recent_receipt_id 갱신.
     """
     biz_num = (parsed.get("businessNum") or "").strip() or None
     address = (parsed.get("address") or "").strip() or None
@@ -939,8 +1095,11 @@ def _register_new_candidate_store(db: Session, submission_id: str, parsed: Dict[
     if tel:
         q = q.filter(UnregisteredStore.tel == tel)
     exists = q.first()
+    now = datetime.utcnow()
     if exists:
-        exists.updated_at = datetime.utcnow()
+        exists.occurrence_count = (exists.occurrence_count or 0) + 1
+        exists.recent_receipt_id = submission_id
+        exists.updated_at = now
         return
 
     db.add(
@@ -951,7 +1110,10 @@ def _register_new_candidate_store(db: Session, submission_id: str, parsed: Dict[
             tel=tel,
             status="TEMP_VALID",
             source_submission_id=submission_id,
-            updated_at=datetime.utcnow(),
+            occurrence_count=1,
+            first_detected_at=now,
+            recent_receipt_id=submission_id,
+            updated_at=now,
         )
     )
 
@@ -1054,6 +1216,8 @@ def map_ocr_to_db(
         status = asset.get("status", "PENDING")
         amount = p.get("amount") if isinstance(p.get("amount"), int) else None
         card_num = _normalize_card_num(p.get("cardNum"))
+        raw_pay = (p.get("payDate") or "").strip() or None
+        pay_date_canonical = _normalize_pay_date_canonical(raw_pay) if raw_pay else None
         item = ReceiptItem(
             submission_id=submission_id,
             seq_no=idx,
@@ -1061,7 +1225,7 @@ def map_ocr_to_db(
             image_key=(asset.get("imageKey") or "").strip(),
             store_name=(p.get("storeName") or "").strip() or None,
             biz_num=(p.get("businessNum") or "").strip() or None,
-            pay_date=(p.get("payDate") or "").strip() or None,
+            pay_date=pay_date_canonical or raw_pay,
             amount=amount,
             address=(p.get("address") or "").strip() or None,
             location=(p.get("location") or "").strip() or None,
@@ -1210,6 +1374,7 @@ async def analyze_receipt_task(req: CompleteRequest):
         documents = _build_documents_from_request(req)
         if not documents:
             submission.status = "UNFIT"
+            submission.total_amount = 0
             submission.fail_reason = _global_fail_reason("BIZ_010")
             submission.global_fail_reason = submission.fail_reason
             submission.audit_log = "문서 구성 요건 불충족"
@@ -1218,10 +1383,7 @@ async def analyze_receipt_task(req: CompleteRequest):
             return
 
         submission.project_type = req.type
-        submission.status = "VERIFYING"
-        db.commit()
-
-        # VERIFYING 중에도 status API에서 items를 볼 수 있도록 placeholder 선저장
+        # VERIFYING 전에 placeholder를 먼저 넣고 한 번에 commit → GET이 VERIFYING을 볼 때 항상 items 존재
         existing_rows = (
             db.query(ReceiptItem)
             .filter(ReceiptItem.submission_id == req.receiptId)
@@ -1250,6 +1412,7 @@ async def analyze_receipt_task(req: CompleteRequest):
                 row.status = "PENDING"
                 row.error_code = None
                 row.error_message = None
+        submission.status = "VERIFYING"
         db.commit()
 
         # 1) 병렬 OCR 수행
@@ -1352,7 +1515,7 @@ async def analyze_receipt_task(req: CompleteRequest):
                     rp["payDate"] = pay_date
                     rp["location"] = location
                     item_rows[ri].amount = amount
-                    item_rows[ri].pay_date = pay_date
+                    item_rows[ri].pay_date = _normalize_pay_date_canonical(pay_date) or pay_date
                     item_rows[ri].location = location
 
                 if ocr_assets[ri]["status"] == "ERROR_OCR":
@@ -1362,7 +1525,8 @@ async def analyze_receipt_task(req: CompleteRequest):
                     fail_code = "ERROR_OCR"
                 else:
                     _, normalized_date = _normalize_and_validate_2026_date(pay_date)
-                    pay_date_stored = normalized_date or pay_date
+                    pay_date_stored = normalized_date or _normalize_pay_date_canonical(pay_date) or pay_date
+                    item_rows[ri].pay_date = pay_date_stored
                     item_fail: Optional[str] = None
                     if _ocr_contains_forbidden_business(ocr_assets[ri]["ocrRaw"]):
                         item_fail = "BIZ_008"
@@ -1451,7 +1615,7 @@ async def analyze_receipt_task(req: CompleteRequest):
                         continue
 
                     is_2026, norm_date = _normalize_and_validate_2026_date(pay_date)
-                    pay_date_stored = norm_date or pay_date
+                    pay_date_stored = norm_date or _normalize_pay_date_canonical(pay_date) or pay_date
                     item_fail: Optional[str] = None
                     if not is_2026:
                         item_fail = "BIZ_002"
@@ -1509,7 +1673,8 @@ async def analyze_receipt_task(req: CompleteRequest):
             f"신규상점대기 {pending_new_cnt}매, 수동검증대기 {pending_verification_cnt}매"
         )
 
-        # 4) 부모 상태 업데이트
+        # 4) 부모 상태 업데이트: total_amount는 반드시 item_rows FIT 합산으로 산출 (관리자 검증 정확도)
+        total_amount = sum(it.amount or 0 for it in item_rows if it.status == "FIT")
         min_criteria = 60000 if req.type == "STAY" else 50000
         finalize_submission(submission, total_amount, min_criteria, fail_code)
         submission.audit_log = " | ".join(audit_lines) if audit_lines else (submission.fail_reason or "")
@@ -1519,6 +1684,7 @@ async def analyze_receipt_task(req: CompleteRequest):
     except Exception as e:
         logger.error("analyze_receipt_task failed: %s", e, exc_info=True)
         submission.status = "ERROR"
+        submission.total_amount = 0
         submission.fail_reason = str(e)
         submission.global_fail_reason = submission.fail_reason
         submission.audit_log = "complete 처리 중 예외 발생"

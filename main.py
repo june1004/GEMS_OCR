@@ -812,7 +812,7 @@ def _normalize_and_validate_2026_date(date_text: str) -> Tuple[bool, Optional[st
         parsed = dateutil_parser.parse(s)
         if parsed.year != 2026:
             return False, None
-        normalized = parsed.strftime("%Y-%m-%d")
+        normalized = parsed.strftime("%Y/%m/%d")
         return True, normalized
     except (ValueError, TypeError):
         return False, None
@@ -820,7 +820,7 @@ def _normalize_and_validate_2026_date(date_text: str) -> Tuple[bool, Optional[st
 
 def _normalize_pay_date_canonical(raw: Optional[str]) -> Optional[str]:
     """
-    결제일자를 YYYY-MM-DD 형식으로 통일. (26/01/10 → 2026-01-10, 2026.1.10 → 2026-01-10)
+    결제일자를 YYYY/MM/DD 형식으로 통일. (26/01/10 → 2026/01/10, 2026.1.10 → 2026/01/10)
     파싱 실패 시 원문 반환(또는 None). receipt_item 저장·API 응답에 사용.
     """
     if not raw or not isinstance(raw, str):
@@ -835,7 +835,7 @@ def _normalize_pay_date_canonical(raw: Optional[str]) -> Optional[str]:
         s = "20" + s
     try:
         parsed = dateutil_parser.parse(s)
-        return parsed.strftime("%Y-%m-%d")
+        return parsed.strftime("%Y/%m/%d")
     except (ValueError, TypeError):
         return raw if raw.strip() else None
 

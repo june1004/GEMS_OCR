@@ -5,9 +5,12 @@
 CREATE TABLE IF NOT EXISTS submissions (
     submission_id VARCHAR(64) PRIMARY KEY,
     user_uuid VARCHAR(128) NOT NULL,
+    campaign_id INTEGER DEFAULT 1,
     project_type VARCHAR(16) NOT NULL, -- STAY | TOUR
     status VARCHAR(32) NOT NULL DEFAULT 'PENDING',
     total_amount INTEGER,
+    global_fail_reason VARCHAR(255),
+    audit_trail TEXT,
     fail_reason VARCHAR(255),
     audit_log TEXT,
     created_at TIMESTAMP WITHOUT TIME ZONE NOT NULL DEFAULT NOW()
@@ -33,6 +36,9 @@ CREATE TABLE IF NOT EXISTS receipt_items (
 );
 
 -- 기존 테이블 호환 (이미 생성된 경우 누락 컬럼 보강)
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS campaign_id INTEGER DEFAULT 1;
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS global_fail_reason VARCHAR(255);
+ALTER TABLE submissions ADD COLUMN IF NOT EXISTS audit_trail TEXT;
 ALTER TABLE receipt_items ADD COLUMN IF NOT EXISTS status VARCHAR(32) NOT NULL DEFAULT 'PENDING';
 ALTER TABLE receipt_items ADD COLUMN IF NOT EXISTS error_code VARCHAR(64);
 ALTER TABLE receipt_items ADD COLUMN IF NOT EXISTS error_message VARCHAR(255);

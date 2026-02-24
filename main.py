@@ -23,7 +23,8 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator, UUID4, ConfigDict
 from sqlalchemy import create_engine, Column, String, Integer, DateTime, JSON, Boolean, ARRAY, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
+from sqlalchemy.orm import sessionmaker, Session, relationship
+from sqlalchemy.dialects.postgresql import JSONB
 from botocore.config import Config
 
 load_dotenv()
@@ -67,11 +68,15 @@ class Submission(Base):
     submission_id = Column(String, primary_key=True, index=True)
     user_uuid = Column(String, index=True, nullable=False)
     project_type = Column(String, nullable=False)  # STAY | TOUR
+    campaign_id = Column(Integer, default=1)
     status = Column(String, default="PENDING")  # PENDING | PROCESSING | FIT | UNFIT | ERROR
     total_amount = Column(Integer)
+    global_fail_reason = Column(String)
+    audit_trail = Column(String)
     fail_reason = Column(String)
     audit_log = Column(String)
     created_at = Column(DateTime, default=datetime.utcnow)
+    items = relationship("ReceiptItem", back_populates="submission", cascade="all, delete-orphan")
 
 
 class ReceiptItem(Base):
@@ -93,9 +98,10 @@ class ReceiptItem(Base):
     error_code = Column(String)
     error_message = Column(String)
     confidence_score = Column(Integer)  # 0~100 정수
-    ocr_raw = Column(JSON)
-    parsed = Column(JSON)
+    ocr_raw = Column(JSONB)
+    parsed = Column(JSONB)
     created_at = Column(DateTime, default=datetime.utcnow)
+    submission = relationship("Submission", back_populates="items")
 
 Base.metadata.create_all(bind=engine)
 
@@ -344,6 +350,7 @@ async def get_presigned_url(
                     submission_id=receipt_id,
                     user_uuid=userUuid,
                     project_type=type,
+                    campaign_id=1,
                     status="PENDING",
                     total_amount=0,
                 )
@@ -405,6 +412,7 @@ async def upload_receipt_via_api(
                 submission_id=receipt_id,
                 user_uuid=userUuid,
                 project_type=type,
+                campaign_id=1,
                 status="PENDING",
                 total_amount=0,
             )
@@ -433,6 +441,7 @@ async def submit_receipt(req: CompleteRequest, background_tasks: BackgroundTasks
     if submission.status in ("PROCESSING", "VERIFYING"):
         return {"status": submission.status, "receiptId": req.receiptId}
 
+    submission.campaign_id = req.campaignId
     submission.status = "PROCESSING"
     db.commit()
 
@@ -535,9 +544,9 @@ async def get_status(receiptId: str, db: Session = Depends(get_db)):
         project_type=submission.project_type,
         overall_status=submission.status,
         total_amount=submission.total_amount,
-        global_fail_reason=submission.fail_reason,
+        global_fail_reason=submission.global_fail_reason or submission.fail_reason,
         items=item_details,
-        audit_trail=submission.audit_log or "",
+        audit_trail=(submission.audit_trail or submission.audit_log or ""),
         status=submission.status,
         amount=submission.total_amount,
         failReason=submission.fail_reason,
@@ -867,6 +876,66 @@ def _global_fail_reason(code: Optional[str]) -> Optional[str]:
     return mapping.get(code, _fail_message(code))
 
 
+def map_ocr_to_db(
+    submission_id: str,
+    ocr_assets: List[Dict[str, Any]],
+    documents: List[Dict[str, str]],
+) -> Tuple[List[ReceiptItem], int]:
+    """
+    OCR 결과를 ReceiptItem 모델에 매핑하고, FIT 항목 합산 금액을 계산.
+    - 카드번호 미인식/비정상: 0000 정규화
+    - amount는 status == FIT 인 항목만 합산
+    """
+    items: List[ReceiptItem] = []
+    total_fit_amount = 0
+    for idx, asset in enumerate(ocr_assets, start=1):
+        p = asset.get("parsed") or {}
+        status = asset.get("status", "PENDING")
+        amount = p.get("amount") if isinstance(p.get("amount"), int) else None
+        card_num = _normalize_card_num(p.get("cardNum"))
+        item = ReceiptItem(
+            submission_id=submission_id,
+            seq_no=idx,
+            doc_type=asset.get("docType", (documents[idx - 1].get("docType") if idx - 1 < len(documents) else "RECEIPT")),
+            image_key=(asset.get("imageKey") or "").strip(),
+            store_name=(p.get("storeName") or "").strip() or None,
+            biz_num=(p.get("businessNum") or "").strip() or None,
+            pay_date=(p.get("payDate") or "").strip() or None,
+            amount=amount,
+            address=(p.get("address") or "").strip() or None,
+            location=(p.get("location") or "").strip() or None,
+            card_num=card_num,
+            status=status,
+            error_code=_normalize_error_code(asset.get("error_code")),
+            error_message=_fail_message(_normalize_error_code(asset.get("error_code"))),
+            confidence_score=p.get("confidenceScore") if isinstance(p.get("confidenceScore"), int) else None,
+            ocr_raw=asset.get("ocrRaw"),
+            parsed=p,
+        )
+        if status == "FIT" and isinstance(amount, int):
+            total_fit_amount += amount
+        items.append(item)
+    return items, total_fit_amount
+
+
+def finalize_submission(submission: Submission, total_amount: int, min_criteria: int, fail_code: Optional[str]) -> None:
+    """
+    submission 최종 판정/감사로그 저장.
+    - FIT item 금액 합산 기준으로 최종 판정
+    """
+    submission.total_amount = total_amount
+    if not fail_code and total_amount >= min_criteria:
+        submission.status = "FIT"
+        submission.global_fail_reason = None
+        submission.fail_reason = None
+    else:
+        submission.status = "UNFIT"
+        resolved = fail_code or "BIZ_003"
+        reason = _global_fail_reason(resolved)
+        submission.global_fail_reason = reason
+        submission.fail_reason = reason
+
+
 def _build_documents_from_request(req: CompleteRequest) -> List[Dict[str, str]]:
     if req.documents:
         return [
@@ -971,7 +1040,9 @@ async def analyze_receipt_task(req: CompleteRequest):
         if not documents:
             submission.status = "UNFIT"
             submission.fail_reason = _global_fail_reason("BIZ_010")
+            submission.global_fail_reason = submission.fail_reason
             submission.audit_log = "문서 구성 요건 불충족"
+            submission.audit_trail = submission.audit_log
             db.commit()
             return
 
@@ -1005,31 +1076,10 @@ async def analyze_receipt_task(req: CompleteRequest):
 
         # 2) 자식 테이블 개별 저장 (기존 동일 submission_id 아이템 교체)
         db.query(ReceiptItem).filter(ReceiptItem.submission_id == req.receiptId).delete(synchronize_session=False)
-        item_rows: List[ReceiptItem] = []
-        for idx, asset in enumerate(ocr_assets, start=1):
-            p = asset["parsed"]
-            card_num = _normalize_card_num(p.get("cardNum"))
-            item = ReceiptItem(
-                submission_id=req.receiptId,
-                seq_no=idx,
-                doc_type=asset["docType"],
-                image_key=asset["imageKey"],
-                store_name=(p.get("storeName") or "").strip() or None,
-                biz_num=(p.get("businessNum") or "").strip() or None,
-                pay_date=(p.get("payDate") or "").strip() or None,
-                amount=p.get("amount") if isinstance(p.get("amount"), int) else None,
-                address=(p.get("address") or "").strip() or None,
-                location=(p.get("location") or "").strip() or None,
-                card_num=card_num,
-                status=asset.get("status", "PENDING"),
-                error_code=_normalize_error_code(asset.get("error_code")),
-                error_message=_fail_message(_normalize_error_code(asset.get("error_code"))),
-                confidence_score=p.get("confidenceScore") if isinstance(p.get("confidenceScore"), int) else None,
-                ocr_raw=asset["ocrRaw"],
-                parsed=p,
-            )
+        mapped_items, _ = map_ocr_to_db(req.receiptId, ocr_assets, documents)
+        item_rows: List[ReceiptItem] = mapped_items
+        for item in item_rows:
             db.add(item)
-            item_rows.append(item)
 
         def mark_item(i: int, status: str, code: Optional[str]) -> None:
             normalized = _normalize_error_code(code) or code
@@ -1193,17 +1243,19 @@ async def analyze_receipt_task(req: CompleteRequest):
         audit_lines.append(f"총 {len(ocr_assets)}매 중 적격 {fit_cnt}매, 부적격 {unfit_cnt}매, 오류 {err_cnt}매")
 
         # 4) 부모 상태 업데이트
-        submission.total_amount = total_amount
-        submission.status = "FIT" if not fail_code else "UNFIT"
-        submission.fail_reason = _global_fail_reason(fail_code)
-        submission.audit_log = " | ".join(audit_lines) if audit_lines else submission.fail_reason
+        min_criteria = 60000 if req.type == "STAY" else 50000
+        finalize_submission(submission, total_amount, min_criteria, fail_code)
+        submission.audit_log = " | ".join(audit_lines) if audit_lines else (submission.fail_reason or "")
+        submission.audit_trail = submission.audit_log
         db.commit()
 
     except Exception as e:
         logger.error("analyze_receipt_task failed: %s", e, exc_info=True)
         submission.status = "ERROR"
         submission.fail_reason = str(e)
+        submission.global_fail_reason = submission.fail_reason
         submission.audit_log = "complete 처리 중 예외 발생"
+        submission.audit_trail = submission.audit_log
         db.commit()
     finally:
         db.close()

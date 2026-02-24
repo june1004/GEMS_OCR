@@ -1221,6 +1221,37 @@ async def analyze_receipt_task(req: CompleteRequest):
         submission.status = "VERIFYING"
         db.commit()
 
+        # VERIFYING 중에도 status API에서 items를 볼 수 있도록 placeholder 선저장
+        existing_rows = (
+            db.query(ReceiptItem)
+            .filter(ReceiptItem.submission_id == req.receiptId)
+            .order_by(ReceiptItem.seq_no.asc())
+            .all()
+        )
+        if len(existing_rows) != len(documents):
+            db.query(ReceiptItem).filter(ReceiptItem.submission_id == req.receiptId).delete(synchronize_session=False)
+            for idx, d in enumerate(documents, start=1):
+                db.add(
+                    ReceiptItem(
+                        submission_id=req.receiptId,
+                        seq_no=idx,
+                        doc_type=d.get("docType", "RECEIPT"),
+                        image_key=(d.get("imageKey") or "").strip(),
+                        card_num="0000",
+                        status="PENDING",
+                    )
+                )
+        else:
+            for idx, d in enumerate(documents, start=1):
+                row = existing_rows[idx - 1]
+                row.seq_no = idx
+                row.doc_type = d.get("docType", "RECEIPT")
+                row.image_key = (d.get("imageKey") or "").strip()
+                row.status = "PENDING"
+                row.error_code = None
+                row.error_message = None
+        db.commit()
+
         # 1) 병렬 OCR 수행
         tasks = [
             _run_ocr_for_document(req.receiptId, d.get("imageKey", ""), d.get("docType", "RECEIPT"))
@@ -1245,12 +1276,38 @@ async def analyze_receipt_task(req: CompleteRequest):
                 r["error_code"] = None
                 ocr_assets.append(r)
 
-        # 2) 자식 테이블 개별 저장 (기존 동일 submission_id 아이템 교체)
-        db.query(ReceiptItem).filter(ReceiptItem.submission_id == req.receiptId).delete(synchronize_session=False)
+        # 2) 자식 테이블 개별 저장 (placeholder row 업데이트)
         mapped_items, _ = map_ocr_to_db(req.receiptId, ocr_assets, documents)
-        item_rows: List[ReceiptItem] = mapped_items
-        for item in item_rows:
-            db.add(item)
+        item_rows = (
+            db.query(ReceiptItem)
+            .filter(ReceiptItem.submission_id == req.receiptId)
+            .order_by(ReceiptItem.seq_no.asc())
+            .all()
+        )
+        if len(item_rows) != len(mapped_items):
+            # 이론상 발생하지 않아야 하나, 안전하게 재구성
+            db.query(ReceiptItem).filter(ReceiptItem.submission_id == req.receiptId).delete(synchronize_session=False)
+            for item in mapped_items:
+                db.add(item)
+            item_rows = mapped_items
+        else:
+            for i, mapped in enumerate(mapped_items):
+                row = item_rows[i]
+                row.doc_type = mapped.doc_type
+                row.image_key = mapped.image_key
+                row.store_name = mapped.store_name
+                row.biz_num = mapped.biz_num
+                row.pay_date = mapped.pay_date
+                row.amount = mapped.amount
+                row.address = mapped.address
+                row.location = mapped.location
+                row.card_num = mapped.card_num
+                row.status = mapped.status
+                row.error_code = mapped.error_code
+                row.error_message = mapped.error_message
+                row.confidence_score = mapped.confidence_score
+                row.ocr_raw = mapped.ocr_raw
+                row.parsed = mapped.parsed
 
         def mark_item(i: int, status: str, code: Optional[str]) -> None:
             normalized = _normalize_error_code(code) or code

@@ -9,7 +9,7 @@ import logging
 from enum import Enum
 import httpx
 import boto3
-from PIL import Image
+from PIL import Image, ImageOps, ImageEnhance
 from botocore.exceptions import ClientError, BotoCoreError
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union, Tuple
@@ -463,6 +463,7 @@ class ReceiptItemSchema(BaseModel):
     error_message: Optional[str] = None
     extracted_data: Optional[ExtractedData] = None
     image_url: str = Field(..., description="MinIO object key 또는 접근 URL")
+    ocr_raw: Optional[Dict[str, Any]] = Field(None, description="원본 OCR JSON (자산화)")
 
 
 class SubmissionStatusResponse(BaseModel):
@@ -537,6 +538,7 @@ async def get_status(receiptId: str, db: Session = Depends(get_db)):
                 error_message=it.error_message,
                 extracted_data=extracted,
                 image_url=it.image_key,
+                ocr_raw=it.ocr_raw,
             )
         )
     return StatusResponse(
@@ -601,10 +603,15 @@ def _resize_and_compress_for_ocr(
     """
     try:
         img = Image.open(io.BytesIO(image_bytes))
+        # EXIF 방향 보정 (촬영 방향 뒤집힘 방지)
+        img = ImageOps.exif_transpose(img)
         if img.mode in ("RGBA", "P"):
             img = img.convert("RGB")
         elif img.mode != "RGB":
             img = img.convert("RGB")
+        # 가벼운 대비/선명도 보정으로 OCR 안정성 향상
+        img = ImageOps.autocontrast(img, cutoff=1)
+        img = ImageEnhance.Sharpness(img).enhance(1.2)
         w, h = img.size
         if w > MAX_OCR_DIMENSION or h > MAX_OCR_DIMENSION:
             ratio = min(MAX_OCR_DIMENSION / w, MAX_OCR_DIMENSION / h)
@@ -673,6 +680,30 @@ async def _call_naver_ocr_binary(
         response = await client.post(NAVER_OCR_URL, headers=headers, files=files)
         response.raise_for_status()
         return response.json()
+
+
+async def _call_naver_ocr_with_retry(
+    image_binary: bytes, receipt_id: str, image_format: str = "jpg", retries: int = 2
+) -> dict:
+    """
+    네이버 OCR 호출 재시도 래퍼.
+    - 네트워크/일시적 API 오류 시 최대 retries+1회 시도
+    """
+    last_exc: Optional[Exception] = None
+    for attempt in range(retries + 1):
+        try:
+            return await _call_naver_ocr_binary(image_binary, receipt_id, image_format)
+        except Exception as e:
+            last_exc = e
+            logger.warning(
+                "Naver OCR call failed (attempt %s/%s): %s",
+                attempt + 1,
+                retries + 1,
+                e,
+            )
+            if attempt < retries:
+                await asyncio.sleep(0.4 * (attempt + 1))
+    raise last_exc if last_exc else RuntimeError("Naver OCR failed")
 
 
 def _parse_ocr_result(ocr_data: dict) -> tuple[Optional[int], Optional[str], Optional[str], Optional[str], Optional[str]]:
@@ -1000,7 +1031,7 @@ async def _run_ocr_for_document(receipt_id: str, image_key: str, doc_type: str) 
     image_bytes, content_type = _get_image_bytes_from_s3(image_key)
     image_bytes, content_type = _resize_and_compress_for_ocr(image_bytes, content_type)
     image_format = _image_format_from_content_type(content_type)
-    ocr_data = await _call_naver_ocr_binary(image_bytes, receipt_id, image_format)
+    ocr_data = await _call_naver_ocr_with_retry(image_bytes, receipt_id, image_format, retries=2)
 
     if doc_type == "RECEIPT":
         amount, pay_date, store_name, address, location = _parse_ocr_result(ocr_data)

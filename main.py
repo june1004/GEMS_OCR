@@ -4,9 +4,11 @@ import re
 import time
 import uuid
 import json
+import logging
 import httpx
 import boto3
 from PIL import Image
+from botocore.exceptions import ClientError, BotoCoreError
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Union, Tuple
 from dotenv import load_dotenv
@@ -23,6 +25,13 @@ from sqlalchemy.orm import sessionmaker, Session
 from botocore.config import Config
 
 load_dotenv()
+
+# 로거 설정 (에러 스택 트레이스 확인용)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
+logger = logging.getLogger(__name__)
 
 # 1. 인프라 설정 (환경 변수)
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -185,6 +194,57 @@ def get_db():
     try: yield db
     finally: db.close()
 
+
+def _check_s3_connection() -> Tuple[bool, Optional[str]]:
+    """S3(MinIO) 연결 및 버킷 접근 가능 여부 확인. 반환: (성공 여부, 실패 시 메시지)."""
+    try:
+        s3_client.head_bucket(Bucket=S3_BUCKET)
+        return True, None
+    except ClientError as e:
+        err = e.response.get("Error", {})
+        code = err.get("Code", "")
+        msg = err.get("Message", str(e))
+        logger.error("S3 ClientError: %s - %s", code, msg, exc_info=True)
+        return False, f"S3 오류({code}): {msg}"
+    except BotoCoreError as e:
+        logger.error("S3 BotoCoreError: %s", e, exc_info=True)
+        return False, f"S3 연결 오류: {str(e)}"
+    except Exception as e:
+        logger.error("S3 unexpected error: %s", e, exc_info=True)
+        return False, f"S3 오류: {str(e)}"
+
+
+def _check_db_connection() -> Tuple[bool, Optional[str]]:
+    """DB 연결 및 receipts 테이블 존재 여부 확인. 반환: (성공 여부, 실패 시 메시지)."""
+    try:
+        db = SessionLocal()
+        try:
+            db.execute(sql_text("SELECT 1"))
+            db.execute(sql_text("SELECT 1 FROM receipts LIMIT 1"))
+            return True, None
+        finally:
+            db.close()
+    except Exception as e:
+        logger.error("DB connection error: %s", e, exc_info=True)
+        return False, f"DB 오류: {str(e)}"
+
+
+@app.get("/api/health", summary="헬스 체크 (S3·DB 연결 확인)")
+async def health_check():
+    """S3 버킷 접근 및 DB 연결·테이블 존재 여부를 확인합니다. 배포/프록시에서 사용."""
+    s3_ok, s3_msg = _check_s3_connection()
+    db_ok, db_msg = _check_db_connection()
+    ok = s3_ok and db_ok
+    detail = {}
+    if not s3_ok:
+        detail["s3"] = s3_msg
+    if not db_ok:
+        detail["db"] = db_msg
+    if not ok:
+        raise HTTPException(status_code=503, detail=detail)
+    return {"status": "ok", "s3": "ok", "db": "ok"}
+
+
 @app.post("/api/v1/receipts/presigned-url", response_model=PresignedUrlResponse)
 async def get_presigned_url(
     fileName: str,
@@ -203,23 +263,46 @@ async def get_presigned_url(
         raise HTTPException(status_code=400, detail="type must be STAY or TOUR")
 
     receipt_id = receiptId or str(uuid.uuid4())
-    # 동일 fileName 반복 업로드 충돌 방지용 랜덤 접미사
     object_key = f"receipts/{receipt_id}_{uuid.uuid4().hex[:8]}_{fileName}"
-    # 설계안: 업로드 URL 10분 유효 (PROJECT/전 단계 JSON API 설계안.md)
-    url = s3_client.generate_presigned_url(
-        "put_object",
-        Params={"Bucket": S3_BUCKET, "Key": object_key, "ContentType": contentType},
-        ExpiresIn=600,  # 10분
-    )
-    
-    existing = db.query(Receipt).filter(Receipt.receipt_id == receipt_id).first()
-    if existing:
-        if existing.user_uuid != userUuid:
-            raise HTTPException(status_code=403, detail="receiptId owner mismatch")
-        existing.type = type
-    else:
-        db.add(Receipt(receipt_id=receipt_id, user_uuid=userUuid, type=type, status="PENDING"))
-    db.commit()
+
+    try:
+        url = s3_client.generate_presigned_url(
+            "put_object",
+            Params={"Bucket": S3_BUCKET, "Key": object_key, "ContentType": contentType},
+            ExpiresIn=600,
+        )
+    except ClientError as e:
+        err = e.response.get("Error", {})
+        code = err.get("Code", "")
+        msg = err.get("Message", str(e))
+        logger.error("S3 Presigned URL ClientError: %s - %s", code, msg, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"S3 오류(Presigned URL): {code} - {msg}",
+        )
+    except (BotoCoreError, Exception) as e:
+        logger.error("S3 Presigned URL unexpected error: %s", e, exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Presigned URL 생성 실패: {str(e)}",
+        )
+
+    try:
+        existing = db.query(Receipt).filter(Receipt.receipt_id == receipt_id).first()
+        if existing:
+            if existing.user_uuid != userUuid:
+                raise HTTPException(status_code=403, detail="receiptId owner mismatch")
+            existing.type = type
+        else:
+            db.add(Receipt(receipt_id=receipt_id, user_uuid=userUuid, type=type, status="PENDING"))
+        db.commit()
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error("DB error in presigned-url: %s", e, exc_info=True)
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB 오류: {str(e)}")
+
     return {"uploadUrl": url, "receiptId": receipt_id, "objectKey": object_key}
 
 
@@ -249,14 +332,27 @@ async def upload_receipt_via_api(
     object_key = f"receipts/{receipt_id}_{name}"
     content_type = file.content_type or "image/jpeg"
     body = await file.read()
-    s3_client.put_object(
-        Bucket=S3_BUCKET,
-        Key=object_key,
-        Body=body,
-        ContentType=content_type,
-    )
-    db.add(Receipt(receipt_id=receipt_id, user_uuid=userUuid, type=type, status="PENDING"))
-    db.commit()
+    try:
+        s3_client.put_object(
+            Bucket=S3_BUCKET,
+            Key=object_key,
+            Body=body,
+            ContentType=content_type,
+        )
+    except ClientError as e:
+        err = e.response.get("Error", {})
+        logger.error("S3 put_object ClientError: %s", err, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"S3 업로드 오류: {err.get('Message', str(e))}")
+    except (BotoCoreError, Exception) as e:
+        logger.error("S3 put_object error: %s", e, exc_info=True)
+        raise HTTPException(status_code=500, detail=f"S3 업로드 실패: {str(e)}")
+    try:
+        db.add(Receipt(receipt_id=receipt_id, user_uuid=userUuid, type=type, status="PENDING"))
+        db.commit()
+    except Exception as e:
+        logger.error("DB error in upload: %s", e, exc_info=True)
+        db.rollback()
+        raise HTTPException(status_code=500, detail=f"DB 오류: {str(e)}")
     return {"uploadUrl": "", "receiptId": receipt_id, "objectKey": object_key}
 
 
@@ -831,6 +927,7 @@ async def analyze_receipt_task(req: CompleteRequest):
         db.commit()
 
     except Exception as e:
+        logger.error("analyze_receipt_task failed: %s", e, exc_info=True)
         receipt.status = "ERROR"
         receipt.fail_reason = str(e)
         db.commit()

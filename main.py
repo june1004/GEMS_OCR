@@ -4,7 +4,9 @@ import re
 import time
 import uuid
 import json
+import asyncio
 import logging
+from enum import Enum
 import httpx
 import boto3
 from PIL import Image
@@ -18,8 +20,8 @@ from sqlalchemy import text as sql_text
 from processor import validate_and_match, validate_campaign_rules, match_store_in_master
 from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, JSON, Boolean, ARRAY
+from pydantic import BaseModel, Field, model_validator, UUID4, ConfigDict
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, JSON, Boolean, ARRAY, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from botocore.config import Config
@@ -59,34 +61,75 @@ s3_client = boto3.client(
     config=Config(signature_version='s3v4')
 )
 
-# 3. 데이터베이스 모델 (자산화 분석용, FE 연동 STAY/TOUR)
-class Receipt(Base):
-    __tablename__ = "receipts"
-    receipt_id = Column(String, primary_key=True, index=True)
+# 3. 데이터베이스 모델 (1:N 상속형 자산화 구조)
+class Submission(Base):
+    __tablename__ = "submissions"
+    submission_id = Column(String, primary_key=True, index=True)
     user_uuid = Column(String, index=True, nullable=False)
-    type = Column(String, nullable=False)  # STAY | TOUR
-    status = Column(String, default="PENDING")  # PENDING → PROCESSING → VERIFYING → FIT | UNFIT | DUPLICATE | ERROR
-    amount = Column(Integer)
-    pay_date = Column(String)
-    store_name = Column(String)
-    address = Column(String)  # OCR 가맹점 주소 전체 (강원특별자치도 검증용)
-    location = Column(String)  # 시군 정보 (데이터 자산화)
-    # FE 연동(합산형): 단일/복수 이미지 및 신규 스펙
-    image_key = Column(String(500))  # 단일 이미지 객체 키 (하위호환)
-    image_keys = Column(ARRAY(String))  # 복수 이미지 (TOUR 1~3장 등), PostgreSQL TEXT[]
-    documents = Column(JSON)  # 신규 스펙: [{ imageKey, docType }], DB는 JSONB
-    business_num = Column(String)  # 사업자등록번호 (OCR 추출)
-    ocr_assets = Column(JSON)  # 이미지별 OCR 원본/파싱 결과 배열
-    audit_trail = Column(String)  # 검증 근거 요약 문자열
-    submission_type = Column(String)  # LEGACY_DATA | DOCUMENTS
-    card_prefix = Column(String)  # 카드 앞 4자리
+    project_type = Column(String, nullable=False)  # STAY | TOUR
+    status = Column(String, default="PENDING")  # PENDING | PROCESSING | FIT | UNFIT | ERROR
+    total_amount = Column(Integer)
     fail_reason = Column(String)
+    audit_log = Column(String)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class ReceiptItem(Base):
+    __tablename__ = "receipt_items"
+    item_id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    submission_id = Column(String, ForeignKey("submissions.submission_id"), index=True, nullable=False)
+    seq_no = Column(Integer, nullable=False, default=1)  # 업로드 순번
+    doc_type = Column(String, nullable=False, default="RECEIPT")
+    image_key = Column(String(500), nullable=False)
+    # 개별 OCR 자산 필드
+    store_name = Column(String)
+    biz_num = Column(String)
+    pay_date = Column(String)
+    amount = Column(Integer)
+    address = Column(String)
+    location = Column(String)
+    card_num = Column(String, default="0000")
+    status = Column(String, default="PENDING")  # PENDING | FIT | UNFIT | ERROR
+    error_code = Column(String)
+    error_message = Column(String)
+    confidence_score = Column(Integer)  # 0~100 정수
     ocr_raw = Column(JSON)
+    parsed = Column(JSON)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(bind=engine)
 
-# 4. Pydantic 스키마 (요구사항 반영)
+# 4. Pydantic 스키마 (1:N + 자산화 지침 반영)
+class ProjectType(str, Enum):
+    STAY = "STAY"
+    TOUR = "TOUR"
+
+
+class ProcessStatus(str, Enum):
+    PENDING = "PENDING"
+    PROCESSING = "PROCESSING"
+    VERIFYING = "VERIFYING"
+    FIT = "FIT"
+    UNFIT = "UNFIT"
+    ERROR = "ERROR"
+
+
+class ErrorCode(str, Enum):
+    BIZ_001 = "BIZ_001"
+    BIZ_002 = "BIZ_002"
+    BIZ_003 = "BIZ_003"
+    BIZ_004 = "BIZ_004"
+    BIZ_005 = "BIZ_005"
+    BIZ_006 = "BIZ_006"
+    BIZ_007 = "BIZ_007"
+    BIZ_008 = "BIZ_008"
+    BIZ_010 = "BIZ_010"
+    BIZ_011 = "BIZ_011"
+    OCR_001 = "OCR_001"
+    OCR_002 = "OCR_002"
+    OCR_003 = "OCR_003"
+
+
 class StayData(BaseModel):
     location: str
     payDate: str
@@ -114,7 +157,7 @@ class PresignedUrlResponse(BaseModel):
     objectKey: str
 
 class CompleteResponse(BaseModel):
-    status: str = "PROCESSING"
+    status: ProcessStatus = ProcessStatus.PROCESSING
     receiptId: str
 
 class CompleteRequest(BaseModel):
@@ -216,12 +259,13 @@ def _check_s3_connection() -> Tuple[bool, Optional[str]]:
 
 
 def _check_db_connection() -> Tuple[bool, Optional[str]]:
-    """DB 연결 및 receipts 테이블 존재 여부 확인. 반환: (성공 여부, 실패 시 메시지)."""
+    """DB 연결 및 핵심 테이블 존재 여부 확인. 반환: (성공 여부, 실패 시 메시지)."""
     try:
         db = SessionLocal()
         try:
             db.execute(sql_text("SELECT 1"))
-            db.execute(sql_text("SELECT 1 FROM receipts LIMIT 1"))
+            db.execute(sql_text("SELECT 1 FROM submissions LIMIT 1"))
+            db.execute(sql_text("SELECT 1 FROM receipt_items LIMIT 1"))
             return True, None
         finally:
             db.close()
@@ -289,13 +333,21 @@ async def get_presigned_url(
         )
 
     try:
-        existing = db.query(Receipt).filter(Receipt.receipt_id == receipt_id).first()
+        existing = db.query(Submission).filter(Submission.submission_id == receipt_id).first()
         if existing:
             if existing.user_uuid != userUuid:
                 raise HTTPException(status_code=403, detail="receiptId owner mismatch")
-            existing.type = type
+            existing.project_type = type
         else:
-            db.add(Receipt(receipt_id=receipt_id, user_uuid=userUuid, type=type, status="PENDING"))
+            db.add(
+                Submission(
+                    submission_id=receipt_id,
+                    user_uuid=userUuid,
+                    project_type=type,
+                    status="PENDING",
+                    total_amount=0,
+                )
+            )
         db.commit()
     except HTTPException:
         raise
@@ -348,7 +400,15 @@ async def upload_receipt_via_api(
         logger.error("S3 put_object error: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"S3 업로드 실패: {str(e)}")
     try:
-        db.add(Receipt(receipt_id=receipt_id, user_uuid=userUuid, type=type, status="PENDING"))
+        db.add(
+            Submission(
+                submission_id=receipt_id,
+                user_uuid=userUuid,
+                project_type=type,
+                status="PENDING",
+                total_amount=0,
+            )
+        )
         db.commit()
     except Exception as e:
         logger.error("DB error in upload: %s", e, exc_info=True)
@@ -360,32 +420,62 @@ async def upload_receipt_via_api(
 @app.post("/api/v1/receipts/complete", response_model=CompleteResponse)
 async def submit_receipt(req: CompleteRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """3단계: 사용자 입력값 수신 및 비동기 분석 시작 (합산형 documents 지원)"""
-    receipt = db.query(Receipt).filter(Receipt.receipt_id == req.receiptId).first()
-    if not receipt:
-        raise HTTPException(status_code=404, detail="Receipt not found")
+    submission = db.query(Submission).filter(Submission.submission_id == req.receiptId).first()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
 
-    if receipt.user_uuid != req.userUuid:
+    if submission.user_uuid != req.userUuid:
         raise HTTPException(status_code=403, detail="receiptId owner mismatch")
 
-    if receipt.status in ("FIT", "UNFIT", "DUPLICATE", "ERROR"):
-        raise HTTPException(status_code=409, detail="Receipt already completed")
+    if submission.status in ("FIT", "UNFIT", "ERROR"):
+        raise HTTPException(status_code=409, detail="Submission already completed")
 
-    if receipt.status in ("PROCESSING", "VERIFYING"):
-        return {"status": receipt.status, "receiptId": req.receiptId}
+    if submission.status in ("PROCESSING", "VERIFYING"):
+        return {"status": submission.status, "receiptId": req.receiptId}
 
-    receipt.status = "PROCESSING"
+    submission.status = "PROCESSING"
     db.commit()
 
     background_tasks.add_task(analyze_receipt_task, req)
     return {"status": "PROCESSING", "receiptId": req.receiptId}
 
-class StatusResponse(BaseModel):
-    status: Optional[str] = None
+class ExtractedData(BaseModel):
+    store_name: Optional[str] = Field(None, description="상호명")
+    amount: int = Field(0, description="인식된 금액")
+    pay_date: Optional[str] = Field(None, description="결제일자")
+    address: Optional[str] = Field(None, description="상점 주소")
+    card_num: str = Field("0000", description="카드번호 앞 4자리 (현금/미인식 시 0000)")
+
+
+class ReceiptItemSchema(BaseModel):
+    item_id: str
+    status: ProcessStatus
+    error_code: Optional[ErrorCode] = None
+    error_message: Optional[str] = None
+    extracted_data: Optional[ExtractedData] = None
+    image_url: str = Field(..., description="MinIO object key 또는 접근 URL")
+
+
+class SubmissionStatusResponse(BaseModel):
+    submission_id: UUID4
+    project_type: ProjectType
+    overall_status: ProcessStatus
+    total_amount: int = Field(0, description="FIT 상태인 영수증들의 합산 금액")
+    global_fail_reason: Optional[str] = Field(None, description="사업 기준 미달 사유")
+    items: List[ReceiptItemSchema] = Field(default_factory=list, description="하위 영수증 목록")
+    audit_trail: str = Field("", description="시스템 판정 근거 요약")
+
+    model_config = ConfigDict(from_attributes=True)
+
+
+class StatusResponse(SubmissionStatusResponse):
+    # 하위호환 필드
+    status: Optional[ProcessStatus] = None
     amount: Optional[int] = None
     failReason: Optional[str] = None
     rewardAmount: int = 0
-    address: Optional[str] = None  # 가맹점 주소(시군 또는 주소)
-    cardPrefix: Optional[str] = None  # 카드 앞 4자리(비식별화)
+    address: Optional[str] = None
+    cardPrefix: Optional[str] = None
 
 def _sanitize_receipt_id(raw: str) -> str:
     """FE/프록시에서 잘못 붙은 문자가 있을 수 있음 (예: 'uuid HTTP/1.1\" 404...'). UUID만 추출."""
@@ -404,17 +494,56 @@ def _sanitize_receipt_id(raw: str) -> str:
 async def get_status(receiptId: str, db: Session = Depends(get_db)):
     """4단계: 최종 결과 조회 (데이터 자산화: address, cardPrefix 포함)"""
     receipt_id = _sanitize_receipt_id(receiptId)
-    receipt = db.query(Receipt).filter(Receipt.receipt_id == receipt_id).first()
-    if not receipt:
-        raise HTTPException(status_code=404, detail="Receipt not found")
-    address = (receipt.address or receipt.location or receipt.store_name or "").strip() or None
+    submission = db.query(Submission).filter(Submission.submission_id == receipt_id).first()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    item_rows = (
+        db.query(ReceiptItem)
+        .filter(ReceiptItem.submission_id == receipt_id)
+        .order_by(ReceiptItem.seq_no.asc())
+        .all()
+    )
+    first_item = item_rows[0] if item_rows else None
+    address = None
+    card_prefix = None
+    if first_item:
+        address = (first_item.address or first_item.location or first_item.store_name or "").strip() or None
+        card_prefix = first_item.card_num or None
+    item_details: List[ReceiptItemSchema] = []
+    for it in item_rows:
+        extracted = None
+        if it.status != "ERROR":
+            extracted = ExtractedData(
+                store_name=it.store_name,
+                amount=it.amount or 0,
+                pay_date=it.pay_date,
+                address=it.address,
+                card_num=it.card_num or "0000",
+            )
+        item_details.append(
+            ReceiptItemSchema(
+                item_id=it.item_id,
+                status=it.status or "PENDING",
+                error_code=_normalize_error_code(it.error_code),
+                error_message=it.error_message,
+                extracted_data=extracted,
+                image_url=it.image_key,
+            )
+        )
     return StatusResponse(
-        status=receipt.status,
-        amount=receipt.amount,
-        failReason=receipt.fail_reason,
-        rewardAmount=30000 if receipt.type == "STAY" and receipt.status == "FIT" else 10000 if receipt.status == "FIT" else 0,
+        submission_id=submission.submission_id,
+        project_type=submission.project_type,
+        overall_status=submission.status,
+        total_amount=submission.total_amount,
+        global_fail_reason=submission.fail_reason,
+        items=item_details,
+        audit_trail=submission.audit_log or "",
+        status=submission.status,
+        amount=submission.total_amount,
+        failReason=submission.fail_reason,
+        rewardAmount=30000 if submission.project_type == "STAY" and submission.status == "FIT" else 10000 if submission.status == "FIT" else 0,
         address=address,
-        cardPrefix=receipt.card_prefix,
+        cardPrefix=card_prefix,
     )
 
 
@@ -613,14 +742,72 @@ def _extract_business_num(ocr_data: dict) -> Optional[str]:
         return None
 
 
-def _check_duplicate_receipt(db: Session, store_name: str, pay_date: str, amount: int, card_prefix: str) -> bool:
-    """동일 상호명+결제날짜+금액+카드앞4자리 존재 시 True (BIZ_001)"""
-    q = db.query(Receipt).filter(
-        Receipt.store_name == store_name,
-        Receipt.pay_date == pay_date,
-        Receipt.amount == amount,
-        Receipt.card_prefix == card_prefix,
-        Receipt.status == "FIT",
+def _normalize_card_num(raw: Optional[str]) -> str:
+    """
+    카드번호 정규화:
+    - 숫자 4자리 이상이면 마지막 4자리 저장
+    - 비어 있거나 은행명/문자열 등 카드번호가 아니면 '0000'
+    """
+    text = (raw or "").strip()
+    digits = re.sub(r"[^0-9]", "", text)
+    if len(digits) >= 4:
+        return digits[-4:]
+    return "0000"
+
+
+def _extract_card_num(ocr_data: dict) -> str:
+    """OCR 결과에서 카드번호(last4)를 추출. 없거나 비정상이면 0000."""
+    try:
+        images = ocr_data.get("images") or []
+        if not images:
+            return "0000"
+        result = (images[0].get("receipt") or {}).get("result") or {}
+        card_info = (result.get("paymentInfo") or {}).get("cardInfo") or {}
+        card_num_obj = card_info.get("number") or {}
+        return _normalize_card_num(card_num_obj.get("text"))
+    except Exception:
+        return "0000"
+
+
+def _extract_confidence_score(ocr_data: dict) -> Optional[int]:
+    """영수증별 신뢰도 스냅샷(0~100): totalPrice.price confidence 우선."""
+    try:
+        images = ocr_data.get("images") or []
+        if not images:
+            return None
+        result = (images[0].get("receipt") or {}).get("result") or {}
+        price = (result.get("totalPrice") or {}).get("price") or {}
+        conf = price.get("confidenceScore")
+        if isinstance(conf, (int, float)):
+            return int(round(float(conf) * 100))
+        return None
+    except Exception:
+        return None
+
+
+def _check_duplicate_receipt_item(
+    db: Session,
+    submission_id: str,
+    biz_num: Optional[str],
+    pay_date: str,
+    amount: int,
+    card_num: str,
+) -> bool:
+    """
+    item 단위 중복 체크:
+    biz_num + pay_date + amount + card_num(0000 포함) 조합이 다른 FIT 신청에 존재하면 True.
+    """
+    if not biz_num:
+        return False
+    q = (
+        db.query(ReceiptItem)
+        .join(Submission, Submission.submission_id == ReceiptItem.submission_id)
+        .filter(ReceiptItem.biz_num == biz_num)
+        .filter(ReceiptItem.pay_date == pay_date)
+        .filter(ReceiptItem.amount == amount)
+        .filter(ReceiptItem.card_num == _normalize_card_num(card_num))
+        .filter(ReceiptItem.submission_id != submission_id)
+        .filter(Submission.status == "FIT")
     )
     return q.first() is not None
 
@@ -657,6 +844,27 @@ def _fail_message(code: Optional[str]) -> Optional[str]:
         "OCR_003": "OCR_003 (마스터 상호 미등록)",
     }
     return msg.get(code, code)
+
+
+def _normalize_error_code(code: Optional[str]) -> Optional[str]:
+    """에러 문자열에서 표준 코드 토큰(BIZ_###/OCR_###)만 추출."""
+    if not code:
+        return None
+    m = re.search(r"\b((?:BIZ|OCR)_[0-9]{3})\b", str(code))
+    return m.group(1) if m else None
+
+
+def _global_fail_reason(code: Optional[str]) -> Optional[str]:
+    """submission(마스터) 단위 fail reason 표준화."""
+    if not code:
+        return None
+    mapping = {
+        "BIZ_003": "UNFIT_TOTAL_AMOUNT (BIZ_003, 합산 금액 미달)",
+        "BIZ_011": "UNFIT_STAY_MISMATCH (BIZ_011, 숙박-증빙 불일치)",
+        "BIZ_004": "UNFIT_REGION (BIZ_004, 지역 불일치)",
+        "BIZ_002": "UNFIT_DATE (BIZ_002, 결제일/기간 오류)",
+    }
+    return mapping.get(code, _fail_message(code))
 
 
 def _build_documents_from_request(req: CompleteRequest) -> List[Dict[str, str]]:
@@ -715,117 +923,158 @@ def _parse_ota_invoice_result(ocr_data: dict) -> Dict[str, Optional[Any]]:
     }
 
 
+async def _run_ocr_for_document(receipt_id: str, image_key: str, doc_type: str) -> Dict[str, Any]:
+    """단일 이미지 OCR 및 파싱."""
+    image_key = (image_key or "").strip()
+    if not image_key:
+        raise ValueError("BIZ_010")
+    image_bytes, content_type = _get_image_bytes_from_s3(image_key)
+    image_bytes, content_type = _resize_and_compress_for_ocr(image_bytes, content_type)
+    image_format = _image_format_from_content_type(content_type)
+    ocr_data = await _call_naver_ocr_binary(image_bytes, receipt_id, image_format)
+
+    if doc_type == "RECEIPT":
+        amount, pay_date, store_name, address, location = _parse_ocr_result(ocr_data)
+        parsed = {
+            "amount": amount,
+            "payDate": pay_date,
+            "storeName": store_name,
+            "address": address,
+            "location": location,
+            "businessNum": _extract_business_num(ocr_data),
+            "cardNum": _extract_card_num(ocr_data),
+            "confidenceScore": _extract_confidence_score(ocr_data),
+        }
+    else:
+        parsed = _parse_ota_invoice_result(ocr_data)
+        parsed["cardNum"] = "0000"
+        parsed["confidenceScore"] = _extract_confidence_score(ocr_data)
+
+    return {
+        "imageKey": image_key,
+        "docType": doc_type,
+        "parsed": parsed,
+        "ocrRaw": ocr_data,
+    }
+
+
 async def analyze_receipt_task(req: CompleteRequest):
-    """합산형 제출(Documents) 기준 OCR 분석 및 유형별 검증 → 자산화."""
+    """1:N 구조 기준 OCR 분석: submission(parent) + receipt_items(children) 자산화."""
     db = SessionLocal()
-    receipt = db.query(Receipt).filter(Receipt.receipt_id == req.receiptId).first()
-    if not receipt:
+    submission = db.query(Submission).filter(Submission.submission_id == req.receiptId).first()
+    if not submission:
         db.close()
         return
 
     try:
         documents = _build_documents_from_request(req)
         if not documents:
-            receipt.status = "UNFIT"
-            receipt.fail_reason = _fail_message("BIZ_010")
+            submission.status = "UNFIT"
+            submission.fail_reason = _global_fail_reason("BIZ_010")
+            submission.audit_log = "문서 구성 요건 불충족"
             db.commit()
             return
 
-        receipt.submission_type = "DOCUMENTS" if req.documents else "LEGACY_DATA"
-        receipt.documents = documents
-        receipt.image_keys = [d["imageKey"] for d in documents]
-        receipt.image_key = documents[0]["imageKey"]
-        receipt.status = "VERIFYING"
+        submission.project_type = req.type
+        submission.status = "VERIFYING"
         db.commit()
 
+        # 1) 병렬 OCR 수행
+        tasks = [
+            _run_ocr_for_document(req.receiptId, d.get("imageKey", ""), d.get("docType", "RECEIPT"))
+            for d in documents
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
         ocr_assets: List[Dict[str, Any]] = []
+        for i, r in enumerate(results):
+            if isinstance(r, Exception):
+                ocr_assets.append(
+                    {
+                        "imageKey": documents[i]["imageKey"],
+                        "docType": documents[i]["docType"],
+                        "parsed": {},
+                        "ocrRaw": None,
+                        "status": "ERROR",
+                        "error_code": "OCR_001",
+                    }
+                )
+            else:
+                r["status"] = "PENDING"
+                r["error_code"] = None
+                ocr_assets.append(r)
+
+        # 2) 자식 테이블 개별 저장 (기존 동일 submission_id 아이템 교체)
+        db.query(ReceiptItem).filter(ReceiptItem.submission_id == req.receiptId).delete(synchronize_session=False)
+        item_rows: List[ReceiptItem] = []
+        for idx, asset in enumerate(ocr_assets, start=1):
+            p = asset["parsed"]
+            card_num = _normalize_card_num(p.get("cardNum"))
+            item = ReceiptItem(
+                submission_id=req.receiptId,
+                seq_no=idx,
+                doc_type=asset["docType"],
+                image_key=asset["imageKey"],
+                store_name=(p.get("storeName") or "").strip() or None,
+                biz_num=(p.get("businessNum") or "").strip() or None,
+                pay_date=(p.get("payDate") or "").strip() or None,
+                amount=p.get("amount") if isinstance(p.get("amount"), int) else None,
+                address=(p.get("address") or "").strip() or None,
+                location=(p.get("location") or "").strip() or None,
+                card_num=card_num,
+                status=asset.get("status", "PENDING"),
+                error_code=_normalize_error_code(asset.get("error_code")),
+                error_message=_fail_message(_normalize_error_code(asset.get("error_code"))),
+                confidence_score=p.get("confidenceScore") if isinstance(p.get("confidenceScore"), int) else None,
+                ocr_raw=asset["ocrRaw"],
+                parsed=p,
+            )
+            db.add(item)
+            item_rows.append(item)
+
+        def mark_item(i: int, status: str, code: Optional[str]) -> None:
+            normalized = _normalize_error_code(code) or code
+            ocr_assets[i]["status"] = status
+            ocr_assets[i]["error_code"] = normalized
+            item_rows[i].status = status
+            item_rows[i].error_code = normalized
+            item_rows[i].error_message = _fail_message(normalized)
+
         fail_code: Optional[str] = None
         audit_lines: List[str] = []
+        total_amount = 0
 
-        # 1) 문서별 OCR
-        for d in documents:
-            image_key = (d.get("imageKey") or "").strip()
-            doc_type = d.get("docType", "RECEIPT")
-            if not image_key:
-                receipt.status = "UNFIT"
-                receipt.fail_reason = _fail_message("BIZ_010")
-                db.commit()
-                return
-            try:
-                image_bytes, content_type = _get_image_bytes_from_s3(image_key)
-            except Exception as e:
-                receipt.status = "ERROR"
-                receipt.fail_reason = f"OCR_001 (이미지 로드 실패: {e})"
-                db.commit()
-                return
-
-            image_bytes, content_type = _resize_and_compress_for_ocr(image_bytes, content_type)
-            image_format = _image_format_from_content_type(content_type)
-            try:
-                ocr_data = await _call_naver_ocr_binary(image_bytes, req.receiptId, image_format)
-            except Exception as e:
-                receipt.status = "ERROR"
-                receipt.fail_reason = f"OCR_001 (OCR request failed: {e})"
-                db.commit()
-                return
-
-            if doc_type == "RECEIPT":
-                amount, pay_date, store_name, address, location = _parse_ocr_result(ocr_data)
-                parsed = {
-                    "amount": amount,
-                    "payDate": pay_date,
-                    "storeName": store_name,
-                    "address": address,
-                    "location": location,
-                    "businessNum": _extract_business_num(ocr_data),
-                }
-            else:
-                parsed = _parse_ota_invoice_result(ocr_data)
-
-            ocr_assets.append(
-                {
-                    "imageKey": image_key,
-                    "docType": doc_type,
-                    "parsed": parsed,
-                    "ocrRaw": ocr_data,
-                }
-            )
-
-        receipt.ocr_assets = ocr_assets
-        receipt.ocr_raw = ocr_assets[0]["ocrRaw"] if ocr_assets else None
-
-        # 2) 유형별 검증 엔진
+        # 3) 유형별 합산/검증 (item status/error_code 우선 결정 후 submission 집계)
         if req.type == "STAY":
-            receipt_docs = [a for a in ocr_assets if a["docType"] == "RECEIPT"]
-            ota_docs = [a for a in ocr_assets if a["docType"] == "OTA_INVOICE"]
-            if len(receipt_docs) < 1 or len(receipt_docs) > 1 or len(ota_docs) > 1:
+            receipt_idx = [i for i, a in enumerate(ocr_assets) if a["docType"] == "RECEIPT"]
+            ota_idx = [i for i, a in enumerate(ocr_assets) if a["docType"] == "OTA_INVOICE"]
+            if len(receipt_idx) < 1 or len(receipt_idx) > 1 or len(ota_idx) > 1:
                 fail_code = "BIZ_010"
+                for i, a in enumerate(ocr_assets):
+                    if a["status"] == "PENDING":
+                        mark_item(i, "UNFIT", "BIZ_010")
             else:
-                rp = receipt_docs[0]["parsed"]
+                ri = receipt_idx[0]
+                rp = ocr_assets[ri]["parsed"]
                 amount = rp.get("amount")
                 pay_date = rp.get("payDate") or ""
                 store_name = rp.get("storeName") or ""
                 address = rp.get("address") or ""
                 location = rp.get("location") or ""
-                business_num = rp.get("businessNum")
+                biz_num = rp.get("businessNum")
+                card_num = _normalize_card_num(rp.get("cardNum"))
 
-                if amount is None:
+                if ocr_assets[ri]["status"] == "ERROR":
+                    fail_code = ocr_assets[ri]["error_code"] or "OCR_001"
+                elif amount is None:
+                    mark_item(ri, "ERROR", "OCR_001")
                     fail_code = "OCR_001"
                 else:
                     _, normalized_date = _normalize_and_validate_2026_date(pay_date)
                     pay_date_stored = normalized_date or pay_date
-                    receipt.amount = amount
-                    receipt.pay_date = pay_date_stored
-                    receipt.store_name = store_name
-                    receipt.address = address
-                    receipt.location = location
-                    receipt.business_num = business_num
-                    receipt.card_prefix = req.data.cardPrefix if isinstance(req.data, StayData) else ""
-
-                    if _ocr_contains_forbidden_business(receipt_docs[0]["ocrRaw"]):
-                        fail_code = "BIZ_008"
-
-                    if not fail_code:
+                    item_fail: Optional[str] = None
+                    if _ocr_contains_forbidden_business(ocr_assets[ri]["ocrRaw"]):
+                        item_fail = "BIZ_008"
+                    if not item_fail:
                         _, fc = validate_and_match(
                             db,
                             store_name,
@@ -833,54 +1082,57 @@ async def analyze_receipt_task(req: CompleteRequest):
                             pay_date,
                             amount,
                             location,
-                            amount,  # 합산형에서는 OCR 추출금액 자체를 기준으로 검증
+                            amount,
                             "STAY",
                             is_2026_date=bool(normalized_date),
                         )
                         if fc:
-                            fail_code = fc
-
-                    if not fail_code and receipt.card_prefix:
-                        if _check_duplicate_receipt(db, store_name, pay_date_stored, amount, receipt.card_prefix):
-                            fail_code = "BIZ_001"
-
-                    if not fail_code and req.campaignId:
+                            item_fail = fc
+                    if not item_fail and _check_duplicate_receipt_item(
+                        db, req.receiptId, biz_num, pay_date_stored, amount, card_num
+                    ):
+                        item_fail = "BIZ_001"
+                    if not item_fail and req.campaignId:
                         ok, c_fail = validate_campaign_rules(db, req.campaignId, location, pay_date_stored)
                         if not ok and c_fail:
-                            fail_code = c_fail
+                            item_fail = c_fail
 
-                    if not fail_code and ota_docs:
-                        op = ota_docs[0]["parsed"]
+                    if item_fail:
+                        mark_item(ri, "UNFIT", item_fail)
+                        fail_code = item_fail
+                    else:
+                        mark_item(ri, "FIT", None)
+                        total_amount = amount
+
+                if ota_idx:
+                    oi = ota_idx[0]
+                    if fail_code and total_amount <= 0:
+                        if ocr_assets[oi]["status"] == "PENDING":
+                            mark_item(oi, "UNFIT", fail_code)
+                    elif ocr_assets[oi]["status"] == "ERROR":
+                        fail_code = fail_code or (ocr_assets[oi]["error_code"] or "OCR_001")
+                    else:
+                        op = ocr_assets[oi]["parsed"]
                         ota_amount = op.get("amount")
-                        if ota_amount is not None and ota_amount != amount:
-                            fail_code = "BIZ_011"
+                        if total_amount and ota_amount is not None and ota_amount != total_amount:
+                            mark_item(oi, "UNFIT", "BIZ_011")
+                            fail_code = fail_code or "BIZ_011"
                         else:
-                            audit_lines.append(f"영수증 금액({amount}) = 명세서 금액({ota_amount}) 일치")
-
-                        for dtx in [op.get("stayStart"), op.get("stayEnd")]:
-                            if dtx:
-                                is_2026, _ = _normalize_and_validate_2026_date(str(dtx))
-                                if not is_2026:
-                                    fail_code = fail_code or "BIZ_002"
-                                    break
-                        if op.get("guestName"):
-                            audit_lines.append("예약자명 추출됨(실명-UUID 자동대조는 현재 스킵)")
+                            mark_item(oi, "FIT", None)
+                            audit_lines.append(f"영수증 금액({total_amount}) = 명세서 금액({ota_amount}) 일치")
 
         else:  # TOUR
-            receipt_docs = [a for a in ocr_assets if a["docType"] == "RECEIPT"]
-            if len(receipt_docs) < 1 or len(receipt_docs) > 3:
+            receipt_idx = [i for i, a in enumerate(ocr_assets) if a["docType"] == "RECEIPT"]
+            if len(receipt_idx) < 1 or len(receipt_idx) > 3:
                 fail_code = "BIZ_010"
+                for i, a in enumerate(ocr_assets):
+                    if a["status"] == "PENDING":
+                        mark_item(i, "UNFIT", "BIZ_010")
             else:
                 total = 0
-                biz_nums: set[str] = set()
                 amount_parts: List[str] = []
-                first_loc = ""
-                first_date = ""
-                first_store = ""
-                first_addr = ""
-                first_card_prefix = req.data.cardPrefix if isinstance(req.data, TourData) else ""
-
-                for idx, a in enumerate(receipt_docs):
+                for i in receipt_idx:
+                    a = ocr_assets[i]
                     p = a["parsed"]
                     amount = p.get("amount")
                     pay_date = p.get("payDate") or ""
@@ -888,70 +1140,70 @@ async def analyze_receipt_task(req: CompleteRequest):
                     address = p.get("address") or ""
                     location = p.get("location") or ""
                     biz_num = p.get("businessNum")
+                    card_num = _normalize_card_num(p.get("cardNum"))
 
-                    if idx == 0:
-                        first_loc = location
-                        first_date = (p.get("payDate") or "")
-                        first_store = store_name
-                        first_addr = address
-
+                    if a["status"] == "ERROR":
+                        continue
                     if amount is None:
-                        fail_code = "OCR_001"
-                        break
+                        mark_item(i, "ERROR", "OCR_001")
+                        continue
+
+                    is_2026, norm_date = _normalize_and_validate_2026_date(pay_date)
+                    pay_date_stored = norm_date or pay_date
+                    item_fail: Optional[str] = None
+                    if not is_2026:
+                        item_fail = "BIZ_002"
+                    elif address and "강원" not in address:
+                        item_fail = "BIZ_004"
+                    elif _ocr_contains_forbidden_business(a["ocrRaw"]):
+                        item_fail = "BIZ_008"
+                    else:
+                        matched, _ = match_store_in_master(db, store_name, location)
+                        if not matched:
+                            item_fail = "OCR_003"
+
+                    if not item_fail and _check_duplicate_receipt_item(
+                        db, req.receiptId, biz_num, pay_date_stored, amount, card_num
+                    ):
+                        item_fail = "BIZ_001"
+                    if not item_fail and req.campaignId:
+                        ok, c_fail = validate_campaign_rules(db, req.campaignId, location, pay_date_stored)
+                        if not ok and c_fail:
+                            item_fail = c_fail
+
+                    if item_fail:
+                        mark_item(i, "UNFIT", item_fail)
+                        continue
+
+                    mark_item(i, "FIT", None)
                     total += amount
                     amount_parts.append(str(amount))
 
-                    is_2026, norm_date = _normalize_and_validate_2026_date(pay_date)
-                    if idx == 0 and norm_date:
-                        first_date = norm_date
-                    if not is_2026:
-                        fail_code = "BIZ_002"
-                        break
-                    if address and "강원" not in address:
-                        fail_code = "BIZ_004"
-                        break
-                    if _ocr_contains_forbidden_business(a["ocrRaw"]):
-                        fail_code = "BIZ_008"
-                        break
-
-                    matched, _ = match_store_in_master(db, store_name, location)
-                    if not matched:
-                        fail_code = "OCR_003"
-                        break
-
-                    if biz_num:
-                        if biz_num in biz_nums:
-                            fail_code = "BIZ_001"
-                            break
-                        biz_nums.add(biz_num)
-
-                    if req.campaignId:
-                        ok, c_fail = validate_campaign_rules(db, req.campaignId, location, norm_date or pay_date)
-                        if not ok and c_fail:
-                            fail_code = c_fail
-                            break
-
-                if not fail_code and total < 50000:
+                total_amount = total
+                if total_amount < 50000:
                     fail_code = "BIZ_003"
+                audit_lines.append(
+                    f"영수증 {len(receipt_idx)}매 중 적격 합산: "
+                    f"{' + '.join(amount_parts) if amount_parts else '0'} = {total_amount}"
+                )
 
-                receipt.amount = total
-                receipt.pay_date = first_date
-                receipt.store_name = first_store
-                receipt.address = first_addr
-                receipt.location = first_loc
-                receipt.business_num = ",".join(sorted(biz_nums)) if biz_nums else None
-                receipt.card_prefix = first_card_prefix
-                audit_lines.append(f"영수증 {len(receipt_docs)}매 합산: {' + '.join(amount_parts)} = {total}")
+        fit_cnt = sum(1 for a in ocr_assets if a.get("status") == "FIT")
+        unfit_cnt = sum(1 for a in ocr_assets if a.get("status") == "UNFIT")
+        err_cnt = sum(1 for a in ocr_assets if a.get("status") == "ERROR")
+        audit_lines.append(f"총 {len(ocr_assets)}매 중 적격 {fit_cnt}매, 부적격 {unfit_cnt}매, 오류 {err_cnt}매")
 
-        receipt.audit_trail = " | ".join(audit_lines) if audit_lines else None
-        receipt.status = "FIT" if not fail_code else "UNFIT"
-        receipt.fail_reason = _fail_message(fail_code)
+        # 4) 부모 상태 업데이트
+        submission.total_amount = total_amount
+        submission.status = "FIT" if not fail_code else "UNFIT"
+        submission.fail_reason = _global_fail_reason(fail_code)
+        submission.audit_log = " | ".join(audit_lines) if audit_lines else submission.fail_reason
         db.commit()
 
     except Exception as e:
         logger.error("analyze_receipt_task failed: %s", e, exc_info=True)
-        receipt.status = "ERROR"
-        receipt.fail_reason = str(e)
+        submission.status = "ERROR"
+        submission.fail_reason = str(e)
+        submission.audit_log = "complete 처리 중 예외 발생"
         db.commit()
     finally:
         db.close()

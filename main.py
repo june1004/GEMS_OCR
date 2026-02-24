@@ -134,6 +134,8 @@ class CompleteRequest(BaseModel):
             normalized_docs: List[ReceiptMetadata] = []
             for d in docs:
                 md = ReceiptMetadata.model_validate(d)
+                if not (md.imageKey or "").strip():
+                    raise ValueError("document imageKey cannot be empty")
                 if md.docType not in ("RECEIPT", "OTA_INVOICE"):
                     raise ValueError("docType must be RECEIPT or OTA_INVOICE")
                 normalized_docs.append(md)
@@ -260,15 +262,23 @@ async def upload_receipt_via_api(
 
 @app.post("/api/v1/receipts/complete", response_model=CompleteResponse)
 async def submit_receipt(req: CompleteRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    """3단계: 사용자 입력값 수신 및 비동기 분석 시작"""
-    # DB 레코드 업데이트
+    """3단계: 사용자 입력값 수신 및 비동기 분석 시작 (합산형 documents 지원)"""
     receipt = db.query(Receipt).filter(Receipt.receipt_id == req.receiptId).first()
-    if not receipt: raise HTTPException(status_code=404, detail="Receipt not found")
-    
+    if not receipt:
+        raise HTTPException(status_code=404, detail="Receipt not found")
+
+    if receipt.user_uuid != req.userUuid:
+        raise HTTPException(status_code=403, detail="receiptId owner mismatch")
+
+    if receipt.status in ("FIT", "UNFIT", "DUPLICATE", "ERROR"):
+        raise HTTPException(status_code=409, detail="Receipt already completed")
+
+    if receipt.status in ("PROCESSING", "VERIFYING"):
+        return {"status": receipt.status, "receiptId": req.receiptId}
+
     receipt.status = "PROCESSING"
     db.commit()
-    
-    # 백그라운드 태스크 등록 (Naver OCR + Gemini + 로직 검증)
+
     background_tasks.add_task(analyze_receipt_task, req)
     return {"status": "PROCESSING", "receiptId": req.receiptId}
 
@@ -535,17 +545,20 @@ def _fail_message(code: Optional[str]) -> Optional[str]:
 
 def _build_documents_from_request(req: CompleteRequest) -> List[Dict[str, str]]:
     if req.documents:
-        return [{"imageKey": d.imageKey, "docType": d.docType} for d in req.documents]
+        return [
+            {"imageKey": (d.imageKey or "").strip(), "docType": d.docType}
+            for d in req.documents
+        ]
 
     # 하위호환: 기존 data 구조를 문서 배열로 변환
     docs: List[Dict[str, str]] = []
     if req.type == "STAY" and isinstance(req.data, StayData):
-        docs.append({"imageKey": req.data.receiptImageKey, "docType": "RECEIPT"})
+        docs.append({"imageKey": req.data.receiptImageKey.strip(), "docType": "RECEIPT"})
         if req.data.isOta and req.data.otaStatementKey:
-            docs.append({"imageKey": req.data.otaStatementKey, "docType": "OTA_INVOICE"})
+            docs.append({"imageKey": req.data.otaStatementKey.strip(), "docType": "OTA_INVOICE"})
     elif req.type == "TOUR" and isinstance(req.data, TourData):
         for k in req.data.receiptImageKeys:
-            docs.append({"imageKey": k, "docType": "RECEIPT"})
+            docs.append({"imageKey": (k or "").strip(), "docType": "RECEIPT"})
     return docs
 
 
@@ -615,8 +628,13 @@ async def analyze_receipt_task(req: CompleteRequest):
 
         # 1) 문서별 OCR
         for d in documents:
-            image_key = d["imageKey"]
-            doc_type = d["docType"]
+            image_key = (d.get("imageKey") or "").strip()
+            doc_type = d.get("docType", "RECEIPT")
+            if not image_key:
+                receipt.status = "UNFIT"
+                receipt.fail_reason = _fail_message("BIZ_010")
+                db.commit()
+                return
             try:
                 image_bytes, content_type = _get_image_bytes_from_s3(image_key)
             except Exception as e:

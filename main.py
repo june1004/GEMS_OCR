@@ -540,7 +540,8 @@ async def _call_naver_ocr_binary(
 def _parse_ocr_result(ocr_data: dict) -> tuple[Optional[int], Optional[str], Optional[str], Optional[str], Optional[str]]:
     """
     Naver OCR JSON 파싱. 반환: (amount, pay_date, store_name, address, location_시군).
-    실패 시 (None, None, None, None, None).
+    - 주소: storeInfo.address.text 없으면 storeInfo.addresses[0].text 사용 (CLOVA 응답 형식 대응).
+    - 금액: totalPrice가 비정상적으로 작거나 없으면 subTotal 부가세로 추정 (VAT 10% → 총액 ≈ 세액×10).
     """
     try:
         images = ocr_data.get("images") or []
@@ -550,11 +551,24 @@ def _parse_ocr_result(ocr_data: dict) -> tuple[Optional[int], Optional[str], Opt
         result = receipt.get("result")
         if not result:
             return (None, None, None, None, None)
-        # 결제 금액 (₩, 콤마, 원 등 제거 후 숫자만 추출)
+        # 결제 금액
         price_text = (result.get("totalPrice") or {}).get("price") or {}
         raw_price = (price_text.get("text") or "0").strip()
         amount_str = re.sub(r"[^0-9]", "", raw_price)
         amount = int(amount_str) if amount_str else None
+        # 금액이 없거나 비정상적으로 작을 때(< 1,000원) subTotal 부가세로 추정
+        if amount is None or amount < 1000:
+            sub_total = result.get("subTotal") or []
+            if isinstance(sub_total, list) and len(sub_total) > 0:
+                first = sub_total[0]
+                tax_prices = (first.get("taxPrice") or []) if isinstance(first, dict) else []
+                if tax_prices and isinstance(tax_prices[0], dict):
+                    tax_text = (tax_prices[0].get("text") or "").strip()
+                    tax_num = re.sub(r"[^0-9]", "", tax_text)
+                    if tax_num:
+                        tax_val = int(tax_num)
+                        if tax_val >= 100:
+                            amount = tax_val * 10  # 부가세 10% 기준 총액 추정
         # 결제 날짜
         payment_info = result.get("paymentInfo") or {}
         date_obj = payment_info.get("date") or {}
@@ -563,10 +577,15 @@ def _parse_ocr_result(ocr_data: dict) -> tuple[Optional[int], Optional[str], Opt
         store_info = result.get("storeInfo") or {}
         store_name = (store_info.get("name") or {}).get("text") or ""
         store_name = store_name.strip()
-        # 주소 (강원특별자치도 검증용)
+        # 주소: address 단일 객체 또는 addresses 배열 (CLOVA 형식)
         addr_obj = store_info.get("address") or {}
         address = (addr_obj.get("text") or "").strip()
-        # 시군: 주소에서 두 번째 단어 (춘천시 등)
+        if not address:
+            addrs = store_info.get("addresses") or []
+            if isinstance(addrs, list) and len(addrs) > 0:
+                first_addr = addrs[0] if isinstance(addrs[0], dict) else {}
+                address = (first_addr.get("text") or "").strip()
+        # 시군: 주소에서 두 번째 단어 (속초시, 춘천시 등)
         location = ""
         if address:
             parts = address.split()
@@ -870,6 +889,12 @@ async def analyze_receipt_task(req: CompleteRequest):
                     location = p.get("location") or ""
                     biz_num = p.get("businessNum")
 
+                    if idx == 0:
+                        first_loc = location
+                        first_date = (p.get("payDate") or "")
+                        first_store = store_name
+                        first_addr = address
+
                     if amount is None:
                         fail_code = "OCR_001"
                         break
@@ -877,6 +902,8 @@ async def analyze_receipt_task(req: CompleteRequest):
                     amount_parts.append(str(amount))
 
                     is_2026, norm_date = _normalize_and_validate_2026_date(pay_date)
+                    if idx == 0 and norm_date:
+                        first_date = norm_date
                     if not is_2026:
                         fail_code = "BIZ_002"
                         break
@@ -903,12 +930,6 @@ async def analyze_receipt_task(req: CompleteRequest):
                         if not ok and c_fail:
                             fail_code = c_fail
                             break
-
-                    if idx == 0:
-                        first_loc = location
-                        first_date = norm_date or pay_date
-                        first_store = store_name
-                        first_addr = address
 
                 if not fail_code and total < 50000:
                     fail_code = "BIZ_003"

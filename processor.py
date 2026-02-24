@@ -4,7 +4,7 @@ GEMS OCR 후처리 및 상점 매칭 서비스.
 """
 import re
 from datetime import datetime
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 from sqlalchemy.orm import Session
 from sqlalchemy import text
 from rapidfuzz import fuzz
@@ -55,16 +55,31 @@ def extract_ocr_fields(ocr_data: dict) -> Optional[dict]:
         return None
 
 
+def _normalize_store_name_for_match(name: str) -> List[str]:
+    """마스터 매칭용 상호명 후보 목록 (주식회사/유한회사 등 접두사 제거)."""
+    if not (name or "").strip():
+        return []
+    name = name.strip()
+    candidates = [name]
+    for prefix in ("주식회사 ", "주식회사", "(주)", "유한회사 ", "유한회사", "(유)"):
+        s = name
+        if s.startswith(prefix):
+            s = s[len(prefix):].strip()
+        if s and s not in candidates:
+            candidates.append(s)
+    return candidates
+
+
 def match_store_in_master(
     db: Session, store_name: str, city_county: str
 ) -> Tuple[bool, Optional[int]]:
     """
     시군구 1차 필터 후 상호명 유사도(token_sort_ratio)로 매칭.
+    상호명은 '주식회사 ', '(주)' 등 접두사 제거한 후보로도 매칭 시도.
     반환: (매칭 여부, matched store_id 또는 None). store_id는 master_stores에 id 컬럼 있을 때만.
     """
     if not (store_name or "").strip():
         return False, None
-    store_name = store_name.strip()
     city_county = (city_county or "").strip()
     try:
         if city_county:
@@ -78,14 +93,16 @@ def match_store_in_master(
             rows = db.execute(
                 text("SELECT store_name FROM master_stores")
             ).fetchall()
+        name_candidates = _normalize_store_name_for_match(store_name)
         for (s_name,) in rows:
             if not s_name:
                 continue
             s_name = s_name.strip()
-            if s_name == store_name:
-                return True, None
-            if fuzz.token_sort_ratio(store_name, s_name) >= FUZZY_MATCH_THRESHOLD:
-                return True, None
+            for cand in name_candidates:
+                if cand == s_name:
+                    return True, None
+                if fuzz.token_sort_ratio(cand, s_name) >= FUZZY_MATCH_THRESHOLD:
+                    return True, None
         return False, None
     except Exception:
         return False, None

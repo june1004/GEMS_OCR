@@ -22,12 +22,14 @@
 |------|------------|------|
 | 1 | `POST /api/v1/receipts/presigned-url` | 업로드용 **Presigned URL 발급 (10분 유효)**. `receiptId`, `objectKey` 반환. |
 | 2 | `PUT {{uploadUrl}}` (FE → MinIO) | 고객이 이미지 이진 데이터를 스토리지에 직접 업로드. |
-| 3 | `POST /api/v1/receipts/complete` | 저장된 이미지 Key 기준으로 **Naver 영수증 OCR** 호출(Get Presigned URL 전달), 검증 후 DB 저장. |
+| 3 | `POST /api/v1/receipts/complete` | **합산형 Submission** 기준으로 `documents[{imageKey, docType}]` 수신 후 OCR/검증/자산화 수행. |
 | 4 | `GET /api/v1/receipts/{receiptId}/status` | OCR·검증 결과 조회 (Polling). |
 
 - **Naver OCR 연동**: [CLOVA OCR Document OCR > 영수증](https://api.ncloud-docs.com/docs/ai-application-service-ocr-ocrdocumentocr-receipt). **multipart(바이너리)** + **리사이징(최대 2000px)/JPEG 압축(quality 80)** 적용 — 영수증·**A4 이내 거래명세서** 등 모든 이미지에 동일 적용. MinIO 읽기 → BE 리사이즈·압축 → `message`+`file` 전송. 전송량·호출 비용 절감. 타임아웃 30초.
 - **상태 흐름**: `PENDING` → `PROCESSING`(OCR 호출 중) → `VERIFYING`(검증 중) → `FIT` | `UNFIT` | `DUPLICATE` | `ERROR`.
-- **검증·매칭**: `processor.py` — 시군구 필터 → 상호명 유사도(`token_sort_ratio` 85%) → 비즈니스 검증 → **캠페인 필터**(지역·기간). BIZ_001 중복, BIZ_008 유흥업소는 main에서 선처리.
+- **검증·매칭**: `processor.py` + `main.py` Submission 엔진 — 문서 타입(`RECEIPT`/`OTA_INVOICE`)별 OCR 파싱, STAY(영수증-증빙 교차검증), TOUR(1~3매 합산/사업자번호 중복 방지), 캠페인 필터(기간/지역).
+- **요청 모델**: `documents: [{ imageKey, docType }]` 우선. 하위호환으로 기존 `data`도 허용(서버에서 documents로 변환).
+- **Presigned 확장**: `POST /api/v1/receipts/presigned-url`에서 `receiptId`를 선택 입력하면 동일 신청에 이미지를 추가 업로드 가능.
 - **캠페인 필터**: `campaigns` 테이블의 `target_city_county`(시군 제한), `start_date`/`end_date`(기간), `is_active`로 검증. BIZ_005(기간 아님), BIZ_006(대상 지역 아님). `POST /complete` 요청에 `campaignId`(기본 1) 포함.
 - 상세 요청/응답 스키마: `PROJECT/전 단계 JSON API 설계안.md` 참고.
 

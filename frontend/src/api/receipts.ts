@@ -4,8 +4,8 @@ import type {
   StatusResponse,
 } from "../types";
 
-const API_BASE =
-  import.meta.env.VITE_API_BASE_URL || "http://localhost:8000";
+/** 개발 시 빈 값이면 같은 origin(5173) → Vite proxy가 /api를 8000으로 전달 */
+const API_BASE = import.meta.env.VITE_API_BASE_URL ?? "";
 
 async function getPresignedUrl(
   fileName: string,

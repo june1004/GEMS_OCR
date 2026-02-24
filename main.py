@@ -8,12 +8,12 @@ import httpx
 import boto3
 from PIL import Image
 from datetime import datetime
-from typing import List, Optional, Union, Tuple
+from typing import Any, Dict, List, Optional, Union, Tuple
 from dotenv import load_dotenv
 from dateutil import parser as dateutil_parser
 from sqlalchemy import text as sql_text
 
-from processor import validate_and_match, validate_campaign_rules
+from processor import validate_and_match, validate_campaign_rules, match_store_in_master
 from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
@@ -63,7 +63,12 @@ class Receipt(Base):
     address = Column(String)  # OCR 가맹점 주소 전체 (강원특별자치도 검증용)
     location = Column(String)  # 시군 정보 (데이터 자산화)
     image_key = Column(String)  # MinIO 객체 키 (영수증 이미지 경로)
+    image_keys = Column(JSON)  # 제출된 전체 이미지 키 배열 (합산형)
+    documents = Column(JSON)  # 문서 메타데이터 배열 [{imageKey, docType}]
     business_num = Column(String)  # 사업자등록번호 (OCR 추출)
+    ocr_assets = Column(JSON)  # 이미지별 OCR 원본/파싱 결과 배열
+    audit_trail = Column(String)  # 검증 근거 요약 문자열
+    submission_type = Column(String)  # LEGACY_DATA | DOCUMENTS
     card_prefix = Column(String)  # 카드 앞 4자리
     fail_reason = Column(String)
     ocr_raw = Column(JSON)
@@ -88,6 +93,11 @@ class TourData(BaseModel):
     cardPrefix: str
     receiptImageKeys: List[str] # 최대 3장 배열 처리
 
+
+class ReceiptMetadata(BaseModel):
+    imageKey: str
+    docType: str  # RECEIPT | OTA_INVOICE
+
 class PresignedUrlResponse(BaseModel):
     uploadUrl: str
     receiptId: str
@@ -102,22 +112,55 @@ class CompleteRequest(BaseModel):
     userUuid: str
     type: str  # STAY or TOUR
     campaignId: int = 1  # 캠페인 필터(지역·기간) 적용, 기본 1
-    data: Union[StayData, TourData]
+    data: Optional[Union[StayData, TourData]] = None
+    documents: Optional[List[ReceiptMetadata]] = None
 
     @model_validator(mode="before")
     @classmethod
     def validate_data_by_type(cls, v):
         """type에 따라 data를 StayData 또는 TourData로 검증 (밸리데이션 에러 명확화)"""
-        if not isinstance(v, dict) or "data" not in v or "type" not in v:
+        if not isinstance(v, dict) or "type" not in v:
             return v
         t = v.get("type")
-        inner = v.get("data")
-        if not isinstance(inner, dict):
-            return v
-        if t == "STAY":
-            v["data"] = StayData.model_validate(inner)
-        elif t == "TOUR":
-            v["data"] = TourData.model_validate(inner)
+        docs = v.get("documents")
+        data = v.get("data")
+
+        if t not in ("STAY", "TOUR"):
+            raise ValueError("type must be STAY or TOUR")
+
+        if docs is not None:
+            if not isinstance(docs, list) or len(docs) == 0:
+                raise ValueError("documents must be a non-empty array")
+            normalized_docs: List[ReceiptMetadata] = []
+            for d in docs:
+                md = ReceiptMetadata.model_validate(d)
+                if md.docType not in ("RECEIPT", "OTA_INVOICE"):
+                    raise ValueError("docType must be RECEIPT or OTA_INVOICE")
+                normalized_docs.append(md)
+            v["documents"] = normalized_docs
+
+            if t == "STAY":
+                receipt_cnt = len([d for d in normalized_docs if d.docType == "RECEIPT"])
+                ota_cnt = len([d for d in normalized_docs if d.docType == "OTA_INVOICE"])
+                if receipt_cnt < 1:
+                    raise ValueError("STAY requires at least one RECEIPT document")
+                if receipt_cnt > 1 or ota_cnt > 1:
+                    raise ValueError("STAY supports RECEIPT(1) + OTA_INVOICE(0~1)")
+            else:
+                if len(normalized_docs) < 1 or len(normalized_docs) > 3:
+                    raise ValueError("TOUR supports 1 to 3 documents")
+                if any(d.docType != "RECEIPT" for d in normalized_docs):
+                    raise ValueError("TOUR supports RECEIPT documents only")
+
+        if data is not None and isinstance(data, dict):
+            if t == "STAY":
+                v["data"] = StayData.model_validate(data)
+            elif t == "TOUR":
+                v["data"] = TourData.model_validate(data)
+
+        if v.get("documents") is None and v.get("data") is None:
+            raise ValueError("Either documents or legacy data is required")
+
         return v
 
 # 5. API 엔드포인트
@@ -141,10 +184,25 @@ def get_db():
     finally: db.close()
 
 @app.post("/api/v1/receipts/presigned-url", response_model=PresignedUrlResponse)
-async def get_presigned_url(fileName: str, contentType: str, userUuid: str, type: str, db: Session = Depends(get_db)):
-    """1단계: 고객 영수증 업로드용 Presigned URL 발급 (10분 유효) → FE가 이 URL로 PUT하여 MinIO에 저장"""
-    receipt_id = str(uuid.uuid4())
-    object_key = f"receipts/{receipt_id}_{fileName}"
+async def get_presigned_url(
+    fileName: str,
+    contentType: str,
+    userUuid: str,
+    type: str,
+    receiptId: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
+    """
+    1단계: 고객 영수증 업로드용 Presigned URL 발급 (10분 유효).
+    - receiptId를 전달하면 동일 신청(합산형)으로 이미지를 계속 추가할 수 있음.
+    - receiptId 미전달 시 새 신청을 생성.
+    """
+    if type not in ("STAY", "TOUR"):
+        raise HTTPException(status_code=400, detail="type must be STAY or TOUR")
+
+    receipt_id = receiptId or str(uuid.uuid4())
+    # 동일 fileName 반복 업로드 충돌 방지용 랜덤 접미사
+    object_key = f"receipts/{receipt_id}_{uuid.uuid4().hex[:8]}_{fileName}"
     # 설계안: 업로드 URL 10분 유효 (PROJECT/전 단계 JSON API 설계안.md)
     url = s3_client.generate_presigned_url(
         "put_object",
@@ -152,15 +210,28 @@ async def get_presigned_url(fileName: str, contentType: str, userUuid: str, type
         ExpiresIn=600,  # 10분
     )
     
-    db.add(Receipt(receipt_id=receipt_id, user_uuid=userUuid, type=type, status="PENDING"))
+    existing = db.query(Receipt).filter(Receipt.receipt_id == receipt_id).first()
+    if existing:
+        if existing.user_uuid != userUuid:
+            raise HTTPException(status_code=403, detail="receiptId owner mismatch")
+        existing.type = type
+    else:
+        db.add(Receipt(receipt_id=receipt_id, user_uuid=userUuid, type=type, status="PENDING"))
     db.commit()
     return {"uploadUrl": url, "receiptId": receipt_id, "objectKey": object_key}
 
 
 @app.post("/api/proxy/presigned-url", response_model=PresignedUrlResponse, include_in_schema=False)
-async def get_presigned_url_proxy(fileName: str, contentType: str, userUuid: str, type: str, db: Session = Depends(get_db)):
+async def get_presigned_url_proxy(
+    fileName: str,
+    contentType: str,
+    userUuid: str,
+    type: str,
+    receiptId: Optional[str] = None,
+    db: Session = Depends(get_db),
+):
     """프론트엔드 프록시 경로: /api/v1/receipts/presigned-url 와 동일"""
-    return await get_presigned_url(fileName, contentType, userUuid, type, db)
+    return await get_presigned_url(fileName, contentType, userUuid, type, receiptId, db)
 
 
 @app.post("/api/v1/receipts/upload", response_model=PresignedUrlResponse)
@@ -441,136 +512,309 @@ def _ocr_contains_forbidden_business(ocr_data: dict) -> bool:
         return False
 
 
+def _fail_message(code: Optional[str]) -> Optional[str]:
+    if not code:
+        return None
+    msg = {
+        "BIZ_001": "BIZ_001 (중복 등록)",
+        "BIZ_002": "BIZ_002 (2026년 결제일 아님)",
+        "BIZ_003": "BIZ_003 (최소 금액 미달)",
+        "BIZ_004": "BIZ_004 (강원특별자치도 외 지역)",
+        "BIZ_005": "BIZ_005 (캠페인 기간 아님)",
+        "BIZ_006": "BIZ_006 (캠페인 대상 지역 아님)",
+        "BIZ_007": "BIZ_007 (입력 금액과 OCR 금액 불일치)",
+        "BIZ_008": "BIZ_008 (유흥업소 등 부적격 업종)",
+        "BIZ_010": "BIZ_010 (문서 구성 요건 불충족)",
+        "BIZ_011": "BIZ_011 (영수증/증빙 금액 불일치)",
+        "OCR_001": "OCR_001 (영수증 판독 불가)",
+        "OCR_002": "OCR_002 (결제일 형식 오류)",
+        "OCR_003": "OCR_003 (마스터 상호 미등록)",
+    }
+    return msg.get(code, code)
+
+
+def _build_documents_from_request(req: CompleteRequest) -> List[Dict[str, str]]:
+    if req.documents:
+        return [{"imageKey": d.imageKey, "docType": d.docType} for d in req.documents]
+
+    # 하위호환: 기존 data 구조를 문서 배열로 변환
+    docs: List[Dict[str, str]] = []
+    if req.type == "STAY" and isinstance(req.data, StayData):
+        docs.append({"imageKey": req.data.receiptImageKey, "docType": "RECEIPT"})
+        if req.data.isOta and req.data.otaStatementKey:
+            docs.append({"imageKey": req.data.otaStatementKey, "docType": "OTA_INVOICE"})
+    elif req.type == "TOUR" and isinstance(req.data, TourData):
+        for k in req.data.receiptImageKeys:
+            docs.append({"imageKey": k, "docType": "RECEIPT"})
+    return docs
+
+
+def _parse_ota_invoice_result(ocr_data: dict) -> Dict[str, Optional[Any]]:
+    """
+    OTA 명세서(일반 OCR 결과 포함)에서 핵심 값 추출.
+    - amount: 총액/결제금액 패턴 우선, 없으면 큰 숫자 후보
+    - stayStart/stayEnd: 날짜 1~2개
+    - guestName: 예약자/투숙객 키워드 기반 추출
+    """
+    text_blob = json.dumps(ocr_data, ensure_ascii=False)
+    amount: Optional[int] = None
+    m = re.search(
+        r"(총.?금액|결제.?금액|합계|total)[^0-9]{0,20}([0-9][0-9,]{2,})",
+        text_blob,
+        re.IGNORECASE,
+    )
+    if m:
+        amount = int(re.sub(r"[^0-9]", "", m.group(2)))
+    else:
+        nums = [int(n.replace(",", "")) for n in re.findall(r"[0-9][0-9,]{4,}", text_blob)]
+        if nums:
+            amount = max(nums)
+
+    dates = re.findall(r"20[0-9]{2}[./-][0-9]{1,2}[./-][0-9]{1,2}", text_blob)
+    stay_start = dates[0] if len(dates) >= 1 else None
+    stay_end = dates[1] if len(dates) >= 2 else None
+    guest = None
+    g = re.search(r"(예약자|투숙객|고객명|name)[^가-힣A-Za-z0-9]{0,8}([가-힣A-Za-z]{2,20})", text_blob, re.IGNORECASE)
+    if g:
+        guest = g.group(2)
+
+    return {
+        "amount": amount,
+        "stayStart": stay_start,
+        "stayEnd": stay_end,
+        "guestName": guest,
+    }
+
+
 async def analyze_receipt_task(req: CompleteRequest):
-    """영수증 OCR 분석 및 PRD 검증 → DB 자산화."""
+    """합산형 제출(Documents) 기준 OCR 분석 및 유형별 검증 → 자산화."""
     db = SessionLocal()
     receipt = db.query(Receipt).filter(Receipt.receipt_id == req.receiptId).first()
     if not receipt:
         db.close()
         return
+
     try:
-        # 1) 이미지 키 → Get Presigned URL (1분)
-        if req.type == "STAY":
-            target_key = getattr(req.data, "receiptImageKey", None)
-        else:
-            keys = getattr(req.data, "receiptImageKeys", None) or []
-            target_key = keys[0] if keys else None
-        if not target_key:
+        documents = _build_documents_from_request(req)
+        if not documents:
             receipt.status = "UNFIT"
-            receipt.fail_reason = "BIZ_001 (No image key)"
+            receipt.fail_reason = _fail_message("BIZ_010")
             db.commit()
-            db.close()
             return
 
-        # 2) MinIO 바이너리 읽기 → 리사이징/압축 → 네이버 OCR multipart 전송
-        try:
-            image_bytes, content_type = _get_image_bytes_from_s3(target_key)
-        except Exception as e:
-            receipt.status = "ERROR"
-            receipt.fail_reason = f"OCR_001 (이미지 로드 실패: {e})"
-            db.commit()
-            db.close()
-            return
-
-        image_bytes, content_type = _resize_and_compress_for_ocr(image_bytes, content_type)
-        image_format = _image_format_from_content_type(content_type)
-        try:
-            ocr_data = await _call_naver_ocr_binary(
-                image_bytes, req.receiptId, image_format
-            )
-        except httpx.HTTPStatusError as e:
-            receipt.status = "ERROR"
-            receipt.fail_reason = f"OCR_001 (OCR API error: {e.response.status_code})"
-            db.commit()
-            db.close()
-            return
-        except Exception as e:
-            receipt.status = "ERROR"
-            receipt.fail_reason = f"OCR_001 (OCR request failed: {e})"
-            db.commit()
-            db.close()
-            return
-
-        amount, pay_date, store_name, address, location = _parse_ocr_result(ocr_data)
-        if amount is None and not store_name:
-            receipt.status = "UNFIT"
-            receipt.fail_reason = "OCR_001 (영수증 판독 불가 - 평평하게 펴서 다시 촬영해 주세요)"
-            receipt.ocr_raw = ocr_data
-            db.commit()
-            db.close()
-            return
-
-        _, normalized_date = _normalize_and_validate_2026_date(pay_date or "")
-        pay_date_stored = normalized_date or (pay_date or "")
-        receipt.amount = amount
-        receipt.pay_date = pay_date_stored
-        receipt.store_name = store_name or ""
-        receipt.address = address or ""
-        receipt.location = location or getattr(req.data, "location", None) or ""
-        receipt.image_key = target_key
-        receipt.business_num = _extract_business_num(ocr_data)
-        receipt.card_prefix = req.data.cardPrefix
-        receipt.ocr_raw = ocr_data
-
-        # 상태: 검증 단계 (VERIFYING)
+        receipt.submission_type = "DOCUMENTS" if req.documents else "LEGACY_DATA"
+        receipt.documents = documents
+        receipt.image_keys = [d["imageKey"] for d in documents]
+        receipt.image_key = documents[0]["imageKey"]
         receipt.status = "VERIFYING"
         db.commit()
 
-        # 3) PRD 검증 엔진: 중복 → 유흥업소 → processor(날짜/금액/지역/상점 매칭)
-        fail_reason = None
-        if _check_duplicate_receipt(db, store_name or "", pay_date_stored, amount or 0, req.data.cardPrefix):
-            receipt.status = "DUPLICATE"
-            receipt.fail_reason = "BIZ_001 (중복 등록 - 동일 영수증)"
-            receipt.amount = amount
-            db.commit()
-            db.close()
-            return
-        if _ocr_contains_forbidden_business(ocr_data):
-            fail_reason = "BIZ_008 (유흥업소 등 부적격 업종)"
-        else:
-            status_from_processor, fail_code = validate_and_match(
-                db,
-                store_name or "",
-                address or "",
-                pay_date or "",
-                amount or 0,
-                location or "",
-                req.data.amount,
-                req.type,
-                is_2026_date=bool(normalized_date),
-            )
-            if fail_code:
-                _msg = {
-                    "BIZ_002": "BIZ_002 (2026년 결제일 아님)",
-                    "BIZ_003": "BIZ_003 (숙박/관광 최소 금액 미달)",
-                    "BIZ_004": "BIZ_004 (강원특별자치도 외 지역)",
-                    "BIZ_005": "BIZ_005 (캠페인 기간 아님)",
-                    "BIZ_006": "BIZ_006 (캠페인 대상 지역 아님)",
-                    "BIZ_007": "BIZ_007 (입력 금액과 OCR 금액 불일치)",
-                    "OCR_002": "OCR_002 (결제일 형식 오류)",
-                    "OCR_003": "OCR_003 (마스터 상호 미등록)",
-                }
-                fail_reason = _msg.get(fail_code, fail_code)
-            elif req.campaignId:
-                # 캠페인 필터: 지역·기간 검증 (상점 매칭 성공 후)
-                is_campaign_ok, camp_fail = validate_campaign_rules(
-                    db, req.campaignId, location or "", pay_date_stored
-                )
-                if not is_campaign_ok and camp_fail:
-                    _msg = {
-                        "BIZ_005": "BIZ_005 (캠페인 기간 아님)",
-                        "BIZ_006": "BIZ_006 (캠페인 대상 지역 아님)",
-                        "OCR_002": "OCR_002 (결제일 형식 오류)",
-                    }
-                    fail_reason = _msg.get(camp_fail, camp_fail)
+        ocr_assets: List[Dict[str, Any]] = []
+        fail_code: Optional[str] = None
+        audit_lines: List[str] = []
 
-        receipt.status = "FIT" if not fail_reason else "UNFIT"
-        receipt.fail_reason = fail_reason
-        receipt.amount = amount
+        # 1) 문서별 OCR
+        for d in documents:
+            image_key = d["imageKey"]
+            doc_type = d["docType"]
+            try:
+                image_bytes, content_type = _get_image_bytes_from_s3(image_key)
+            except Exception as e:
+                receipt.status = "ERROR"
+                receipt.fail_reason = f"OCR_001 (이미지 로드 실패: {e})"
+                db.commit()
+                return
+
+            image_bytes, content_type = _resize_and_compress_for_ocr(image_bytes, content_type)
+            image_format = _image_format_from_content_type(content_type)
+            try:
+                ocr_data = await _call_naver_ocr_binary(image_bytes, req.receiptId, image_format)
+            except Exception as e:
+                receipt.status = "ERROR"
+                receipt.fail_reason = f"OCR_001 (OCR request failed: {e})"
+                db.commit()
+                return
+
+            if doc_type == "RECEIPT":
+                amount, pay_date, store_name, address, location = _parse_ocr_result(ocr_data)
+                parsed = {
+                    "amount": amount,
+                    "payDate": pay_date,
+                    "storeName": store_name,
+                    "address": address,
+                    "location": location,
+                    "businessNum": _extract_business_num(ocr_data),
+                }
+            else:
+                parsed = _parse_ota_invoice_result(ocr_data)
+
+            ocr_assets.append(
+                {
+                    "imageKey": image_key,
+                    "docType": doc_type,
+                    "parsed": parsed,
+                    "ocrRaw": ocr_data,
+                }
+            )
+
+        receipt.ocr_assets = ocr_assets
+        receipt.ocr_raw = ocr_assets[0]["ocrRaw"] if ocr_assets else None
+
+        # 2) 유형별 검증 엔진
+        if req.type == "STAY":
+            receipt_docs = [a for a in ocr_assets if a["docType"] == "RECEIPT"]
+            ota_docs = [a for a in ocr_assets if a["docType"] == "OTA_INVOICE"]
+            if len(receipt_docs) < 1 or len(receipt_docs) > 1 or len(ota_docs) > 1:
+                fail_code = "BIZ_010"
+            else:
+                rp = receipt_docs[0]["parsed"]
+                amount = rp.get("amount")
+                pay_date = rp.get("payDate") or ""
+                store_name = rp.get("storeName") or ""
+                address = rp.get("address") or ""
+                location = rp.get("location") or ""
+                business_num = rp.get("businessNum")
+
+                if amount is None:
+                    fail_code = "OCR_001"
+                else:
+                    _, normalized_date = _normalize_and_validate_2026_date(pay_date)
+                    pay_date_stored = normalized_date or pay_date
+                    receipt.amount = amount
+                    receipt.pay_date = pay_date_stored
+                    receipt.store_name = store_name
+                    receipt.address = address
+                    receipt.location = location
+                    receipt.business_num = business_num
+                    receipt.card_prefix = req.data.cardPrefix if isinstance(req.data, StayData) else ""
+
+                    if _ocr_contains_forbidden_business(receipt_docs[0]["ocrRaw"]):
+                        fail_code = "BIZ_008"
+
+                    if not fail_code:
+                        _, fc = validate_and_match(
+                            db,
+                            store_name,
+                            address,
+                            pay_date,
+                            amount,
+                            location,
+                            amount,  # 합산형에서는 OCR 추출금액 자체를 기준으로 검증
+                            "STAY",
+                            is_2026_date=bool(normalized_date),
+                        )
+                        if fc:
+                            fail_code = fc
+
+                    if not fail_code and receipt.card_prefix:
+                        if _check_duplicate_receipt(db, store_name, pay_date_stored, amount, receipt.card_prefix):
+                            fail_code = "BIZ_001"
+
+                    if not fail_code and req.campaignId:
+                        ok, c_fail = validate_campaign_rules(db, req.campaignId, location, pay_date_stored)
+                        if not ok and c_fail:
+                            fail_code = c_fail
+
+                    if not fail_code and ota_docs:
+                        op = ota_docs[0]["parsed"]
+                        ota_amount = op.get("amount")
+                        if ota_amount is not None and ota_amount != amount:
+                            fail_code = "BIZ_011"
+                        else:
+                            audit_lines.append(f"영수증 금액({amount}) = 명세서 금액({ota_amount}) 일치")
+
+                        for dtx in [op.get("stayStart"), op.get("stayEnd")]:
+                            if dtx:
+                                is_2026, _ = _normalize_and_validate_2026_date(str(dtx))
+                                if not is_2026:
+                                    fail_code = fail_code or "BIZ_002"
+                                    break
+                        if op.get("guestName"):
+                            audit_lines.append("예약자명 추출됨(실명-UUID 자동대조는 현재 스킵)")
+
+        else:  # TOUR
+            receipt_docs = [a for a in ocr_assets if a["docType"] == "RECEIPT"]
+            if len(receipt_docs) < 1 or len(receipt_docs) > 3:
+                fail_code = "BIZ_010"
+            else:
+                total = 0
+                biz_nums: set[str] = set()
+                amount_parts: List[str] = []
+                first_loc = ""
+                first_date = ""
+                first_store = ""
+                first_addr = ""
+                first_card_prefix = req.data.cardPrefix if isinstance(req.data, TourData) else ""
+
+                for idx, a in enumerate(receipt_docs):
+                    p = a["parsed"]
+                    amount = p.get("amount")
+                    pay_date = p.get("payDate") or ""
+                    store_name = p.get("storeName") or ""
+                    address = p.get("address") or ""
+                    location = p.get("location") or ""
+                    biz_num = p.get("businessNum")
+
+                    if amount is None:
+                        fail_code = "OCR_001"
+                        break
+                    total += amount
+                    amount_parts.append(str(amount))
+
+                    is_2026, norm_date = _normalize_and_validate_2026_date(pay_date)
+                    if not is_2026:
+                        fail_code = "BIZ_002"
+                        break
+                    if address and "강원" not in address:
+                        fail_code = "BIZ_004"
+                        break
+                    if _ocr_contains_forbidden_business(a["ocrRaw"]):
+                        fail_code = "BIZ_008"
+                        break
+
+                    matched, _ = match_store_in_master(db, store_name, location)
+                    if not matched:
+                        fail_code = "OCR_003"
+                        break
+
+                    if biz_num:
+                        if biz_num in biz_nums:
+                            fail_code = "BIZ_001"
+                            break
+                        biz_nums.add(biz_num)
+
+                    if req.campaignId:
+                        ok, c_fail = validate_campaign_rules(db, req.campaignId, location, norm_date or pay_date)
+                        if not ok and c_fail:
+                            fail_code = c_fail
+                            break
+
+                    if idx == 0:
+                        first_loc = location
+                        first_date = norm_date or pay_date
+                        first_store = store_name
+                        first_addr = address
+
+                if not fail_code and total < 50000:
+                    fail_code = "BIZ_003"
+
+                receipt.amount = total
+                receipt.pay_date = first_date
+                receipt.store_name = first_store
+                receipt.address = first_addr
+                receipt.location = first_loc
+                receipt.business_num = ",".join(sorted(biz_nums)) if biz_nums else None
+                receipt.card_prefix = first_card_prefix
+                audit_lines.append(f"영수증 {len(receipt_docs)}매 합산: {' + '.join(amount_parts)} = {total}")
+
+        receipt.audit_trail = " | ".join(audit_lines) if audit_lines else None
+        receipt.status = "FIT" if not fail_code else "UNFIT"
+        receipt.fail_reason = _fail_message(fail_code)
+        db.commit()
 
     except Exception as e:
         receipt.status = "ERROR"
         receipt.fail_reason = str(e)
-    finally:
         db.commit()
+    finally:
         db.close()

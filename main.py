@@ -103,6 +103,19 @@ class ReceiptItem(Base):
     created_at = Column(DateTime, default=datetime.utcnow)
     submission = relationship("Submission", back_populates="items")
 
+
+class UnregisteredStore(Base):
+    __tablename__ = "unregistered_stores"
+    id = Column(String, primary_key=True, default=lambda: str(uuid.uuid4()))
+    store_name = Column(String(255))
+    biz_num = Column(String(64), index=True)
+    address = Column(String(500))
+    tel = Column(String(64))
+    status = Column(String(32), default="TEMP_VALID")  # TEMP_VALID | APPROVED | REJECTED
+    source_submission_id = Column(String, index=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
 Base.metadata.create_all(bind=engine)
 
 # 4. Pydantic 스키마 (1:N + 자산화 지침 반영)
@@ -118,6 +131,13 @@ class ProcessStatus(str, Enum):
     FIT = "FIT"
     UNFIT = "UNFIT"
     ERROR = "ERROR"
+    PENDING_NEW = "PENDING_NEW"
+    PENDING_VERIFICATION = "PENDING_VERIFICATION"
+    UNFIT_CATEGORY = "UNFIT_CATEGORY"
+    UNFIT_REGION = "UNFIT_REGION"
+    UNFIT_DATE = "UNFIT_DATE"
+    UNFIT_DUPLICATE = "UNFIT_DUPLICATE"
+    ERROR_OCR = "ERROR_OCR"
 
 
 class ErrorCode(str, Enum):
@@ -134,6 +154,13 @@ class ErrorCode(str, Enum):
     OCR_001 = "OCR_001"
     OCR_002 = "OCR_002"
     OCR_003 = "OCR_003"
+    PENDING_NEW = "PENDING_NEW"
+    PENDING_VERIFICATION = "PENDING_VERIFICATION"
+    UNFIT_CATEGORY = "UNFIT_CATEGORY"
+    UNFIT_REGION = "UNFIT_REGION"
+    UNFIT_DATE = "UNFIT_DATE"
+    UNFIT_DUPLICATE = "UNFIT_DUPLICATE"
+    ERROR_OCR = "ERROR_OCR"
 
 
 class StayData(BaseModel):
@@ -272,6 +299,7 @@ def _check_db_connection() -> Tuple[bool, Optional[str]]:
             db.execute(sql_text("SELECT 1"))
             db.execute(sql_text("SELECT 1 FROM submissions LIMIT 1"))
             db.execute(sql_text("SELECT 1 FROM receipt_items LIMIT 1"))
+            db.execute(sql_text("SELECT 1 FROM unregistered_stores LIMIT 1"))
             return True, None
         finally:
             db.close()
@@ -854,6 +882,8 @@ def _check_duplicate_receipt_item(
 
 # 유흥업소 등 부적격 업태 키워드 (BIZ_008)
 FORBIDDEN_BUSINESS_KEYWORDS = ("단란주점", "유흥주점", "유흥주점영업", "무도장", "사교춤장")
+OCR_CONFIDENCE_THRESHOLD = 90  # >= 90%면 OCR 우선 신뢰
+AMOUNT_MISMATCH_RATIO_THRESHOLD = 0.10  # 10% 이상 차이 시 수동 검증 보류
 
 
 def _ocr_contains_forbidden_business(ocr_data: dict) -> bool:
@@ -863,6 +893,67 @@ def _ocr_contains_forbidden_business(ocr_data: dict) -> bool:
         return any(kw in text for kw in FORBIDDEN_BUSINESS_KEYWORDS)
     except Exception:
         return False
+
+
+def _extract_store_tel(ocr_data: dict) -> Optional[str]:
+    """OCR 결과에서 가맹점 전화번호 추출."""
+    try:
+        images = ocr_data.get("images") or []
+        if not images:
+            return None
+        result = (images[0].get("receipt") or {}).get("result") or {}
+        store_info = result.get("storeInfo") or {}
+        tel_list = store_info.get("tel") or []
+        if isinstance(tel_list, list) and tel_list:
+            tel_text = (tel_list[0].get("text") or "").strip()
+            return tel_text or None
+    except Exception:
+        return None
+    return None
+
+
+def _is_amount_mismatch(user_amount: Optional[int], ocr_amount: Optional[int]) -> bool:
+    """사용자 입력 금액과 OCR 금액 차이가 10% 이상인지 판정."""
+    if user_amount is None or ocr_amount is None:
+        return False
+    base = max(user_amount, 1)
+    ratio = abs(ocr_amount - user_amount) / base
+    return ratio >= AMOUNT_MISMATCH_RATIO_THRESHOLD
+
+
+def _register_new_candidate_store(db: Session, submission_id: str, parsed: Dict[str, Any], ocr_raw: Optional[Dict[str, Any]]) -> None:
+    """
+    마스터 미등록 상점을 임시 등록(TEMP_VALID).
+    biz_num+address+tel 조합 우선으로 중복 등록 방지.
+    """
+    biz_num = (parsed.get("businessNum") or "").strip() or None
+    address = (parsed.get("address") or "").strip() or None
+    tel = _extract_store_tel(ocr_raw or {}) if ocr_raw else None
+    store_name = (parsed.get("storeName") or "").strip() or None
+
+    q = db.query(UnregisteredStore).filter(UnregisteredStore.status == "TEMP_VALID")
+    if biz_num:
+        q = q.filter(UnregisteredStore.biz_num == biz_num)
+    if address:
+        q = q.filter(UnregisteredStore.address == address)
+    if tel:
+        q = q.filter(UnregisteredStore.tel == tel)
+    exists = q.first()
+    if exists:
+        exists.updated_at = datetime.utcnow()
+        return
+
+    db.add(
+        UnregisteredStore(
+            store_name=store_name,
+            biz_num=biz_num,
+            address=address,
+            tel=tel,
+            status="TEMP_VALID",
+            source_submission_id=submission_id,
+            updated_at=datetime.utcnow(),
+        )
+    )
 
 
 def _fail_message(code: Optional[str]) -> Optional[str]:
@@ -882,15 +973,25 @@ def _fail_message(code: Optional[str]) -> Optional[str]:
         "OCR_001": "OCR_001 (영수증 판독 불가)",
         "OCR_002": "OCR_002 (결제일 형식 오류)",
         "OCR_003": "OCR_003 (마스터 상호 미등록)",
+        "PENDING_NEW": "PENDING_NEW (신규 상점 검수 대기)",
+        "PENDING_VERIFICATION": "PENDING_VERIFICATION (사용자 입력값- OCR 불일치)",
+        "UNFIT_CATEGORY": "UNFIT_CATEGORY (제외 업종)",
+        "UNFIT_REGION": "UNFIT_REGION (지역 불일치)",
+        "UNFIT_DATE": "UNFIT_DATE (기간/날짜 불일치)",
+        "UNFIT_DUPLICATE": "UNFIT_DUPLICATE (중복 제출)",
+        "ERROR_OCR": "ERROR_OCR (판독 불가)",
     }
     return msg.get(code, code)
 
 
 def _normalize_error_code(code: Optional[str]) -> Optional[str]:
-    """에러 문자열에서 표준 코드 토큰(BIZ_###/OCR_###)만 추출."""
+    """에러 문자열에서 표준 코드 토큰 추출."""
     if not code:
         return None
-    m = re.search(r"\b((?:BIZ|OCR)_[0-9]{3})\b", str(code))
+    m = re.search(
+        r"\b((?:BIZ|OCR)_[0-9]{3}|PENDING_NEW|PENDING_VERIFICATION|UNFIT_CATEGORY|UNFIT_REGION|UNFIT_DATE|UNFIT_DUPLICATE|ERROR_OCR)\b",
+        str(code),
+    )
     return m.group(1) if m else None
 
 
@@ -903,8 +1004,37 @@ def _global_fail_reason(code: Optional[str]) -> Optional[str]:
         "BIZ_011": "UNFIT_STAY_MISMATCH (BIZ_011, 숙박-증빙 불일치)",
         "BIZ_004": "UNFIT_REGION (BIZ_004, 지역 불일치)",
         "BIZ_002": "UNFIT_DATE (BIZ_002, 결제일/기간 오류)",
+        "PENDING_NEW": "PENDING_NEW (신규 상점 확인 필요)",
+        "PENDING_VERIFICATION": "PENDING_VERIFICATION (입력값- OCR 불일치)",
+        "UNFIT_CATEGORY": "UNFIT_CATEGORY (제외 업종)",
+        "UNFIT_DUPLICATE": "UNFIT_DUPLICATE (중복 제출)",
+        "ERROR_OCR": "ERROR_OCR (판독 불가)",
     }
     return mapping.get(code, _fail_message(code))
+
+
+def _status_for_code(code: Optional[str]) -> str:
+    """에러 코드에 대응하는 item/submission 상태명을 반환."""
+    c = _normalize_error_code(code) or code
+    if not c:
+        return "FIT"
+    if c in ("OCR_001", "ERROR_OCR"):
+        return "ERROR_OCR"
+    if c in ("BIZ_004", "UNFIT_REGION"):
+        return "UNFIT_REGION"
+    if c in ("BIZ_002", "OCR_002", "UNFIT_DATE"):
+        return "UNFIT_DATE"
+    if c in ("BIZ_001", "UNFIT_DUPLICATE"):
+        return "UNFIT_DUPLICATE"
+    if c in ("BIZ_008", "UNFIT_CATEGORY"):
+        return "UNFIT_CATEGORY"
+    if c == "PENDING_NEW":
+        return "PENDING_NEW"
+    if c == "PENDING_VERIFICATION":
+        return "PENDING_VERIFICATION"
+    if c.startswith("BIZ_"):
+        return "UNFIT"
+    return "UNFIT"
 
 
 def map_ocr_to_db(
@@ -955,14 +1085,24 @@ def finalize_submission(submission: Submission, total_amount: int, min_criteria:
     - FIT item 금액 합산 기준으로 최종 판정
     """
     submission.total_amount = total_amount
-    if not fail_code and total_amount >= min_criteria:
+    resolved = _normalize_error_code(fail_code) or fail_code
+    if not resolved and total_amount >= min_criteria:
         submission.status = "FIT"
         submission.global_fail_reason = None
         submission.fail_reason = None
-    else:
-        submission.status = "UNFIT"
-        resolved = fail_code or "BIZ_003"
+    elif resolved in ("PENDING_NEW", "PENDING_VERIFICATION"):
+        submission.status = resolved
         reason = _global_fail_reason(resolved)
+        submission.global_fail_reason = reason
+        submission.fail_reason = reason
+    elif resolved in ("UNFIT_CATEGORY", "UNFIT_REGION", "UNFIT_DATE", "UNFIT_DUPLICATE", "ERROR_OCR"):
+        submission.status = resolved
+        reason = _global_fail_reason(resolved)
+        submission.global_fail_reason = reason
+        submission.fail_reason = reason
+    else:
+        submission.status = _status_for_code(resolved or "BIZ_003")
+        reason = _global_fail_reason(resolved or "BIZ_003")
         submission.global_fail_reason = reason
         submission.fail_reason = reason
 
@@ -1096,7 +1236,7 @@ async def analyze_receipt_task(req: CompleteRequest):
                         "docType": documents[i]["docType"],
                         "parsed": {},
                         "ocrRaw": None,
-                        "status": "ERROR",
+                        "status": "ERROR_OCR",
                         "error_code": "OCR_001",
                     }
                 )
@@ -1136,19 +1276,33 @@ async def analyze_receipt_task(req: CompleteRequest):
             else:
                 ri = receipt_idx[0]
                 rp = ocr_assets[ri]["parsed"]
-                amount = rp.get("amount")
+                ocr_amount = rp.get("amount")
+                amount = ocr_amount
                 pay_date = rp.get("payDate") or ""
                 store_name = rp.get("storeName") or ""
                 address = rp.get("address") or ""
                 location = rp.get("location") or ""
                 biz_num = rp.get("businessNum")
                 card_num = _normalize_card_num(rp.get("cardNum"))
+                confidence = rp.get("confidenceScore") if isinstance(rp.get("confidenceScore"), int) else 0
 
-                if ocr_assets[ri]["status"] == "ERROR":
-                    fail_code = ocr_assets[ri]["error_code"] or "OCR_001"
+                # OCR 신뢰도가 낮으면 사용자 입력을 참조값으로 사용 (고신뢰 OCR은 그대로 우선)
+                if confidence < OCR_CONFIDENCE_THRESHOLD and isinstance(req.data, StayData):
+                    amount = req.data.amount
+                    pay_date = req.data.payDate or pay_date
+                    location = req.data.location or location
+                    rp["amount"] = amount
+                    rp["payDate"] = pay_date
+                    rp["location"] = location
+                    item_rows[ri].amount = amount
+                    item_rows[ri].pay_date = pay_date
+                    item_rows[ri].location = location
+
+                if ocr_assets[ri]["status"] == "ERROR_OCR":
+                    fail_code = "ERROR_OCR"
                 elif amount is None:
-                    mark_item(ri, "ERROR", "OCR_001")
-                    fail_code = "OCR_001"
+                    mark_item(ri, "ERROR_OCR", "OCR_001")
+                    fail_code = "ERROR_OCR"
                 else:
                     _, normalized_date = _normalize_and_validate_2026_date(pay_date)
                     pay_date_stored = normalized_date or pay_date
@@ -1168,7 +1322,11 @@ async def analyze_receipt_task(req: CompleteRequest):
                             is_2026_date=bool(normalized_date),
                         )
                         if fc:
-                            item_fail = fc
+                            if fc == "OCR_003":
+                                _register_new_candidate_store(db, req.receiptId, rp, ocr_assets[ri]["ocrRaw"])
+                                item_fail = "PENDING_NEW"
+                            else:
+                                item_fail = fc
                     if not item_fail and _check_duplicate_receipt_item(
                         db, req.receiptId, biz_num, pay_date_stored, amount, card_num
                     ):
@@ -1178,8 +1336,14 @@ async def analyze_receipt_task(req: CompleteRequest):
                         if not ok and c_fail:
                             item_fail = c_fail
 
+                    # 사용자 입력 대비 OCR 금액 10% 이상 차이 시 수동검증 보류
+                    if not item_fail and isinstance(req.data, StayData):
+                        base_amount = ocr_amount if isinstance(ocr_amount, int) else amount
+                        if _is_amount_mismatch(req.data.amount, base_amount):
+                            item_fail = "PENDING_VERIFICATION"
+
                     if item_fail:
-                        mark_item(ri, "UNFIT", item_fail)
+                        mark_item(ri, _status_for_code(item_fail), item_fail)
                         fail_code = item_fail
                     else:
                         mark_item(ri, "FIT", None)
@@ -1189,14 +1353,14 @@ async def analyze_receipt_task(req: CompleteRequest):
                     oi = ota_idx[0]
                     if fail_code and total_amount <= 0:
                         if ocr_assets[oi]["status"] == "PENDING":
-                            mark_item(oi, "UNFIT", fail_code)
-                    elif ocr_assets[oi]["status"] == "ERROR":
+                            mark_item(oi, _status_for_code(fail_code), fail_code)
+                    elif ocr_assets[oi]["status"] == "ERROR_OCR":
                         fail_code = fail_code or (ocr_assets[oi]["error_code"] or "OCR_001")
                     else:
                         op = ocr_assets[oi]["parsed"]
                         ota_amount = op.get("amount")
                         if total_amount and ota_amount is not None and ota_amount != total_amount:
-                            mark_item(oi, "UNFIT", "BIZ_011")
+                            mark_item(oi, _status_for_code("BIZ_011"), "BIZ_011")
                             fail_code = fail_code or "BIZ_011"
                         else:
                             mark_item(oi, "FIT", None)
@@ -1223,10 +1387,10 @@ async def analyze_receipt_task(req: CompleteRequest):
                     biz_num = p.get("businessNum")
                     card_num = _normalize_card_num(p.get("cardNum"))
 
-                    if a["status"] == "ERROR":
+                    if a["status"] == "ERROR_OCR":
                         continue
                     if amount is None:
-                        mark_item(i, "ERROR", "OCR_001")
+                        mark_item(i, "ERROR_OCR", "OCR_001")
                         continue
 
                     is_2026, norm_date = _normalize_and_validate_2026_date(pay_date)
@@ -1241,7 +1405,8 @@ async def analyze_receipt_task(req: CompleteRequest):
                     else:
                         matched, _ = match_store_in_master(db, store_name, location)
                         if not matched:
-                            item_fail = "OCR_003"
+                            _register_new_candidate_store(db, req.receiptId, p, a["ocrRaw"])
+                            item_fail = "PENDING_NEW"
 
                     if not item_fail and _check_duplicate_receipt_item(
                         db, req.receiptId, biz_num, pay_date_stored, amount, card_num
@@ -1253,7 +1418,7 @@ async def analyze_receipt_task(req: CompleteRequest):
                             item_fail = c_fail
 
                     if item_fail:
-                        mark_item(i, "UNFIT", item_fail)
+                        mark_item(i, _status_for_code(item_fail), item_fail)
                         continue
 
                     mark_item(i, "FIT", None)
@@ -1261,6 +1426,11 @@ async def analyze_receipt_task(req: CompleteRequest):
                     amount_parts.append(str(amount))
 
                 total_amount = total
+                if isinstance(req.data, TourData) and _is_amount_mismatch(req.data.amount, total_amount):
+                    for i in receipt_idx:
+                        if ocr_assets[i].get("status") == "FIT":
+                            mark_item(i, "PENDING_VERIFICATION", "PENDING_VERIFICATION")
+                    fail_code = fail_code or "PENDING_VERIFICATION"
                 if total_amount < 50000:
                     fail_code = "BIZ_003"
                 audit_lines.append(
@@ -1269,9 +1439,18 @@ async def analyze_receipt_task(req: CompleteRequest):
                 )
 
         fit_cnt = sum(1 for a in ocr_assets if a.get("status") == "FIT")
-        unfit_cnt = sum(1 for a in ocr_assets if a.get("status") == "UNFIT")
-        err_cnt = sum(1 for a in ocr_assets if a.get("status") == "ERROR")
-        audit_lines.append(f"총 {len(ocr_assets)}매 중 적격 {fit_cnt}매, 부적격 {unfit_cnt}매, 오류 {err_cnt}매")
+        unfit_cnt = sum(1 for a in ocr_assets if str(a.get("status", "")).startswith("UNFIT"))
+        err_cnt = sum(1 for a in ocr_assets if a.get("status") in ("ERROR", "ERROR_OCR"))
+        pending_new_cnt = sum(1 for a in ocr_assets if a.get("status") == "PENDING_NEW")
+        pending_verification_cnt = sum(1 for a in ocr_assets if a.get("status") == "PENDING_VERIFICATION")
+        if not fail_code and pending_new_cnt > 0:
+            fail_code = "PENDING_NEW"
+        if not fail_code and pending_verification_cnt > 0:
+            fail_code = "PENDING_VERIFICATION"
+        audit_lines.append(
+            f"총 {len(ocr_assets)}매 중 적격 {fit_cnt}매, 부적격 {unfit_cnt}매, 오류 {err_cnt}매, "
+            f"신규상점대기 {pending_new_cnt}매, 수동검증대기 {pending_verification_cnt}매"
+        )
 
         # 4) 부모 상태 업데이트
         min_criteria = 60000 if req.type == "STAY" else 50000

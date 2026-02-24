@@ -19,7 +19,7 @@ from processor import validate_and_match, validate_campaign_rules, match_store_i
 from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, JSON, Boolean
+from sqlalchemy import create_engine, Column, String, Integer, DateTime, JSON, Boolean, ARRAY
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session
 from botocore.config import Config
@@ -59,21 +59,22 @@ s3_client = boto3.client(
     config=Config(signature_version='s3v4')
 )
 
-# 3. 데이터베이스 모델 (자산화 분석용)
+# 3. 데이터베이스 모델 (자산화 분석용, FE 연동 STAY/TOUR)
 class Receipt(Base):
     __tablename__ = "receipts"
     receipt_id = Column(String, primary_key=True, index=True)
-    user_uuid = Column(String, index=True)
-    type = Column(String) # STAY or TOUR
+    user_uuid = Column(String, index=True, nullable=False)
+    type = Column(String, nullable=False)  # STAY | TOUR
     status = Column(String, default="PENDING")  # PENDING → PROCESSING → VERIFYING → FIT | UNFIT | DUPLICATE | ERROR
     amount = Column(Integer)
     pay_date = Column(String)
     store_name = Column(String)
     address = Column(String)  # OCR 가맹점 주소 전체 (강원특별자치도 검증용)
     location = Column(String)  # 시군 정보 (데이터 자산화)
-    image_key = Column(String)  # MinIO 객체 키 (영수증 이미지 경로)
-    image_keys = Column(JSON)  # 제출된 전체 이미지 키 배열 (합산형)
-    documents = Column(JSON)  # 문서 메타데이터 배열 [{imageKey, docType}]
+    # FE 연동(합산형): 단일/복수 이미지 및 신규 스펙
+    image_key = Column(String(500))  # 단일 이미지 객체 키 (하위호환)
+    image_keys = Column(ARRAY(String))  # 복수 이미지 (TOUR 1~3장 등), PostgreSQL TEXT[]
+    documents = Column(JSON)  # 신규 스펙: [{ imageKey, docType }], DB는 JSONB
     business_num = Column(String)  # 사업자등록번호 (OCR 추출)
     ocr_assets = Column(JSON)  # 이미지별 OCR 원본/파싱 결과 배열
     audit_trail = Column(String)  # 검증 근거 요약 문자열

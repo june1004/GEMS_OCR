@@ -8,3 +8,15 @@
 ALTER TABLE receipts ADD COLUMN IF NOT EXISTS image_key VARCHAR(500);
 ALTER TABLE receipts ADD COLUMN IF NOT EXISTS image_keys TEXT[];
 ALTER TABLE receipts ADD COLUMN IF NOT EXISTS documents JSONB;
+
+-- BE 모델과 스키마 정합성용: 나머지 누락 컬럼 일괄 추가 (이미 있으면 스킵)
+ALTER TABLE receipts ADD COLUMN IF NOT EXISTS business_num VARCHAR(50);
+ALTER TABLE receipts ADD COLUMN IF NOT EXISTS ocr_assets JSONB;
+ALTER TABLE receipts ADD COLUMN IF NOT EXISTS audit_trail TEXT;
+ALTER TABLE receipts ADD COLUMN IF NOT EXISTS submission_type VARCHAR(50);
+
+-- 적용 후 확인용: 아래 쿼리로 image_key, image_keys, documents 포함 여부 확인
+-- SELECT column_name, data_type
+-- FROM information_schema.columns
+-- WHERE table_schema = 'public' AND table_name = 'receipts'
+-- ORDER BY ordinal_position;

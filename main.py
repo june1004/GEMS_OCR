@@ -18,10 +18,15 @@ from dateutil import parser as dateutil_parser
 from sqlalchemy import text as sql_text
 
 from processor import validate_and_match, validate_campaign_rules, match_store_in_master
+from store_classifier import (
+    classify_store,
+    is_forbidden as _classifier_is_forbidden,
+    AUTO_REGISTER_THRESHOLD as CLASSIFIER_AUTO_THRESHOLD,
+)
 from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator, UUID4, ConfigDict
-from sqlalchemy import create_engine, Column, String, Integer, DateTime, JSON, Boolean, ARRAY, ForeignKey
+from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, JSON, Boolean, ARRAY, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.dialects.postgresql import JSONB
@@ -48,6 +53,12 @@ S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
 S3_BUCKET = os.getenv("S3_BUCKET", "gems-receipts")
 NAVER_OCR_URL = os.getenv("NAVER_OCR_INVOKE_URL")
+# 분석 완료 시 FE 결과 수신 URL (운영: https://easy.gwd.go.kr/dg/coupon/api/ocr/result / 테스트: http://210.179.205.50/dg/coupon/api/ocr/result)
+OCR_RESULT_CALLBACK_URL = os.getenv("OCR_RESULT_CALLBACK_URL", "").strip() or None
+OCR_CALLBACK_TIMEOUT_SEC = 10
+OCR_CALLBACK_SCHEMA_VERSION = 2
+OCR_CALLBACK_MAX_AUDIT_TRAIL_CHARS = int(os.getenv("OCR_CALLBACK_MAX_AUDIT_TRAIL_CHARS", "2000"))
+OCR_CALLBACK_MAX_ERROR_MESSAGE_CHARS = int(os.getenv("OCR_CALLBACK_MAX_ERROR_MESSAGE_CHARS", "200"))
 NAVER_OCR_SECRET = os.getenv("NAVER_OCR_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
@@ -117,7 +128,20 @@ class UnregisteredStore(Base):
     first_detected_at = Column(DateTime)
     recent_receipt_id = Column(String(64), index=True)  # 증거 확인용 최근 submission_id
     predicted_category = Column(String(64))  # OCR/분류용 (nullable)
+    category_confidence = Column(Float)  # 0.0~1.0 (자동 분류 신뢰도)
+    classifier_type = Column(String(20))  # RULE | SEMANTIC | AI
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow)
+
+
+class JudgmentRuleConfig(Base):
+    __tablename__ = "judgment_rule_config"
+    id = Column(Integer, primary_key=True, default=1)
+    unknown_store_policy = Column(String(32), default="AUTO_REGISTER")  # AUTO_REGISTER | PENDING_NEW
+    auto_register_threshold = Column(Float, default=0.90)  # 0.0 ~ 1.0
+    enable_gemini_classifier = Column(Boolean, default=True)
+    min_amount_stay = Column(Integer, default=60000)
+    min_amount_tour = Column(Integer, default=50000)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 Base.metadata.create_all(bind=engine)
@@ -457,9 +481,15 @@ async def upload_receipt_via_api(
     return {"uploadUrl": "", "receiptId": receipt_id, "objectKey": object_key}
 
 
-@app.post("/api/v1/receipts/complete", response_model=CompleteResponse)
+@app.post(
+    "/api/v1/receipts/complete",
+    response_model=CompleteResponse,
+    summary="검증 완료 요청",
+    description="receiptId 기준 1회 호출. documents 배열에 해당 신청의 모든 이미지(imageKey=objectKey, docType) 전달. "
+    "documents 사용 시 data는 생략(null) 가능. 분석 완료 시 OCR_RESULT_CALLBACK_URL이 설정된 경우 FE로 결과 POST(재시도 없음).",
+)
 async def submit_receipt(req: CompleteRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    """3단계: 사용자 입력값 수신 및 비동기 분석 시작 (합산형 documents 지원)"""
+    """3단계: 사용자 입력값 수신 및 비동기 분석 시작 (합산형 documents 지원). 1건 신청 = 1 receiptId = complete 1회."""
     submission = db.query(Submission).filter(Submission.submission_id == req.receiptId).first()
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
@@ -518,6 +548,17 @@ class StatusResponse(SubmissionStatusResponse):
     rewardAmount: int = 0
     address: Optional[str] = None
     cardPrefix: Optional[str] = None
+    # FE 폴링 가이드
+    shouldPoll: bool = Field(False, description="true면 FE가 같은 status API를 재호출")
+    recommendedPollIntervalMs: Optional[int] = Field(
+        None,
+        description="권장 폴링 주기(ms). shouldPoll=true일 때만 의미",
+    )
+    reviewRequired: bool = Field(False, description="관리자/담당자 수동 검토 필요 여부")
+    statusStage: str = Field(
+        "DONE",
+        description="AUTO_PROCESSING | MANUAL_REVIEW | DONE",
+    )
 
 def _parse_city_county_from_address(address: Optional[str]) -> Optional[str]:
     """주소에서 시군 구 추출. '강원특별자치도 춘천시 중앙로 123' -> '춘천시'."""
@@ -525,6 +566,33 @@ def _parse_city_county_from_address(address: Optional[str]) -> Optional[str]:
         return None
     parts = address.strip().split()
     return parts[1] if len(parts) >= 2 else None
+
+
+def _normalize_unknown_store_policy(raw: Optional[str]) -> str:
+    s = (raw or "").strip().upper()
+    if s in ("PENDING_NEW", "AUTO_REGISTER"):
+        return s
+    return "AUTO_REGISTER"
+
+
+def _get_judgment_rule_config(db: Session) -> JudgmentRuleConfig:
+    """판정 규칙 싱글톤 로드. 없으면 기본행(id=1) 생성."""
+    cfg = db.query(JudgmentRuleConfig).filter(JudgmentRuleConfig.id == 1).first()
+    if cfg:
+        return cfg
+    cfg = JudgmentRuleConfig(
+        id=1,
+        unknown_store_policy="AUTO_REGISTER",
+        auto_register_threshold=0.90,
+        enable_gemini_classifier=True,
+        min_amount_stay=60000,
+        min_amount_tour=50000,
+        updated_at=datetime.utcnow(),
+    )
+    db.add(cfg)
+    db.commit()
+    db.refresh(cfg)
+    return cfg
 
 
 def _sanitize_receipt_id(raw: str) -> str:
@@ -536,13 +604,130 @@ def _sanitize_receipt_id(raw: str) -> str:
     return match.group(1) if match else s.split()[0] if s.split() else s
 
 
+def _polling_hint_by_status(status: Optional[str]) -> Tuple[bool, Optional[int], bool, str]:
+    """
+    FE 폴링 정책 가이드:
+    - AUTO_PROCESSING: OCR/자동검증 중 → 빠른 폴링(2s)
+    - MANUAL_REVIEW: 관리자 검토 대기 → 느린 폴링(30s)
+    - DONE: 최종 완료/종결 상태 → 폴링 중지
+    """
+    s = (status or "").strip()
+    if s in ("PROCESSING", "VERIFYING"):
+        return True, 2000, False, "AUTO_PROCESSING"
+    if s in ("PENDING_NEW", "PENDING_VERIFICATION"):
+        return True, 30000, True, "MANUAL_REVIEW"
+    return False, None, False, "DONE"
+
+
+def _build_status_payload(submission: Submission, item_rows: List[Any]) -> Dict[str, Any]:
+    """
+    콜백 전송용 payload 생성.
+    - GET status 응답과 거의 동일하되, 콜백에서는 대용량 필드(예: items[].ocr_raw)를 제외해 전송량을 줄인다.
+    """
+    first_item = item_rows[0] if item_rows else None
+    address = None
+    card_prefix = None
+    if first_item:
+        address = (first_item.address or first_item.location or first_item.store_name or "").strip() or None
+        card_prefix = first_item.card_num or None
+    if submission.status in ("VERIFYING", "PROCESSING") and card_prefix == "0000":
+        card_prefix = None
+    audit_trail_raw = (submission.audit_trail or submission.audit_log or "")
+    audit_trail_truncated = False
+    if OCR_CALLBACK_MAX_AUDIT_TRAIL_CHARS > 0 and len(audit_trail_raw) > OCR_CALLBACK_MAX_AUDIT_TRAIL_CHARS:
+        audit_trail_raw = audit_trail_raw[: OCR_CALLBACK_MAX_AUDIT_TRAIL_CHARS - 1] + "…"
+        audit_trail_truncated = True
+
+    item_details: List[Dict[str, Any]] = []
+    error_message_truncated_count = 0
+    for it in item_rows:
+        extracted = None
+        if it.status != "ERROR":
+            extracted = {
+                "store_name": it.store_name,
+                "amount": it.amount or 0,
+                "pay_date": it.pay_date,
+                "address": it.address,
+                "card_num": it.card_num or "0000",
+            }
+        err_msg = it.error_message
+        if (
+            err_msg
+            and OCR_CALLBACK_MAX_ERROR_MESSAGE_CHARS > 0
+            and len(err_msg) > OCR_CALLBACK_MAX_ERROR_MESSAGE_CHARS
+        ):
+            err_msg = err_msg[: OCR_CALLBACK_MAX_ERROR_MESSAGE_CHARS - 1] + "…"
+            error_message_truncated_count += 1
+        item_details.append({
+            "item_id": str(it.item_id),
+            "status": it.status or "PENDING",
+            "error_code": _normalize_error_code(it.error_code),
+            "error_message": err_msg,
+            "extracted_data": extracted,
+            "image_url": it.image_key or "",
+            # 콜백 최적화: ocr_raw는 매우 크므로 콜백에서는 제외 (GET status에서만 제공)
+        })
+    should_poll, poll_interval_ms, review_required, status_stage = _polling_hint_by_status(submission.status)
+    resp = StatusResponse(
+        submission_id=submission.submission_id,
+        project_type=submission.project_type,
+        overall_status=submission.status,
+        total_amount=submission.total_amount or 0,
+        global_fail_reason=submission.global_fail_reason or submission.fail_reason,
+        items=item_details,
+        audit_trail=audit_trail_raw,
+        status=submission.status,
+        amount=submission.total_amount or 0,
+        failReason=submission.fail_reason,
+        rewardAmount=30000 if submission.project_type == "STAY" and submission.status == "FIT" else 10000 if submission.status == "FIT" else 0,
+        address=address,
+        cardPrefix=card_prefix,
+        shouldPoll=should_poll,
+        recommendedPollIntervalMs=poll_interval_ms,
+        reviewRequired=review_required,
+        statusStage=status_stage,
+    )
+    payload = resp.model_dump(mode="json")
+    payload["payloadMeta"] = {
+        "auditTrailTruncated": audit_trail_truncated,
+        "errorMessageTruncatedCount": error_message_truncated_count,
+        "generatedAt": datetime.utcnow().isoformat(),
+    }
+    return payload
+
+
+async def _send_result_callback(receipt_id: str, payload: Dict[str, Any]) -> None:
+    """분석 완료 시 FE 지정 URL로 결과 POST. 재시도 없음, 실패 시 로그 후 종료."""
+    if not OCR_RESULT_CALLBACK_URL:
+        return
+    payload_with_id = {
+        "schemaVersion": OCR_CALLBACK_SCHEMA_VERSION,
+        "receiptId": receipt_id,
+        **payload,
+    }
+    try:
+        async with httpx.AsyncClient(timeout=OCR_CALLBACK_TIMEOUT_SEC) as client:
+            r = await client.post(
+                OCR_RESULT_CALLBACK_URL,
+                json=payload_with_id,
+                headers={"Content-Type": "application/json"},
+            )
+            if r.status_code >= 400:
+                logger.warning("OCR result callback failed: receiptId=%s status=%s body=%s", receipt_id, r.status_code, r.text[:200])
+    except Exception as e:
+        logger.warning("OCR result callback error (no retry): receiptId=%s err=%s", receipt_id, e)
+
+
 @app.get(
     "/api/v1/receipts/{receiptId}/status",
     response_model=StatusResponse,
     responses={404: {"description": "Receipt not found"}},
+    summary="결과 조회(폴링/스케줄러 복구)",
+    description="receiptId 단위 최종 판정. 동일 receiptId에 대해 언제든 반복 호출 가능(FE 스케줄러 누락 복구용). "
+    "콜백과 동일한 JSON 구조(콜백 시 Body에 receiptId 추가하여 전송).",
 )
 async def get_status(receiptId: str, db: Session = Depends(get_db)):
-    """4단계: 최종 결과 조회 (데이터 자산화: address, cardPrefix 포함). submission 필드는 DB 기준 최신값 사용."""
+    """4단계: 최종 결과 조회. receiptId 단위 적합/부적합, DB 기준 최신값 반환."""
     receipt_id = _sanitize_receipt_id(receiptId)
     submission = db.query(Submission).filter(Submission.submission_id == receipt_id).first()
     if not submission:
@@ -560,6 +745,9 @@ async def get_status(receiptId: str, db: Session = Depends(get_db)):
     if first_item:
         address = (first_item.address or first_item.location or first_item.store_name or "").strip() or None
         card_prefix = first_item.card_num or None
+    # VERIFYING/PROCESSING 중 placeholder만 있을 땐 카드 미확정으로 null 반환 (0000 노출 방지)
+    if submission.status in ("VERIFYING", "PROCESSING") and card_prefix == "0000":
+        card_prefix = None
     item_details: List[ReceiptItemSchema] = []
     for it in item_rows:
         extracted = None
@@ -582,6 +770,7 @@ async def get_status(receiptId: str, db: Session = Depends(get_db)):
                 ocr_raw=it.ocr_raw,
             )
         )
+    should_poll, poll_interval_ms, review_required, status_stage = _polling_hint_by_status(submission.status)
     return StatusResponse(
         submission_id=submission.submission_id,
         project_type=submission.project_type,
@@ -596,6 +785,10 @@ async def get_status(receiptId: str, db: Session = Depends(get_db)):
         rewardAmount=30000 if submission.project_type == "STAY" and submission.status == "FIT" else 10000 if submission.status == "FIT" else 0,
         address=address,
         cardPrefix=card_prefix,
+        shouldPoll=should_poll,
+        recommendedPollIntervalMs=poll_interval_ms,
+        reviewRequired=review_required,
+        statusStage=status_stage,
     )
 
 
@@ -619,6 +812,72 @@ async def get_status_alt(receiptId: str, db: Session = Depends(get_db)):
 async def get_status_proxy(receiptId: str, db: Session = Depends(get_db)):
     """프론트엔드 프록시 경로: /api/v1/receipts/{id}/status 와 동일 응답"""
     return await get_status(receiptId, db)
+
+
+# 5-1. 판정 규칙 관리 API (관리자)
+class JudgmentRuleConfigResponse(BaseModel):
+    unknown_store_policy: str = Field(..., description="AUTO_REGISTER | PENDING_NEW")
+    auto_register_threshold: float = Field(..., description="0.0~1.0")
+    enable_gemini_classifier: bool = Field(..., description="신규 상점 분류 시 Gemini 사용 여부")
+    min_amount_stay: int = Field(..., description="STAY 최소 금액")
+    min_amount_tour: int = Field(..., description="TOUR 최소 금액")
+    updated_at: Optional[str] = None
+
+
+class JudgmentRuleConfigUpdateRequest(BaseModel):
+    unknown_store_policy: Optional[str] = Field(None, description="AUTO_REGISTER | PENDING_NEW")
+    auto_register_threshold: Optional[float] = Field(None, description="0.0~1.0")
+    enable_gemini_classifier: Optional[bool] = None
+    min_amount_stay: Optional[int] = None
+    min_amount_tour: Optional[int] = None
+
+
+@app.get(
+    "/api/v1/admin/rules/judgment",
+    response_model=JudgmentRuleConfigResponse,
+    summary="판정 규칙 조회",
+)
+async def get_judgment_rule_config(db: Session = Depends(get_db)):
+    cfg = _get_judgment_rule_config(db)
+    return JudgmentRuleConfigResponse(
+        unknown_store_policy=_normalize_unknown_store_policy(cfg.unknown_store_policy),
+        auto_register_threshold=float(cfg.auto_register_threshold or 0.90),
+        enable_gemini_classifier=bool(cfg.enable_gemini_classifier),
+        min_amount_stay=int(cfg.min_amount_stay or 60000),
+        min_amount_tour=int(cfg.min_amount_tour or 50000),
+        updated_at=cfg.updated_at.isoformat() if cfg.updated_at else None,
+    )
+
+
+@app.put(
+    "/api/v1/admin/rules/judgment",
+    response_model=JudgmentRuleConfigResponse,
+    summary="판정 규칙 수정",
+)
+async def update_judgment_rule_config(body: JudgmentRuleConfigUpdateRequest, db: Session = Depends(get_db)):
+    cfg = _get_judgment_rule_config(db)
+    if body.unknown_store_policy is not None:
+        cfg.unknown_store_policy = _normalize_unknown_store_policy(body.unknown_store_policy)
+    if body.auto_register_threshold is not None:
+        # 운영 실수를 막기 위해 0~1 범위로 클램프
+        cfg.auto_register_threshold = max(0.0, min(1.0, float(body.auto_register_threshold)))
+    if body.enable_gemini_classifier is not None:
+        cfg.enable_gemini_classifier = bool(body.enable_gemini_classifier)
+    if body.min_amount_stay is not None:
+        cfg.min_amount_stay = max(0, int(body.min_amount_stay))
+    if body.min_amount_tour is not None:
+        cfg.min_amount_tour = max(0, int(body.min_amount_tour))
+    cfg.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(cfg)
+    return JudgmentRuleConfigResponse(
+        unknown_store_policy=_normalize_unknown_store_policy(cfg.unknown_store_policy),
+        auto_register_threshold=float(cfg.auto_register_threshold or 0.90),
+        enable_gemini_classifier=bool(cfg.enable_gemini_classifier),
+        min_amount_stay=int(cfg.min_amount_stay or 60000),
+        min_amount_tour=int(cfg.min_amount_tour or 50000),
+        updated_at=cfg.updated_at.isoformat() if cfg.updated_at else None,
+    )
 
 
 # 5-2. 신규 상점 후보군(Unregistered Stores) 관리 API
@@ -664,8 +923,10 @@ async def list_candidate_stores(
     sort_by: Optional[str] = "occurrence_count",
     db: Session = Depends(get_db),
 ):
-    """관리자: 후보 상점 리스트 (시군구 필터, 최소 빈도, 정렬)."""
-    q = db.query(UnregisteredStore).filter(UnregisteredStore.status == "TEMP_VALID")
+    """관리자: 후보 상점 리스트 (시군구 필터, 최소 빈도, 정렬). TEMP_VALID + AUTO_REGISTERED(검토 필요)."""
+    q = db.query(UnregisteredStore).filter(
+        UnregisteredStore.status.in_(["TEMP_VALID", "AUTO_REGISTERED"])
+    )
     rows = q.all()
     # 시군구 필터: 주소에서 두 번째 토큰(춘천시 등)으로 필터
     if city_county and city_county.strip():
@@ -1076,11 +1337,67 @@ def _is_amount_mismatch(user_amount: Optional[int], ocr_amount: Optional[int]) -
     return ratio >= AMOUNT_MISMATCH_RATIO_THRESHOLD
 
 
-def _register_new_candidate_store(db: Session, submission_id: str, parsed: Dict[str, Any], ocr_raw: Optional[Dict[str, Any]]) -> None:
+def _auto_register_store(
+    db: Session,
+    submission_id: str,
+    store_name: str,
+    address: Optional[str],
+    biz_num: Optional[str],
+    tel: Optional[str],
+    predicted_category: str,
+    category_confidence: float,
+    classifier_type: str,
+) -> None:
+    """고신뢰도 자동 분류 시 master_stores + unregistered_stores(AUTO_REGISTERED) 삽입. 이후 동일 상점은 FIT."""
+    try:
+        db.execute(
+            sql_text(
+                "INSERT INTO master_stores (store_name, category_large, category_small, road_address) "
+                "VALUES (:store_name, :category_large, :category_small, :road_address)"
+            ),
+            {
+                "store_name": store_name or "",
+                "category_large": predicted_category,
+                "category_small": predicted_category,
+                "road_address": address or "",
+            },
+        )
+    except Exception as e:
+        logger.warning("auto_register_store master_stores insert failed: %s", e)
+        return
+    now = datetime.utcnow()
+    db.add(
+        UnregisteredStore(
+            store_name=store_name,
+            biz_num=biz_num,
+            address=address,
+            tel=tel,
+            status="AUTO_REGISTERED",
+            source_submission_id=submission_id,
+            occurrence_count=1,
+            first_detected_at=now,
+            recent_receipt_id=submission_id,
+            predicted_category=predicted_category,
+            category_confidence=category_confidence,
+            classifier_type=classifier_type,
+            updated_at=now,
+        )
+    )
+
+
+def _register_new_candidate_store(
+    db: Session,
+    submission_id: str,
+    parsed: Dict[str, Any],
+    ocr_raw: Optional[Dict[str, Any]],
+    predicted_category: Optional[str] = None,
+    category_confidence: Optional[float] = None,
+    classifier_type: Optional[str] = None,
+) -> None:
     """
     마스터 미등록 상점을 임시 등록(TEMP_VALID).
     biz_num+address+tel 조합 우선으로 중복 등록 방지.
-    동일 상점 재발견 시 occurrence_count 증가, recent_receipt_id 갱신.
+    predicted_category/confidence/classifier_type 은 업종 자동 분류 결과(선택).
     """
     biz_num = (parsed.get("businessNum") or "").strip() or None
     address = (parsed.get("address") or "").strip() or None
@@ -1100,6 +1417,12 @@ def _register_new_candidate_store(db: Session, submission_id: str, parsed: Dict[
         exists.occurrence_count = (exists.occurrence_count or 0) + 1
         exists.recent_receipt_id = submission_id
         exists.updated_at = now
+        if predicted_category is not None:
+            exists.predicted_category = predicted_category
+        if category_confidence is not None:
+            exists.category_confidence = category_confidence
+        if classifier_type is not None:
+            exists.classifier_type = classifier_type
         return
 
     db.add(
@@ -1113,6 +1436,9 @@ def _register_new_candidate_store(db: Session, submission_id: str, parsed: Dict[
             occurrence_count=1,
             first_detected_at=now,
             recent_receipt_id=submission_id,
+            predicted_category=predicted_category,
+            category_confidence=category_confidence,
+            classifier_type=classifier_type,
             updated_at=now,
         )
     )
@@ -1371,6 +1697,14 @@ async def analyze_receipt_task(req: CompleteRequest):
         return
 
     try:
+        rule_cfg = _get_judgment_rule_config(db)
+        unknown_store_policy = _normalize_unknown_store_policy(rule_cfg.unknown_store_policy)
+        auto_register_threshold = float(rule_cfg.auto_register_threshold or CLASSIFIER_AUTO_THRESHOLD)
+        auto_register_threshold = max(0.0, min(1.0, auto_register_threshold))
+        use_gemini_classifier = bool(rule_cfg.enable_gemini_classifier)
+        min_amount_stay = int(rule_cfg.min_amount_stay or 60000)
+        min_amount_tour = int(rule_cfg.min_amount_tour or 50000)
+
         documents = _build_documents_from_request(req)
         if not documents:
             submission.status = "UNFIT"
@@ -1541,11 +1875,52 @@ async def analyze_receipt_task(req: CompleteRequest):
                             amount,
                             "STAY",
                             is_2026_date=bool(normalized_date),
+                            min_amount_stay=min_amount_stay,
+                            min_amount_tour=min_amount_tour,
                         )
                         if fc:
                             if fc == "OCR_003":
-                                _register_new_candidate_store(db, req.receiptId, rp, ocr_assets[ri]["ocrRaw"])
-                                item_fail = "PENDING_NEW"
+                                ocr_raw_ri = ocr_assets[ri].get("ocrRaw")
+                                if _classifier_is_forbidden(store_name, address, ocr_raw_ri):
+                                    item_fail = "BIZ_008"
+                                else:
+                                    pred_cat, conf, ctype = classify_store(
+                                        store_name, address, ocr_raw_ri, use_gemini=use_gemini_classifier
+                                    )
+                                    should_auto_register = (
+                                        unknown_store_policy == "AUTO_REGISTER"
+                                        and bool(pred_cat)
+                                        and conf >= auto_register_threshold
+                                    )
+                                    if should_auto_register:
+                                        _auto_register_store(
+                                            db,
+                                            req.receiptId,
+                                            store_name or "",
+                                            address,
+                                            biz_num,
+                                            _extract_store_tel(ocr_raw_ri or {}),
+                                            pred_cat,
+                                            conf,
+                                            ctype,
+                                        )
+                                        matched_after, _ = match_store_in_master(db, store_name, location)
+                                        if not matched_after:
+                                            _register_new_candidate_store(
+                                                db, req.receiptId, rp, ocr_raw_ri,
+                                                predicted_category=pred_cat,
+                                                category_confidence=conf,
+                                                classifier_type=ctype,
+                                            )
+                                            item_fail = "PENDING_NEW"
+                                    else:
+                                        _register_new_candidate_store(
+                                            db, req.receiptId, rp, ocr_raw_ri,
+                                            predicted_category=pred_cat or None,
+                                            category_confidence=conf if conf else None,
+                                            classifier_type=ctype,
+                                        )
+                                        item_fail = "PENDING_NEW"
                             else:
                                 item_fail = fc
                     if not item_fail and _check_duplicate_receipt_item(
@@ -1626,8 +2001,47 @@ async def analyze_receipt_task(req: CompleteRequest):
                     else:
                         matched, _ = match_store_in_master(db, store_name, location)
                         if not matched:
-                            _register_new_candidate_store(db, req.receiptId, p, a["ocrRaw"])
-                            item_fail = "PENDING_NEW"
+                            ocr_raw_a = a.get("ocrRaw")
+                            if _classifier_is_forbidden(store_name, address, ocr_raw_a):
+                                item_fail = "BIZ_008"
+                            else:
+                                pred_cat, conf, ctype = classify_store(
+                                    store_name, address, ocr_raw_a, use_gemini=use_gemini_classifier
+                                )
+                                should_auto_register = (
+                                    unknown_store_policy == "AUTO_REGISTER"
+                                    and bool(pred_cat)
+                                    and conf >= auto_register_threshold
+                                )
+                                if should_auto_register:
+                                    _auto_register_store(
+                                        db,
+                                        req.receiptId,
+                                        store_name or "",
+                                        address,
+                                        biz_num,
+                                        _extract_store_tel(ocr_raw_a or {}),
+                                        pred_cat,
+                                        conf,
+                                        ctype,
+                                    )
+                                    matched_after, _ = match_store_in_master(db, store_name, location)
+                                    if not matched_after:
+                                        _register_new_candidate_store(
+                                            db, req.receiptId, p, ocr_raw_a,
+                                            predicted_category=pred_cat,
+                                            category_confidence=conf,
+                                            classifier_type=ctype,
+                                        )
+                                        item_fail = "PENDING_NEW"
+                                else:
+                                    _register_new_candidate_store(
+                                        db, req.receiptId, p, ocr_raw_a,
+                                        predicted_category=pred_cat or None,
+                                        category_confidence=conf if conf else None,
+                                        classifier_type=ctype,
+                                    )
+                                    item_fail = "PENDING_NEW"
 
                     if not item_fail and _check_duplicate_receipt_item(
                         db, req.receiptId, biz_num, pay_date_stored, amount, card_num
@@ -1652,7 +2066,7 @@ async def analyze_receipt_task(req: CompleteRequest):
                         if ocr_assets[i].get("status") == "FIT":
                             mark_item(i, "PENDING_VERIFICATION", "PENDING_VERIFICATION")
                     fail_code = fail_code or "PENDING_VERIFICATION"
-                if total_amount < 50000:
+                if total_amount < min_amount_tour:
                     fail_code = "BIZ_003"
                 audit_lines.append(
                     f"영수증 {len(receipt_idx)}매 중 적격 합산: "
@@ -1675,11 +2089,13 @@ async def analyze_receipt_task(req: CompleteRequest):
 
         # 4) 부모 상태 업데이트: total_amount는 반드시 item_rows FIT 합산으로 산출 (관리자 검증 정확도)
         total_amount = sum(it.amount or 0 for it in item_rows if it.status == "FIT")
-        min_criteria = 60000 if req.type == "STAY" else 50000
+        min_criteria = min_amount_stay if req.type == "STAY" else min_amount_tour
         finalize_submission(submission, total_amount, min_criteria, fail_code)
         submission.audit_log = " | ".join(audit_lines) if audit_lines else (submission.fail_reason or "")
         submission.audit_trail = submission.audit_log
         db.commit()
+        payload = _build_status_payload(submission, item_rows)
+        await _send_result_callback(req.receiptId, payload)
 
     except Exception as e:
         logger.error("analyze_receipt_task failed: %s", e, exc_info=True)
@@ -1690,5 +2106,14 @@ async def analyze_receipt_task(req: CompleteRequest):
         submission.audit_log = "complete 처리 중 예외 발생"
         submission.audit_trail = submission.audit_log
         db.commit()
+        db.refresh(submission)
+        item_rows_ex = (
+            db.query(ReceiptItem)
+            .filter(ReceiptItem.submission_id == req.receiptId)
+            .order_by(ReceiptItem.seq_no.asc())
+            .all()
+        )
+        payload = _build_status_payload(submission, item_rows_ex)
+        await _send_result_callback(req.receiptId, payload)
     finally:
         db.close()

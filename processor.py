@@ -118,6 +118,8 @@ def validate_and_match(
     user_amount: int,
     campaign_type: str,
     is_2026_date: bool,
+    min_amount_stay: int = 60000,
+    min_amount_tour: int = 50000,
 ) -> Tuple[str, Optional[str]]:
     """
     비즈니스 로직 검증 + 마스터 상점 매칭.
@@ -129,7 +131,7 @@ def validate_and_match(
         return "UNFIT", ERR_DATE
 
     # (2) 금액: 최소 금액 + 사용자 입력값 일치
-    min_limit = 60000 if campaign_type == "STAY" else 50000
+    min_limit = min_amount_stay if campaign_type == "STAY" else min_amount_tour
     if ocr_amount < min_limit:
         return "UNFIT", ERR_AMOUNT
     if ocr_amount != user_amount:

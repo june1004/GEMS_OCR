@@ -29,6 +29,8 @@
 
 - `JUDGMENT_RULE_SYSTEM_DESIGN.md`  
   - 판정 규칙 운영 구조(관리자 규칙 API 포함)
+- `ADMIN_PORTAL_GUIDE.md`
+  - 관리자 웹 연동 체크리스트/운영 보강 지침
 - `GEMINI_CLASSIFIER_GUIDE.md`  
   - 업종 자동 분류의 Gemini 연동 가이드
 

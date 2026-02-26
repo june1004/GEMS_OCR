@@ -1186,10 +1186,11 @@ def _parse_ocr_result(ocr_data: dict) -> tuple[Optional[int], Optional[str], Opt
         payment_info = result.get("paymentInfo") or {}
         date_obj = payment_info.get("date") or {}
         pay_date = (date_obj.get("text") or "").strip()
+        pay_date = _normalize_pay_date_canonical(pay_date) or pay_date
         # 상호명
         store_info = result.get("storeInfo") or {}
         store_name = (store_info.get("name") or {}).get("text") or ""
-        store_name = store_name.strip()
+        store_name = re.sub(r"\s+", " ", store_name).strip()
         # 주소: address 단일 객체 또는 addresses 배열 (CLOVA 형식)
         addr_obj = store_info.get("address") or {}
         address = (addr_obj.get("text") or "").strip()
@@ -1198,6 +1199,7 @@ def _parse_ocr_result(ocr_data: dict) -> tuple[Optional[int], Optional[str], Opt
             if isinstance(addrs, list) and len(addrs) > 0:
                 first_addr = addrs[0] if isinstance(addrs[0], dict) else {}
                 address = (first_addr.get("text") or "").strip()
+        address = _normalize_address(address) or address
         # 시군: 주소에서 두 번째 단어 (속초시, 춘천시 등)
         location = ""
         if address:
@@ -1221,7 +1223,7 @@ def _extract_business_num(ocr_data: dict) -> Optional[str]:
         store_info = result.get("storeInfo") or {}
         biz_obj = store_info.get("bizNum") or {}
         biz = (biz_obj.get("text") or "").strip()
-        return biz or None
+        return _normalize_biz_num(biz) or None
     except (KeyError, TypeError, ValueError):
         return None
 
@@ -1237,6 +1239,66 @@ def _normalize_card_num(raw: Optional[str]) -> str:
     if len(digits) >= 4:
         return digits[-4:]
     return "0000"
+
+
+def _digits_only(raw: Optional[str]) -> str:
+    return re.sub(r"[^0-9]", "", (raw or "").strip())
+
+
+def _normalize_biz_num(raw: Optional[str]) -> Optional[str]:
+    """
+    사업자등록번호 정규화:
+    - 숫자만 추출 후 길이 10이면 000-00-00000 포맷으로 통일
+    - 그 외는 원문/None
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+    d = _digits_only(s)
+    if len(d) == 10:
+        return f"{d[:3]}-{d[3:5]}-{d[5:]}"
+    return s
+
+
+def _normalize_tel(raw: Optional[str]) -> Optional[str]:
+    """
+    전화번호 정규화:
+    - 숫자만 추출 후 02/지역번호/휴대폰 기준으로 하이픈 포맷
+    - 국제코드 82로 시작하면 0으로 치환
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+    d = _digits_only(s)
+    if d.startswith("82") and len(d) >= 10:
+        d = "0" + d[2:]
+    if len(d) == 8:
+        return f"{d[:4]}-{d[4:]}"
+    if d.startswith("02"):
+        if len(d) == 9:
+            return f"02-{d[2:5]}-{d[5:]}"
+        if len(d) == 10:
+            return f"02-{d[2:6]}-{d[6:]}"
+    if len(d) == 10:
+        return f"{d[:3]}-{d[3:6]}-{d[6:]}"
+    if len(d) == 11:
+        return f"{d[:3]}-{d[3:7]}-{d[7:]}"
+    return s
+
+
+def _normalize_address(raw: Optional[str]) -> Optional[str]:
+    """
+    주소 정규화(외부 표시/자산화용):
+    - 양쪽 공백 제거
+    - 중복 공백 1칸으로 축소
+    - '강원도 ...' 표기를 '강원특별자치도 ...'로 통일 (선두 토큰 기준)
+    """
+    s = (raw or "").strip()
+    if not s:
+        return None
+    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"^강원도(\s+)", r"강원특별자치도\1", s)
+    return s
 
 
 def _extract_card_num(ocr_data: dict) -> str:
@@ -1322,7 +1384,7 @@ def _extract_store_tel(ocr_data: dict) -> Optional[str]:
         tel_list = store_info.get("tel") or []
         if isinstance(tel_list, list) and tel_list:
             tel_text = (tel_list[0].get("text") or "").strip()
-            return tel_text or None
+            return _normalize_tel(tel_text) or None
     except Exception:
         return None
     return None
@@ -1399,10 +1461,11 @@ def _register_new_candidate_store(
     biz_num+address+tel 조합 우선으로 중복 등록 방지.
     predicted_category/confidence/classifier_type 은 업종 자동 분류 결과(선택).
     """
-    biz_num = (parsed.get("businessNum") or "").strip() or None
-    address = (parsed.get("address") or "").strip() or None
+    biz_num = _normalize_biz_num((parsed.get("businessNum") or "").strip()) if parsed.get("businessNum") else None
+    address = _normalize_address((parsed.get("address") or "").strip()) if parsed.get("address") else None
     tel = _extract_store_tel(ocr_raw or {}) if ocr_raw else None
-    store_name = (parsed.get("storeName") or "").strip() or None
+    store_name_raw = (parsed.get("storeName") or "").strip() or None
+    store_name = re.sub(r"\s+", " ", store_name_raw).strip() if store_name_raw else None
 
     q = db.query(UnregisteredStore).filter(UnregisteredStore.status == "TEMP_VALID")
     if biz_num:
@@ -1544,16 +1607,21 @@ def map_ocr_to_db(
         card_num = _normalize_card_num(p.get("cardNum"))
         raw_pay = (p.get("payDate") or "").strip() or None
         pay_date_canonical = _normalize_pay_date_canonical(raw_pay) if raw_pay else None
+        raw_store_name = (p.get("storeName") or "").strip() or None
+        store_name = re.sub(r"\s+", " ", raw_store_name).strip() if raw_store_name else None
+        biz_num = _normalize_biz_num((p.get("businessNum") or "").strip()) if p.get("businessNum") else None
+        raw_addr = (p.get("address") or "").strip() or None
+        address = _normalize_address(raw_addr) if raw_addr else None
         item = ReceiptItem(
             submission_id=submission_id,
             seq_no=idx,
             doc_type=asset.get("docType", (documents[idx - 1].get("docType") if idx - 1 < len(documents) else "RECEIPT")),
             image_key=(asset.get("imageKey") or "").strip(),
-            store_name=(p.get("storeName") or "").strip() or None,
-            biz_num=(p.get("businessNum") or "").strip() or None,
+            store_name=store_name,
+            biz_num=biz_num,
             pay_date=pay_date_canonical or raw_pay,
             amount=amount,
-            address=(p.get("address") or "").strip() or None,
+            address=address,
             location=(p.get("location") or "").strip() or None,
             card_num=card_num,
             status=status,
@@ -1836,7 +1904,7 @@ async def analyze_receipt_task(req: CompleteRequest):
                 store_name = rp.get("storeName") or ""
                 address = rp.get("address") or ""
                 location = rp.get("location") or ""
-                biz_num = rp.get("businessNum")
+                biz_num = _normalize_biz_num(rp.get("businessNum"))
                 card_num = _normalize_card_num(rp.get("cardNum"))
                 confidence = rp.get("confidenceScore") if isinstance(rp.get("confidenceScore"), int) else 0
 
@@ -1981,6 +2049,7 @@ async def analyze_receipt_task(req: CompleteRequest):
                     address = p.get("address") or ""
                     location = p.get("location") or ""
                     biz_num = p.get("businessNum")
+                    biz_num = _normalize_biz_num(biz_num)
                     card_num = _normalize_card_num(p.get("cardNum"))
 
                     if a["status"] == "ERROR_OCR":

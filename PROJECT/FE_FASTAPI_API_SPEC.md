@@ -51,6 +51,7 @@
 
 - FE는 `uploadUrl`로 **PUT** 요청해 파일 업로드.  
 - `objectKey`는 3단계 Complete 요청의 `documents[].imageKey`로 그대로 전달.
+- `receiptId`를 재사용할 때는 **동일 type(STAY↔STAY, TOUR↔TOUR)** 인 경우에만 허용되며, 다른 type으로 재사용하면 **409(type mismatch)** 로 차단됩니다.
 
 ---
 
@@ -66,6 +67,11 @@
   - `documents`: 배열 — 각 항목 `{ "imageKey": "objectKey", "docType": "RECEIPT" | "OTA_INVOICE" }`
     - STAY: RECEIPT 1장 필수, OTA 명세서 있으면 `docType: "OTA_INVOICE"` 1건 추가
     - TOUR: RECEIPT만 1~3장
+
+> 참고: 내부 호환을 위해 legacy `data`(수기 보정값) 경로가 존재할 수 있으나, FE 신규 구현은 **documents만 전송**하면 됩니다.  
+> 자산화/관리 목적 필드(location 등)는 **OCR 인식 결과를 기준으로 저장**되며, FE가 입력을 책임질 필요가 없습니다.
+
+- type은 receiptId 생성 시점에 고정되며, 다른 type으로 complete 호출 시 **409(type mismatch)** 로 차단됩니다.
 
 **Response (200)**
 

@@ -12,6 +12,9 @@
   - 폴링 정책
   - **결과 콜백(BE→FE) 및 FE 스케줄러 복구 정책 포함**
 
+- `FE_FASTAPI_DEVELOPER_GUIDE.md`
+  - FE 개발자가 실제 구현할 때 헷갈리는 포인트 중심(Submission=receiptId, FormData 업로드 대안, documents 구성 규칙, 콜백/복구, 체크리스트)
+
 > 기존 QA/요약 문서는 중복되어 제거하고, 위 문서로 통합했습니다.
 
 ---

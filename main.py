@@ -12,7 +12,7 @@ import boto3
 from PIL import Image, ImageOps, ImageEnhance
 from botocore.exceptions import ClientError, BotoCoreError
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Union, Tuple
+from typing import Any, Dict, List, Optional, Union, Tuple, Literal
 from dotenv import load_dotenv
 from dateutil import parser as dateutil_parser
 from sqlalchemy import text as sql_text
@@ -23,10 +23,10 @@ from store_classifier import (
     is_forbidden as _classifier_is_forbidden,
     AUTO_REGISTER_THRESHOLD as CLASSIFIER_AUTO_THRESHOLD,
 )
-from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends, UploadFile, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator, UUID4, ConfigDict
-from sqlalchemy import create_engine, Column, String, Integer, Float, DateTime, JSON, Boolean, ARRAY, ForeignKey
+from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Float, DateTime, JSON, Boolean, ARRAY, ForeignKey
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.dialects.postgresql import JSONB
@@ -61,6 +61,8 @@ OCR_CALLBACK_MAX_AUDIT_TRAIL_CHARS = int(os.getenv("OCR_CALLBACK_MAX_AUDIT_TRAIL
 OCR_CALLBACK_MAX_ERROR_MESSAGE_CHARS = int(os.getenv("OCR_CALLBACK_MAX_ERROR_MESSAGE_CHARS", "200"))
 NAVER_OCR_SECRET = os.getenv("NAVER_OCR_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+# 관리자 API 보호(선택): 설정 시 /api/v1/admin/* 호출에 X-Admin-Key 필요
+ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip() or None
 
 # 2. DB 및 S3 클라이언트 초기화
 engine = create_engine(DATABASE_URL)
@@ -144,6 +146,19 @@ class JudgmentRuleConfig(Base):
     min_amount_tour = Column(Integer, default=50000)
     updated_at = Column(DateTime, default=datetime.utcnow)
 
+
+class AdminAuditLog(Base):
+    __tablename__ = "admin_audit_log"
+    id = Column(BigInteger, primary_key=True, autoincrement=True)
+    actor = Column(String(128))
+    action = Column(String(64), nullable=False)       # RULE_UPDATE | CANDIDATE_APPROVE | SUBMISSION_OVERRIDE | CALLBACK_RESEND
+    target_type = Column(String(64))                  # judgment_rule_config | unregistered_store | submission
+    target_id = Column(String(128))
+    before_json = Column(JSONB)
+    after_json = Column(JSONB)
+    meta = Column(JSONB)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
 Base.metadata.create_all(bind=engine)
 
 # 4. Pydantic 스키마 (1:N + 자산화 지침 반영)
@@ -192,13 +207,20 @@ class ErrorCode(str, Enum):
 
 
 class StayData(BaseModel):
-    location: str
+    location: Optional[str] = None
     payDate: str
     amount: int
     cardPrefix: str
     receiptImageKey: str
     isOta: bool = False
     otaStatementKey: Optional[str] = None
+
+    model_config = ConfigDict(
+        json_schema_extra={
+            "deprecated": True,
+            "description": "(Legacy) FE 수기 입력 보정용(STAY). 신규 FE 구현은 documents-only(v2) 사용 권장.",
+        }
+    )
 
 class TourData(BaseModel):
     storeName: str
@@ -207,10 +229,17 @@ class TourData(BaseModel):
     cardPrefix: str
     receiptImageKeys: List[str] # 최대 3장 배열 처리
 
+    model_config = ConfigDict(
+        json_schema_extra={
+            "deprecated": True,
+            "description": "(Legacy) FE 수기 입력 보정용(TOUR). 신규 FE 구현은 documents-only(v2) 사용 권장.",
+        }
+    )
+
 
 class ReceiptMetadata(BaseModel):
     imageKey: str
-    docType: str  # RECEIPT | OTA_INVOICE
+    docType: Literal["RECEIPT", "OTA_INVOICE"]
 
 class PresignedUrlResponse(BaseModel):
     uploadUrl: str
@@ -224,9 +253,14 @@ class CompleteResponse(BaseModel):
 class CompleteRequest(BaseModel):
     receiptId: str
     userUuid: str
-    type: str  # STAY or TOUR
+    type: ProjectType
     campaignId: int = 1  # 캠페인 필터(지역·기간) 적용, 기본 1
-    data: Optional[Union[StayData, TourData]] = None
+    data: Optional[Union[StayData, TourData]] = Field(
+        default=None,
+        description="(Legacy) FE 수기 입력 보정용 데이터. documents 방식 사용 시 data는 생략 권장. "
+        "자산화/관리 목적 필드(location 등)는 OCR 인식 결과를 기준으로 저장됩니다.",
+        json_schema_extra={"deprecated": True},
+    )
     documents: Optional[List[ReceiptMetadata]] = None
 
     @model_validator(mode="before")
@@ -236,6 +270,8 @@ class CompleteRequest(BaseModel):
         if not isinstance(v, dict) or "type" not in v:
             return v
         t = v.get("type")
+        if isinstance(t, ProjectType):
+            t = t.value
         docs = v.get("documents")
         data = v.get("data")
 
@@ -276,6 +312,58 @@ class CompleteRequest(BaseModel):
 
         if v.get("documents") is None and v.get("data") is None:
             raise ValueError("Either documents or legacy data is required")
+
+        return v
+
+
+class CompleteRequestV2(BaseModel):
+    """
+    FE 연동 전용: documents-only 요청 모델.
+    - FE는 업로드된 objectKey를 documents로 전달하고, OCR/판정/자산화는 BE가 처리한다.
+    - 레거시 data(수기 보정값)는 v1에서만 지원(Deprecated).
+    """
+
+    receiptId: str
+    userUuid: str
+    type: ProjectType
+    campaignId: int = 1
+    documents: List[ReceiptMetadata]
+
+    @model_validator(mode="before")
+    @classmethod
+    def validate_documents_by_type(cls, v):
+        if not isinstance(v, dict) or "type" not in v:
+            return v
+        t = v.get("type")
+        if isinstance(t, ProjectType):
+            t = t.value
+        docs = v.get("documents")
+        if t not in ("STAY", "TOUR"):
+            raise ValueError("type must be STAY or TOUR")
+        if not isinstance(docs, list) or len(docs) == 0:
+            raise ValueError("documents must be a non-empty array")
+        normalized_docs: List[ReceiptMetadata] = []
+        for d in docs:
+            md = ReceiptMetadata.model_validate(d)
+            if not (md.imageKey or "").strip():
+                raise ValueError("document imageKey cannot be empty")
+            if md.docType not in ("RECEIPT", "OTA_INVOICE"):
+                raise ValueError("docType must be RECEIPT or OTA_INVOICE")
+            normalized_docs.append(md)
+        v["documents"] = normalized_docs
+
+        if t == "STAY":
+            receipt_cnt = len([d for d in normalized_docs if d.docType == "RECEIPT"])
+            ota_cnt = len([d for d in normalized_docs if d.docType == "OTA_INVOICE"])
+            if receipt_cnt < 1:
+                raise ValueError("STAY requires at least one RECEIPT document")
+            if receipt_cnt > 1 or ota_cnt > 1:
+                raise ValueError("STAY supports RECEIPT(1) + OTA_INVOICE(0~1)")
+        else:
+            if len(normalized_docs) < 1 or len(normalized_docs) > 3:
+                raise ValueError("TOUR supports 1 to 3 documents")
+            if any(d.docType != "RECEIPT" for d in normalized_docs):
+                raise ValueError("TOUR supports RECEIPT documents only")
 
         return v
 
@@ -357,7 +445,7 @@ async def get_presigned_url(
     fileName: str,
     contentType: str,
     userUuid: str,
-    type: str,
+    type: ProjectType,
     receiptId: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
@@ -366,9 +454,6 @@ async def get_presigned_url(
     - receiptId를 전달하면 동일 신청(합산형)으로 이미지를 계속 추가할 수 있음.
     - receiptId 미전달 시 새 신청을 생성.
     """
-    if type not in ("STAY", "TOUR"):
-        raise HTTPException(status_code=400, detail="type must be STAY or TOUR")
-
     receipt_id = receiptId or str(uuid.uuid4())
     object_key = f"receipts/{receipt_id}_{uuid.uuid4().hex[:8]}_{fileName}"
 
@@ -399,7 +484,9 @@ async def get_presigned_url(
         if existing:
             if existing.user_uuid != userUuid:
                 raise HTTPException(status_code=403, detail="receiptId owner mismatch")
-            existing.project_type = type
+            # receiptId 재사용은 "같은 신청(같은 type)"에 한해서만 허용 (STAY↔TOUR 엉킴 방지)
+            if (existing.project_type or "").strip() and existing.project_type != type:
+                raise HTTPException(status_code=409, detail="receiptId type mismatch")
         else:
             db.add(
                 Submission(
@@ -439,7 +526,7 @@ async def get_presigned_url_proxy(
 async def upload_receipt_via_api(
     file: UploadFile = File(...),
     userUuid: str = Form(...),
-    type: str = Form(...),
+    type: ProjectType = Form(...),
     db: Session = Depends(get_db),
 ):
     """1단계 대안: 파일을 API로 전송하면 서버가 S3에 업로드 (스토리지 CORS 미설정 시 사용)"""
@@ -488,14 +575,18 @@ async def upload_receipt_via_api(
     description="receiptId 기준 1회 호출. documents 배열에 해당 신청의 모든 이미지(imageKey=objectKey, docType) 전달. "
     "documents 사용 시 data는 생략(null) 가능. 분석 완료 시 OCR_RESULT_CALLBACK_URL이 설정된 경우 FE로 결과 POST(재시도 없음).",
 )
-async def submit_receipt(req: CompleteRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
-    """3단계: 사용자 입력값 수신 및 비동기 분석 시작 (합산형 documents 지원). 1건 신청 = 1 receiptId = complete 1회."""
+async def _submit_receipt_common(req: CompleteRequest, background_tasks: BackgroundTasks, db: Session):
+    """3단계 공통 처리: 비동기 분석 시작. 1건 신청 = 1 receiptId = complete 1회."""
     submission = db.query(Submission).filter(Submission.submission_id == req.receiptId).first()
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
 
     if submission.user_uuid != req.userUuid:
         raise HTTPException(status_code=403, detail="receiptId owner mismatch")
+
+    # receiptId는 생성 시 type이 고정됨. 다른 type으로 complete 호출 시 엉킴 방지.
+    if (submission.project_type or "").strip() and submission.project_type != req.type:
+        raise HTTPException(status_code=409, detail="receiptId type mismatch")
 
     if submission.status in ("FIT", "UNFIT", "ERROR"):
         raise HTTPException(status_code=409, detail="Submission already completed")
@@ -509,6 +600,34 @@ async def submit_receipt(req: CompleteRequest, background_tasks: BackgroundTasks
 
     background_tasks.add_task(analyze_receipt_task, req)
     return {"status": "PROCESSING", "receiptId": req.receiptId}
+
+
+async def submit_receipt(req: CompleteRequestV2, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
+    """
+    v1은 FE 연동을 위해 documents-only로 고정한다.
+    - legacy data(수기 보정값)는 혼동을 줄이기 위해 별도 legacy 엔드포인트로 분리(스키마 비노출).
+    """
+    v1_req = CompleteRequest(
+        receiptId=req.receiptId,
+        userUuid=req.userUuid,
+        type=req.type,
+        campaignId=req.campaignId,
+        documents=req.documents,
+        data=None,
+    )
+    return await _submit_receipt_common(v1_req, background_tasks, db)
+
+
+@app.post(
+    "/api/v1/receipts/complete-legacy",
+    response_model=CompleteResponse,
+    include_in_schema=False,
+)
+async def submit_receipt_legacy(
+    req: CompleteRequest, background_tasks: BackgroundTasks, db: Session = Depends(get_db)
+):
+    """(Legacy) 과거 클라이언트 호환용. 신규 FE 연동에서는 사용하지 않는다."""
+    return await _submit_receipt_common(req, background_tasks, db)
 
 class ExtractedData(BaseModel):
     store_name: Optional[str] = Field(None, description="상호명")
@@ -593,6 +712,47 @@ def _get_judgment_rule_config(db: Session) -> JudgmentRuleConfig:
     db.commit()
     db.refresh(cfg)
     return cfg
+
+
+def require_admin(
+    x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
+    x_admin_actor: Optional[str] = Header(None, alias="X-Admin-Actor"),
+) -> str:
+    """
+    관리자 API 접근 가드(선택).
+    - ADMIN_API_KEY 환경변수가 설정된 경우에만 X-Admin-Key를 검증한다.
+    - actor는 감사로그용 식별자(없으면 'admin').
+    """
+    if ADMIN_API_KEY and (x_admin_key or "").strip() != ADMIN_API_KEY:
+        raise HTTPException(status_code=401, detail="Unauthorized admin request")
+    return (x_admin_actor or "admin").strip() or "admin"
+
+
+def _audit_log(
+    db: Session,
+    actor: str,
+    action: str,
+    target_type: str,
+    target_id: str,
+    before_json: Optional[Dict[str, Any]] = None,
+    after_json: Optional[Dict[str, Any]] = None,
+    meta: Optional[Dict[str, Any]] = None,
+) -> None:
+    try:
+        db.add(
+            AdminAuditLog(
+                actor=actor,
+                action=action,
+                target_type=target_type,
+                target_id=target_id,
+                before_json=before_json,
+                after_json=after_json,
+                meta=meta,
+            )
+        )
+    except Exception:
+        # 감사로그 실패는 운영에 치명적이지 않게 처리(본 트랜잭션은 유지)
+        pass
 
 
 def _sanitize_receipt_id(raw: str) -> str:
@@ -696,9 +856,11 @@ def _build_status_payload(submission: Submission, item_rows: List[Any]) -> Dict[
     return payload
 
 
-async def _send_result_callback(receipt_id: str, payload: Dict[str, Any]) -> None:
+async def _send_result_callback(receipt_id: str, payload: Dict[str, Any], target_url: Optional[str] = None) -> None:
     """분석 완료 시 FE 지정 URL로 결과 POST. 재시도 없음, 실패 시 로그 후 종료."""
-    if not OCR_RESULT_CALLBACK_URL:
+    url = (target_url or "").strip() if target_url else None
+    url = url or OCR_RESULT_CALLBACK_URL
+    if not url:
         return
     payload_with_id = {
         "schemaVersion": OCR_CALLBACK_SCHEMA_VERSION,
@@ -708,7 +870,7 @@ async def _send_result_callback(receipt_id: str, payload: Dict[str, Any]) -> Non
     try:
         async with httpx.AsyncClient(timeout=OCR_CALLBACK_TIMEOUT_SEC) as client:
             r = await client.post(
-                OCR_RESULT_CALLBACK_URL,
+                url,
                 json=payload_with_id,
                 headers={"Content-Type": "application/json"},
             )
@@ -837,7 +999,7 @@ class JudgmentRuleConfigUpdateRequest(BaseModel):
     response_model=JudgmentRuleConfigResponse,
     summary="판정 규칙 조회",
 )
-async def get_judgment_rule_config(db: Session = Depends(get_db)):
+async def get_judgment_rule_config(db: Session = Depends(get_db), actor: str = Depends(require_admin)):
     cfg = _get_judgment_rule_config(db)
     return JudgmentRuleConfigResponse(
         unknown_store_policy=_normalize_unknown_store_policy(cfg.unknown_store_policy),
@@ -854,8 +1016,17 @@ async def get_judgment_rule_config(db: Session = Depends(get_db)):
     response_model=JudgmentRuleConfigResponse,
     summary="판정 규칙 수정",
 )
-async def update_judgment_rule_config(body: JudgmentRuleConfigUpdateRequest, db: Session = Depends(get_db)):
+async def update_judgment_rule_config(
+    body: JudgmentRuleConfigUpdateRequest, db: Session = Depends(get_db), actor: str = Depends(require_admin)
+):
     cfg = _get_judgment_rule_config(db)
+    before = {
+        "unknown_store_policy": cfg.unknown_store_policy,
+        "auto_register_threshold": float(cfg.auto_register_threshold or 0.90),
+        "enable_gemini_classifier": bool(cfg.enable_gemini_classifier),
+        "min_amount_stay": int(cfg.min_amount_stay or 60000),
+        "min_amount_tour": int(cfg.min_amount_tour or 50000),
+    }
     if body.unknown_store_policy is not None:
         cfg.unknown_store_policy = _normalize_unknown_store_policy(body.unknown_store_policy)
     if body.auto_register_threshold is not None:
@@ -870,6 +1041,23 @@ async def update_judgment_rule_config(body: JudgmentRuleConfigUpdateRequest, db:
     cfg.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(cfg)
+    after = {
+        "unknown_store_policy": cfg.unknown_store_policy,
+        "auto_register_threshold": float(cfg.auto_register_threshold or 0.90),
+        "enable_gemini_classifier": bool(cfg.enable_gemini_classifier),
+        "min_amount_stay": int(cfg.min_amount_stay or 60000),
+        "min_amount_tour": int(cfg.min_amount_tour or 50000),
+    }
+    _audit_log(
+        db,
+        actor=actor,
+        action="RULE_UPDATE",
+        target_type="judgment_rule_config",
+        target_id="1",
+        before_json=before,
+        after_json=after,
+    )
+    db.commit()
     return JudgmentRuleConfigResponse(
         unknown_store_policy=_normalize_unknown_store_policy(cfg.unknown_store_policy),
         auto_register_threshold=float(cfg.auto_register_threshold or 0.90),
@@ -922,6 +1110,7 @@ async def list_candidate_stores(
     min_occurrence: Optional[int] = None,
     sort_by: Optional[str] = "occurrence_count",
     db: Session = Depends(get_db),
+    actor: str = Depends(require_admin),
 ):
     """관리자: 후보 상점 리스트 (시군구 필터, 최소 빈도, 정렬). TEMP_VALID + AUTO_REGISTERED(검토 필요)."""
     q = db.query(UnregisteredStore).filter(
@@ -966,6 +1155,7 @@ async def list_candidate_stores(
 async def approve_candidate_stores(
     body: ApproveCandidatesRequest,
     db: Session = Depends(get_db),
+    actor: str = Depends(require_admin),
 ):
     """관리자: 후보 → master_stores 이관 후 status=APPROVED 처리."""
     approved = 0
@@ -979,6 +1169,7 @@ async def approve_candidate_stores(
             failed_ids.append(cid)
             continue
         try:
+            before = {"status": cand.status, "store_name": cand.store_name, "biz_num": cand.biz_num, "address": cand.address}
             # master_stores에 삽입 (store_name, category_large, road_address → 트리거로 city_county 자동)
             db.execute(
                 sql_text(
@@ -994,12 +1185,319 @@ async def approve_candidate_stores(
             )
             cand.status = "APPROVED"
             cand.updated_at = datetime.utcnow()
+            _audit_log(
+                db,
+                actor=actor,
+                action="CANDIDATE_APPROVE",
+                target_type="unregistered_store",
+                target_id=cand.id,
+                before_json=before,
+                after_json={"status": cand.status, "target_category": body.target_category},
+                meta={"receiptId": cand.recent_receipt_id or cand.source_submission_id},
+            )
             approved += 1
         except Exception as e:
             logger.warning("approve candidate %s failed: %s", cid, e)
             failed_ids.append(cid)
     db.commit()
     return ApproveCandidatesResponse(approved_count=approved, failed_ids=failed_ids)
+
+
+# 5-3. Submission 관리 API (관리자) — 검색/상세/override/콜백 재전송/증거 이미지
+class AdminSubmissionListItem(BaseModel):
+    receiptId: str
+    userUuid: str
+    project_type: Optional[str] = None
+    status: Optional[str] = None
+    total_amount: int = 0
+    created_at: Optional[str] = None
+
+
+class AdminSubmissionListResponse(BaseModel):
+    total: int
+    items: List[AdminSubmissionListItem] = Field(default_factory=list)
+
+
+@app.get(
+    "/api/v1/admin/submissions",
+    response_model=AdminSubmissionListResponse,
+    summary="신청 목록 검색(관리자)",
+)
+async def admin_list_submissions(
+    status: Optional[str] = None,
+    userUuid: Optional[str] = None,
+    receiptId: Optional[str] = None,
+    dateFrom: Optional[str] = None,
+    dateTo: Optional[str] = None,
+    limit: int = Query(50, ge=1, le=200),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    actor: str = Depends(require_admin),
+):
+    q = db.query(Submission)
+    if receiptId:
+        q = q.filter(Submission.submission_id == receiptId.strip())
+    if userUuid:
+        q = q.filter(Submission.user_uuid == userUuid.strip())
+    if status:
+        q = q.filter(Submission.status == status.strip())
+    if dateFrom:
+        try:
+            dt = dateutil_parser.parse(dateFrom)
+            q = q.filter(Submission.created_at >= dt)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid dateFrom")
+    if dateTo:
+        try:
+            dt = dateutil_parser.parse(dateTo)
+            q = q.filter(Submission.created_at <= dt)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid dateTo")
+
+    total = q.count()
+    rows = (
+        q.order_by(Submission.created_at.desc())
+        .offset(offset)
+        .limit(limit)
+        .all()
+    )
+    items = [
+        AdminSubmissionListItem(
+            receiptId=r.submission_id,
+            userUuid=r.user_uuid,
+            project_type=r.project_type,
+            status=r.status,
+            total_amount=r.total_amount or 0,
+            created_at=r.created_at.isoformat() if r.created_at else None,
+        )
+        for r in rows
+    ]
+    return AdminSubmissionListResponse(total=total, items=items)
+
+
+class AdminSubmissionDetailResponse(BaseModel):
+    receiptId: str
+    submission: Dict[str, Any]
+    statusPayload: Dict[str, Any]
+
+
+def _build_status_payload_admin(submission: Submission, item_rows: List[ReceiptItem]) -> Dict[str, Any]:
+    """관리자용 상세: ocr_raw 포함."""
+    base = _build_status_payload(submission, item_rows)
+    # 콜백 최적화 함수(_build_status_payload)는 ocr_raw를 제외하므로, 관리자용은 다시 붙인다.
+    # item_id로 매칭해 주입
+    raw_by_id = {str(it.item_id): it.ocr_raw for it in item_rows}
+    for it in base.get("items", []):
+        iid = it.get("item_id")
+        it["ocr_raw"] = raw_by_id.get(iid)
+    return base
+
+
+@app.get(
+    "/api/v1/admin/submissions/{receiptId}",
+    response_model=AdminSubmissionDetailResponse,
+    summary="신청 단건 상세(관리자)",
+)
+async def admin_get_submission(receiptId: str, db: Session = Depends(get_db), actor: str = Depends(require_admin)):
+    rid = _sanitize_receipt_id(receiptId)
+    submission = db.query(Submission).filter(Submission.submission_id == rid).first()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    item_rows = (
+        db.query(ReceiptItem)
+        .filter(ReceiptItem.submission_id == rid)
+        .order_by(ReceiptItem.seq_no.asc())
+        .all()
+    )
+    status_payload = _build_status_payload_admin(submission, item_rows)
+    return AdminSubmissionDetailResponse(
+        receiptId=rid,
+        submission={
+            "submission_id": submission.submission_id,
+            "user_uuid": submission.user_uuid,
+            "project_type": submission.project_type,
+            "campaign_id": submission.campaign_id,
+            "status": submission.status,
+            "total_amount": submission.total_amount or 0,
+            "global_fail_reason": submission.global_fail_reason,
+            "fail_reason": submission.fail_reason,
+            "audit_trail": submission.audit_trail,
+            "created_at": submission.created_at.isoformat() if submission.created_at else None,
+        },
+        statusPayload=status_payload,
+    )
+
+
+class AdminReceiptImageItem(BaseModel):
+    item_id: str
+    doc_type: Optional[str] = None
+    image_key: str
+    image_url: str
+
+
+class AdminReceiptImagesResponse(BaseModel):
+    receiptId: str
+    expiresIn: int = 600
+    items: List[AdminReceiptImageItem] = Field(default_factory=list)
+
+
+@app.get(
+    "/api/v1/admin/receipts/{receiptId}/images",
+    response_model=AdminReceiptImagesResponse,
+    summary="신청 이미지 presigned GET(관리자)",
+)
+async def admin_get_receipt_images(receiptId: str, db: Session = Depends(get_db), actor: str = Depends(require_admin)):
+    rid = _sanitize_receipt_id(receiptId)
+    item_rows = (
+        db.query(ReceiptItem)
+        .filter(ReceiptItem.submission_id == rid)
+        .order_by(ReceiptItem.seq_no.asc())
+        .all()
+    )
+    items: List[AdminReceiptImageItem] = []
+    for it in item_rows:
+        key = (it.image_key or "").strip()
+        if not key:
+            continue
+        url = s3_client.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": key},
+            ExpiresIn=600,
+        )
+        items.append(
+            AdminReceiptImageItem(
+                item_id=str(it.item_id),
+                doc_type=it.doc_type,
+                image_key=key,
+                image_url=url,
+            )
+        )
+    return AdminReceiptImagesResponse(receiptId=rid, items=items)
+
+
+class AdminOverrideRequest(BaseModel):
+    status: str
+    reason: str
+    override_reward_amount: Optional[int] = None
+    resend_callback: bool = False
+
+
+class AdminOverrideResponse(BaseModel):
+    receiptId: str
+    previous_status: str
+    new_status: str
+    updated_at: str
+
+
+@app.post(
+    "/api/v1/admin/submissions/{receiptId}/override",
+    response_model=AdminOverrideResponse,
+    summary="수동 판정 변경(override)",
+)
+async def admin_override_submission(
+    receiptId: str,
+    body: AdminOverrideRequest,
+    db: Session = Depends(get_db),
+    actor: str = Depends(require_admin),
+):
+    rid = _sanitize_receipt_id(receiptId)
+    submission = db.query(Submission).filter(Submission.submission_id == rid).first()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    before = {"status": submission.status, "fail_reason": submission.fail_reason, "total_amount": submission.total_amount or 0}
+    prev_status = submission.status or ""
+    submission.status = body.status.strip()
+    submission.fail_reason = None if submission.status == "FIT" else (body.reason.strip() or submission.fail_reason)
+    submission.global_fail_reason = submission.fail_reason
+    # 감사/추적을 위해 audit_trail에 override 기록을 append
+    override_line = f"OVERRIDE({datetime.utcnow().isoformat()}): {body.reason.strip()}"
+    existing = submission.audit_trail or submission.audit_log or ""
+    submission.audit_trail = (existing + " | " + override_line).strip(" |") if existing else override_line
+    submission.audit_log = submission.audit_trail
+    if body.override_reward_amount is not None:
+        # rewardAmount는 응답 계산 로직이 있으므로, 필요 시 별도 컬럼 도입이 더 안전함.
+        pass
+    db.commit()
+    db.refresh(submission)
+    _audit_log(
+        db,
+        actor=actor,
+        action="SUBMISSION_OVERRIDE",
+        target_type="submission",
+        target_id=rid,
+        before_json=before,
+        after_json={"status": submission.status, "fail_reason": submission.fail_reason, "audit_trail": submission.audit_trail},
+        meta={"resend_callback": bool(body.resend_callback)},
+    )
+    db.commit()
+    if body.resend_callback:
+        item_rows = (
+            db.query(ReceiptItem)
+            .filter(ReceiptItem.submission_id == rid)
+            .order_by(ReceiptItem.seq_no.asc())
+            .all()
+        )
+        payload = _build_status_payload(submission, item_rows)
+        await _send_result_callback(rid, payload)
+        _audit_log(
+            db,
+            actor=actor,
+            action="CALLBACK_RESEND",
+            target_type="submission",
+            target_id=rid,
+            meta={"trigger": "override"},
+        )
+        db.commit()
+    return AdminOverrideResponse(
+        receiptId=rid,
+        previous_status=prev_status,
+        new_status=submission.status,
+        updated_at=datetime.utcnow().isoformat(),
+    )
+
+
+class AdminCallbackResendRequest(BaseModel):
+    target_url: Optional[str] = None
+
+
+class AdminCallbackResendResponse(BaseModel):
+    receiptId: str
+    sent: bool
+
+
+@app.post(
+    "/api/v1/admin/submissions/{receiptId}/callback/resend",
+    response_model=AdminCallbackResendResponse,
+    summary="콜백 재전송(관리자)",
+)
+async def admin_resend_callback(
+    receiptId: str,
+    body: AdminCallbackResendRequest,
+    db: Session = Depends(get_db),
+    actor: str = Depends(require_admin),
+):
+    rid = _sanitize_receipt_id(receiptId)
+    submission = db.query(Submission).filter(Submission.submission_id == rid).first()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    item_rows = (
+        db.query(ReceiptItem)
+        .filter(ReceiptItem.submission_id == rid)
+        .order_by(ReceiptItem.seq_no.asc())
+        .all()
+    )
+    payload = _build_status_payload(submission, item_rows)
+    await _send_result_callback(rid, payload, target_url=body.target_url)
+    _audit_log(
+        db,
+        actor=actor,
+        action="CALLBACK_RESEND",
+        target_type="submission",
+        target_id=rid,
+        meta={"target_url": body.target_url},
+    )
+    db.commit()
+    return AdminCallbackResendResponse(receiptId=rid, sent=True)
 
 
 # 6. Naver 영수증 OCR 연동 (CLOVA Document OCR > 영수증)

@@ -191,13 +191,7 @@ Response 예시:
 
 ### 3) “증거(영수증) 확인” 기능(최소)
 
-현재 BE에는 “이미지 presigned GET URL 발급” 전용 API가 없습니다.  
-관리자 웹은 아래 중 하나를 선택해야 합니다.
-
-- **옵션 A(권장)**: BE에 `GET /api/v1/admin/receipts/{receiptId}/images` 같은 presigned GET API를 추가해, 관리자 웹은 해당 URL로 이미지를 보여줌
-- **옵션 B**: 운영 환경에서 스토리지 접근 정책을 별도로 마련(비권장: 보안/권한 통제가 어려움)
-
-#### 옵션 A(권장) API 설계 초안 (미구현)
+현재 BE에는 “이미지 presigned GET URL 발급” 전용 API가 **구현되어 있습니다.**
 
 - `GET /api/v1/admin/receipts/{receiptId}/images`
   - Response:
@@ -233,15 +227,14 @@ Response 예시:
 - 기간(created_at) 필터
 - items 단위 판정/에러코드 확인
 
-이를 위해 BE에 아래 API 신설이 필요합니다(현재 미구현):
-- `GET /api/v1/admin/submissions?status=&from=&to=&userUuid=&receiptId=`
-- `GET /api/v1/admin/submissions/{receiptId}` (status payload와 동일 스냅샷 + 내부 필드)
-
-#### API 설계 초안 (미구현)
+이를 위해 BE에 아래 API가 **구현되어 있습니다**:
+- `GET /api/v1/admin/submissions`
+  - Query: `status`, `userUuid`, `receiptId`, `dateFrom`, `dateTo`, `limit`, `offset`
+- `GET /api/v1/admin/submissions/{receiptId}` (관리자용 상세: items[].ocr_raw 포함)
 
 ##### (1) 목록 검색
 
-`GET /api/v1/admin/submissions?status=PENDING_NEW&from=2026-02-01&to=2026-02-29&limit=50&offset=0`
+`GET /api/v1/admin/submissions?status=PENDING_NEW&dateFrom=2026-02-01&dateTo=2026-02-29&limit=50&offset=0`
 
 Response 예시:
 
@@ -265,7 +258,7 @@ Response 예시:
 
 `GET /api/v1/admin/submissions/{receiptId}`
 
-Response는 기본적으로 `GET /api/v1/receipts/{receiptId}/status` payload + 관리자용 내부 필드(예: campaign_id, raw DB timestamps 등).
+Response는 관리자용 submission 메타 + status payload를 포함합니다. (관리자용 status payload에는 items[].ocr_raw가 포함됨)
 
 ---
 
@@ -273,16 +266,11 @@ Response는 기본적으로 `GET /api/v1/receipts/{receiptId}/status` payload + 
 
 요구 예시: `UNFIT → FIT`로 관리자 검토 후 상태 변경.
 
-권장 설계:
+해당 기능은 BE에 **구현되어 있습니다.**
 - `POST /api/v1/admin/submissions/{receiptId}/override`
-  - body: `status`, `reason`, (optional) `override_reward_amount`
-- BE는:
-  - submission.status/fail_reason/audit_trail 갱신
-  - 필요한 경우 items[] 상태도 함께 갱신
-  - 변경 감사로그 기록(누가/언제/무엇을)
-  - **콜백 재전송 옵션** 제공(선택)
-
-#### API 설계 초안 (미구현)
+  - body: `status`, `reason`, (optional) `override_reward_amount`, `resend_callback`
+  - override 시 감사로그 기록(SUBMISSION_OVERRIDE)
+  - resend_callback=true면 콜백 재전송 + 감사로그 기록(CALLBACK_RESEND)
 
 `POST /api/v1/admin/submissions/{receiptId}/override`
 
@@ -314,11 +302,10 @@ Response 예시:
 
 ### C) 콜백 재전송(장애 대응)
 
-콜백이 실패했거나 FE가 누락한 경우를 대비해:
+해당 기능은 BE에 **구현되어 있습니다.**
 - `POST /api/v1/admin/submissions/{receiptId}/callback/resend`
-- BE는 DB에 저장된 최종 payload를 재구성해 콜백 URL로 POST(재시도 정책은 운영 정책에 맞춰 결정)
-
-#### API 설계 초안 (미구현)
+  - body: `target_url`(optional). 미지정 시 `OCR_RESULT_CALLBACK_URL`로 전송.
+  - 재전송 감사로그 기록(CALLBACK_RESEND)
 
 `POST /api/v1/admin/submissions/{receiptId}/callback/resend`
 
@@ -335,8 +322,7 @@ Response 예시:
 ```json
 {
   "receiptId": "uuid",
-  "sent": true,
-  "http_status": 200
+  "sent": true
 }
 ```
 
@@ -361,6 +347,14 @@ Response 예시:
   - 또는 **Basic Auth**
 
 > 이유: FastAPI 코드 수정 없이도 빠르게 안전성을 확보 가능.
+
+#### 현재 BE 반영된 “선택적 키 가드”
+
+- 환경변수 `ADMIN_API_KEY`가 **설정된 경우에만** `/api/v1/admin/*` 호출에 아래 헤더가 필요합니다.
+  - `X-Admin-Key: <ADMIN_API_KEY 값>`
+  - (선택) `X-Admin-Actor: <관리자 식별자>` → 감사로그 actor로 저장
+
+> 운영 팁: 초기에는 Reverse proxy IP allowlist + ADMIN_API_KEY 병행을 권장합니다.
 
 ---
 
@@ -436,13 +430,224 @@ BE 저장 시점에 정규화:
 
 ## 6. 관리자 웹 연동 “최소 구현 순서”
 
-1) 판정 규칙 설정 화면 (`/api/v1/admin/rules/judgment`)  
-2) 후보 상점 리스트 + 승인 (`/api/v1/admin/stores/candidates`, approve)  
-3) 증거(영수증) 확인 기능(이미지 접근 방식 결정)  
-4) submission 검색/조회(신규 API 추가)  
-5) override + 콜백 재전송(신규 API 추가) + 감사로그
+1) 판정 규칙 설정 화면 (`/api/v1/admin/rules/judgment`) ✅  
+2) 후보 상점 리스트 + 승인 (`/api/v1/admin/stores/candidates`, approve) ✅  
+3) 증거(영수증) 확인 기능 (`/api/v1/admin/receipts/{receiptId}/images`) ✅  
+4) submission 검색/조회 (`/api/v1/admin/submissions`, `.../{receiptId}`) ✅  
+5) override + 콜백 재전송 + 감사로그 ✅
 
 ---
 
-*문서 버전: 1.1 | 관리자 웹 연동 가이드*
+## 7. 관리자 웹 구현 템플릿 (TypeScript)
+
+> 아래 타입/함수는 관리자 웹(`gems_ocr-9f4d37f5`)에서 그대로 복사해 붙여 사용할 수 있는 최소 템플릿입니다.
+
+### 7-1. 공통: 관리자 헤더 구성
+
+```ts
+export type AdminAuth = {
+  adminKey?: string;   // ENV ADMIN_API_KEY와 동일한 값(운영에서만 사용 권장)
+  actor?: string;      // 감사로그 식별자 (예: 이메일)
+};
+
+export function buildAdminHeaders(auth?: AdminAuth): Record<string, string> {
+  const h: Record<string, string> = { "Content-Type": "application/json" };
+  if (auth?.adminKey) h["X-Admin-Key"] = auth.adminKey;
+  if (auth?.actor) h["X-Admin-Actor"] = auth.actor;
+  return h;
+}
+```
+
+### 7-2. 타입 정의 (핵심)
+
+```ts
+export type JudgmentRuleConfig = {
+  unknown_store_policy: "AUTO_REGISTER" | "PENDING_NEW";
+  auto_register_threshold: number; // 0~1
+  enable_gemini_classifier: boolean;
+  min_amount_stay: number;
+  min_amount_tour: number;
+  updated_at?: string;
+};
+
+export type CandidateStoreItem = {
+  candidate_id: string;
+  store_name?: string | null;
+  biz_num?: string | null;
+  address?: string | null;
+  tel?: string | null;
+  occurrence_count: number;
+  predicted_category?: string | null;
+  first_detected_at?: string | null;
+  recent_receipt_id?: string | null;
+  status: string;
+};
+
+export type CandidatesListResponse = {
+  total_candidates: number;
+  items: CandidateStoreItem[];
+};
+
+export type AdminSubmissionListItem = {
+  receiptId: string;
+  userUuid: string;
+  project_type?: string | null;
+  status?: string | null;
+  total_amount: number;
+  created_at?: string | null;
+};
+
+export type AdminSubmissionListResponse = {
+  total: number;
+  items: AdminSubmissionListItem[];
+};
+
+export type AdminSubmissionDetailResponse = {
+  receiptId: string;
+  submission: Record<string, unknown>;
+  statusPayload: Record<string, unknown>;
+};
+
+export type AdminReceiptImagesResponse = {
+  receiptId: string;
+  expiresIn: number;
+  items: Array<{
+    item_id: string;
+    doc_type?: string | null;
+    image_key: string;
+    image_url: string;
+  }>;
+};
+```
+
+### 7-3. fetch 기반 API 호출 예시
+
+```ts
+export async function adminGetJudgmentRules(baseUrl: string, auth?: AdminAuth) {
+  const r = await fetch(`${baseUrl}/api/v1/admin/rules/judgment`, {
+    headers: buildAdminHeaders(auth),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return (await r.json()) as JudgmentRuleConfig;
+}
+
+export async function adminUpdateJudgmentRules(
+  baseUrl: string,
+  body: Partial<JudgmentRuleConfig>,
+  auth?: AdminAuth
+) {
+  const r = await fetch(`${baseUrl}/api/v1/admin/rules/judgment`, {
+    method: "PUT",
+    headers: buildAdminHeaders(auth),
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return (await r.json()) as JudgmentRuleConfig;
+}
+
+export async function adminListCandidates(
+  baseUrl: string,
+  params: { city_county?: string; min_occurrence?: number; sort_by?: "occurrence_count" | "created_at" },
+  auth?: AdminAuth
+) {
+  const qs = new URLSearchParams();
+  if (params.city_county) qs.set("city_county", params.city_county);
+  if (params.min_occurrence != null) qs.set("min_occurrence", String(params.min_occurrence));
+  if (params.sort_by) qs.set("sort_by", params.sort_by);
+  const r = await fetch(`${baseUrl}/api/v1/admin/stores/candidates?${qs.toString()}`, {
+    headers: buildAdminHeaders(auth),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return (await r.json()) as CandidatesListResponse;
+}
+
+export async function adminApproveCandidates(
+  baseUrl: string,
+  body: { candidate_ids: string[]; target_category: string; is_premium?: boolean },
+  auth?: AdminAuth
+) {
+  const r = await fetch(`${baseUrl}/api/v1/admin/stores/candidates/approve`, {
+    method: "POST",
+    headers: buildAdminHeaders(auth),
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return (await r.json()) as { approved_count: number; failed_ids: string[] };
+}
+
+export async function adminListSubmissions(
+  baseUrl: string,
+  params: {
+    status?: string;
+    userUuid?: string;
+    receiptId?: string;
+    dateFrom?: string;
+    dateTo?: string;
+    limit?: number;
+    offset?: number;
+  },
+  auth?: AdminAuth
+) {
+  const qs = new URLSearchParams();
+  Object.entries(params).forEach(([k, v]) => {
+    if (v == null || v === "") return;
+    qs.set(k, String(v));
+  });
+  const r = await fetch(`${baseUrl}/api/v1/admin/submissions?${qs.toString()}`, {
+    headers: buildAdminHeaders(auth),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return (await r.json()) as AdminSubmissionListResponse;
+}
+
+export async function adminGetSubmission(baseUrl: string, receiptId: string, auth?: AdminAuth) {
+  const r = await fetch(`${baseUrl}/api/v1/admin/submissions/${encodeURIComponent(receiptId)}`, {
+    headers: buildAdminHeaders(auth),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return (await r.json()) as AdminSubmissionDetailResponse;
+}
+
+export async function adminGetReceiptImages(baseUrl: string, receiptId: string, auth?: AdminAuth) {
+  const r = await fetch(`${baseUrl}/api/v1/admin/receipts/${encodeURIComponent(receiptId)}/images`, {
+    headers: buildAdminHeaders(auth),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return (await r.json()) as AdminReceiptImagesResponse;
+}
+
+export async function adminOverrideSubmission(
+  baseUrl: string,
+  receiptId: string,
+  body: { status: string; reason: string; override_reward_amount?: number; resend_callback?: boolean },
+  auth?: AdminAuth
+) {
+  const r = await fetch(`${baseUrl}/api/v1/admin/submissions/${encodeURIComponent(receiptId)}/override`, {
+    method: "POST",
+    headers: buildAdminHeaders(auth),
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return (await r.json()) as { receiptId: string; previous_status: string; new_status: string; updated_at: string };
+}
+
+export async function adminResendCallback(
+  baseUrl: string,
+  receiptId: string,
+  body?: { target_url?: string },
+  auth?: AdminAuth
+) {
+  const r = await fetch(`${baseUrl}/api/v1/admin/submissions/${encodeURIComponent(receiptId)}/callback/resend`, {
+    method: "POST",
+    headers: buildAdminHeaders(auth),
+    body: JSON.stringify(body ?? {}),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return (await r.json()) as { receiptId: string; sent: boolean };
+}
+```
+
+---
+
+*문서 버전: 1.2 | 관리자 웹 연동 가이드*
 

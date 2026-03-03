@@ -4,7 +4,7 @@
 CREATE TABLE IF NOT EXISTS admin_audit_log (
     id BIGSERIAL PRIMARY KEY,
     actor VARCHAR(128),                 -- 관리자 식별자(이메일/계정ID/IP 등)
-    action VARCHAR(64) NOT NULL,        -- RULE_UPDATE | CANDIDATE_APPROVE | SUBMISSION_OVERRIDE | CALLBACK_RESEND
+    action VARCHAR(64) NOT NULL,        -- RULE_UPDATE | CANDIDATE_APPROVE | SUBMISSION_OVERRIDE | CALLBACK_RESEND | CAMPAIGN_CREATE | CAMPAIGN_UPDATE
     target_type VARCHAR(64),            -- judgment_rule_config | unregistered_store | submission
     target_id VARCHAR(128),             -- receiptId, candidate_id 등
     before_json JSONB,

@@ -92,7 +92,6 @@ Form fields:
 - `receiptId` (필수) — Step1에서 받은 값
 - `userUuid` (필수) — presigned 발급 시 사용한 값과 동일
 - `type` (필수) — `STAY` | `TOUR`
-- `campaignId` (선택, 기본 1)
 - `documents` (권장): 업로드한 이미지 목록
   - 각 원소 `{ "imageKey": "<objectKey>", "docType": "RECEIPT" | "OTA_INVOICE" }`
 - `data` (레거시): documents 대신 사용할 수 있으나 필수 필드가 많아 운영에선 documents 방식 권장
@@ -106,7 +105,6 @@ Form fields:
   "receiptId": "uuid",
   "userUuid": "user-123",
   "type": "STAY",
-  "campaignId": 1,
   "documents": [
     { "imageKey": "receipts/uuid_a.jpg", "docType": "RECEIPT" },
     { "imageKey": "receipts/uuid_b.jpg", "docType": "OTA_INVOICE" }
@@ -121,7 +119,6 @@ Form fields:
   "receiptId": "uuid",
   "userUuid": "user-123",
   "type": "TOUR",
-  "campaignId": 1,
   "documents": [
     { "imageKey": "receipts/uuid_a.jpg", "docType": "RECEIPT" },
     { "imageKey": "receipts/uuid_b.jpg", "docType": "RECEIPT" }

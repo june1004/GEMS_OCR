@@ -62,7 +62,6 @@
 - **Body (JSON)**:
   - `receiptId`: string (1단계에서 받은 것)
   - `userUuid`: string
-  - `campaignId`: number (선택, 기본 1)
   - `type`: `"STAY"` \| `"TOUR"`
   - `documents`: 배열 — 각 항목 `{ "imageKey": "objectKey", "docType": "RECEIPT" | "OTA_INVOICE" }`
     - STAY: RECEIPT 1장 필수, OTA 명세서 있으면 `docType: "OTA_INVOICE"` 1건 추가
@@ -72,6 +71,7 @@
 > 자산화/관리 목적 필드(location 등)는 **OCR 인식 결과를 기준으로 저장**되며, FE가 입력을 책임질 필요가 없습니다.
 
 - type은 receiptId 생성 시점에 고정되며, 다른 type으로 complete 호출 시 **409(type mismatch)** 로 차단됩니다.
+> 참고: campaignId는 내부 운영/자산화용이며, v1 연동( documents-only )에서는 FE가 전달하지 않습니다.
 
 **Response (200)**
 
@@ -128,6 +128,34 @@
 | ocr_raw | object \| null | 원본 OCR JSON (있을 경우) |
 
 ---
+
+### 3.4 (선택) 활성 캠페인 조회
+
+캠페인이 1개(기본)인 경우 FE는 이 API를 호출할 필요가 없습니다.  
+향후 캠페인 다중 운영(기간/지역 이벤트 등) 확장 시, FE가 화면에 표시하거나 운영/디버깅 목적으로 사용할 수 있습니다.
+
+- **Method**: `GET`
+- **URL**: `/api/v1/campaigns/active`
+
+**Response (200)**
+
+```json
+{
+  "defaultCampaignId": 1,
+  "items": [
+    {
+      "campaignId": 1,
+      "name": "2026 혜택받go 강원 여행 인센티브",
+      "active": true,
+      "targetCityCounty": null,
+      "startDate": null,
+      "endDate": null,
+      "projectType": null,
+      "priority": 100
+    }
+  ]
+}
+```
 
 ## 4. 영수증 장별 에러코드 (items[].error_code)
 

@@ -44,3 +44,8 @@
 - `DBEAVER_MIGRATION_GUIDE.md`
 - `migrations/*.sql`
 
+### 캠페인(확장)
+
+- 기본 캠페인 테이블/필터: `migrations/campaigns_filtering.sql`
+- 라우팅 확장 컬럼(priority, project_type 등): `migrations/campaigns_routing_ext.sql`
+

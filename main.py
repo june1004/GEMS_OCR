@@ -11,7 +11,7 @@ import httpx
 import boto3
 from PIL import Image, ImageOps, ImageEnhance
 from botocore.exceptions import ClientError, BotoCoreError
-from datetime import datetime
+from datetime import datetime, date
 from typing import Any, Dict, List, Optional, Union, Tuple, Literal
 from dotenv import load_dotenv
 from dateutil import parser as dateutil_parser
@@ -63,6 +63,11 @@ NAVER_OCR_SECRET = os.getenv("NAVER_OCR_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # 관리자 API 보호(선택): 설정 시 /api/v1/admin/* 호출에 X-Admin-Key 필요
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip() or None
+
+# 캠페인 라우팅(확장 포인트)
+# - FE가 campaignId를 결정/관리하지 않도록, 서버가 캠페인을 선택해 submission.campaign_id에 고정한다.
+# - 현재는 DEFAULT_CAMPAIGN_ID(기본 1) 중심으로 운영하되, campaigns 테이블 기반으로 확장 가능.
+DEFAULT_CAMPAIGN_ID = int(os.getenv("DEFAULT_CAMPAIGN_ID", "1"))
 
 # 2. DB 및 S3 클라이언트 초기화
 engine = create_engine(DATABASE_URL)
@@ -159,6 +164,7 @@ class AdminAuditLog(Base):
     meta = Column(JSONB)
     created_at = Column(DateTime, default=datetime.utcnow)
 
+
 Base.metadata.create_all(bind=engine)
 
 # 4. Pydantic 스키마 (1:N + 자산화 지침 반영)
@@ -254,7 +260,12 @@ class CompleteRequest(BaseModel):
     receiptId: str
     userUuid: str
     type: ProjectType
-    campaignId: int = 1  # 캠페인 필터(지역·기간) 적용, 기본 1
+    campaignId: Optional[int] = Field(
+        default=None,
+        description="(Internal/Legacy) 캠페인 식별자. 서버가 presigned 단계에서 캠페인을 선택해 submission에 고정하므로, "
+        "FE 신규 연동에서는 생략 권장(서버가 저장된 campaign_id를 사용).",
+        json_schema_extra={"deprecated": True},
+    )
     data: Optional[Union[StayData, TourData]] = Field(
         default=None,
         description="(Legacy) FE 수기 입력 보정용 데이터. documents 방식 사용 시 data는 생략 권장. "
@@ -326,7 +337,6 @@ class CompleteRequestV2(BaseModel):
     receiptId: str
     userUuid: str
     type: ProjectType
-    campaignId: int = 1
     documents: List[ReceiptMetadata]
 
     @model_validator(mode="before")
@@ -386,6 +396,188 @@ def get_db():
     db = SessionLocal()
     try: yield db
     finally: db.close()
+
+
+def _parse_date_any(raw: Any) -> Optional[date]:
+    """
+    pay_date/campaign date 파싱.
+    - 지원: date/datetime, 'YYYY-MM-DD', 'YYYY/MM/DD'
+    """
+    if raw is None:
+        return None
+    if isinstance(raw, date) and not isinstance(raw, datetime):
+        return raw
+    if isinstance(raw, datetime):
+        return raw.date()
+    if isinstance(raw, str):
+        s = raw.strip()
+        if not s:
+            return None
+        s = s.replace("/", "-")
+        try:
+            return datetime.strptime(s[:10], "%Y-%m-%d").date()
+        except Exception:
+            return None
+    return None
+
+
+def _city_matches_target(store_city: str, target_city: str) -> bool:
+    store_city = (store_city or "").strip()
+    target_city = (target_city or "").strip()
+    if not target_city:
+        return True
+    if store_city == target_city:
+        return True
+    if target_city in store_city or store_city in target_city:
+        return True
+    target_key = target_city.replace("시", "").replace("군", "").strip()
+    if target_key and (target_key in store_city or store_city.startswith(target_key)):
+        return True
+    return False
+
+
+def _fetch_active_campaign_rows(db: Session) -> List[Dict[str, Any]]:
+    """
+    campaigns 테이블에서 활성 캠페인을 조회.
+    - 컬럼 확장(priority, project_type, updated_at) 유무에 따라 안전하게 조회한다.
+    """
+    try:
+        rows = db.execute(
+            sql_text(
+                "SELECT campaign_id, campaign_name, is_active, target_city_county, start_date, end_date, created_at, "
+                "COALESCE(priority, 100) AS priority, project_type "
+                "FROM campaigns WHERE is_active = true"
+            )
+        ).mappings().all()
+        return [dict(r) for r in rows]
+    except Exception:
+        try:
+            rows = db.execute(
+                sql_text(
+                    "SELECT campaign_id, campaign_name, is_active, target_city_county, start_date, end_date, created_at "
+                    "FROM campaigns WHERE is_active = true"
+                )
+            ).mappings().all()
+            items: List[Dict[str, Any]] = []
+            for r in rows:
+                d = dict(r)
+                d["priority"] = 100
+                d["project_type"] = None
+                items.append(d)
+            return items
+        except Exception:
+            return []
+
+
+def _resolve_campaign_id_for_presigned(db: Session, user_uuid: str, project_type: ProjectType) -> int:
+    """
+    Presigned 단계 캠페인 선택(보수적):
+    - 이 시점엔 OCR location/pay_date가 없으므로, 지역 제한 없는(=target_city_county NULL) 활성 캠페인 중
+      기간(start/end)이 '오늘'을 포함하는 캠페인을 우선 선택한다.
+    - 없으면 DEFAULT_CAMPAIGN_ID로 fallback.
+    """
+    today = datetime.utcnow().date()
+    pt = project_type.value if isinstance(project_type, ProjectType) else str(project_type)
+    candidates = []
+    for c in _fetch_active_campaign_rows(db):
+        if c.get("project_type") and str(c.get("project_type")).strip() != pt:
+            continue
+        target = (c.get("target_city_county") or "").strip()
+        if target:
+            continue
+        sd = _parse_date_any(c.get("start_date"))
+        ed = _parse_date_any(c.get("end_date"))
+        if sd and ed and not (sd <= today <= ed):
+            continue
+        candidates.append(c)
+    if not candidates:
+        return DEFAULT_CAMPAIGN_ID
+    candidates.sort(key=lambda x: (int(x.get("priority") or 100), int(x.get("campaign_id") or 0)))
+    return int(candidates[0].get("campaign_id") or DEFAULT_CAMPAIGN_ID)
+
+
+def _resolve_campaign_id_for_receipt(
+    db: Session, project_type: ProjectType, store_city: str, pay_date: str
+) -> int:
+    """
+    OCR 결과(location/pay_date)가 확보된 이후 캠페인 선택(확장 핵심).
+    - 활성 캠페인 중 (project_type 일치/NULL) + (기간 포함) + (target_city_county 매칭/NULL) 조건을 만족하는 후보 선택
+    - 우선순위: (1) priority 낮은 값 (2) target_city_county가 있는 캠페인(지역 특화) (3) campaign_id 작은 값
+    - 후보 없으면 DEFAULT_CAMPAIGN_ID
+    """
+    receipt_date = _parse_date_any(pay_date)
+    pt = project_type.value if isinstance(project_type, ProjectType) else str(project_type)
+    matches: List[Dict[str, Any]] = []
+    for c in _fetch_active_campaign_rows(db):
+        if c.get("project_type") and str(c.get("project_type")).strip() != pt:
+            continue
+        sd = _parse_date_any(c.get("start_date"))
+        ed = _parse_date_any(c.get("end_date"))
+        if receipt_date and sd and ed and not (sd <= receipt_date <= ed):
+            continue
+        target = (c.get("target_city_county") or "").strip()
+        if not _city_matches_target(store_city, target):
+            continue
+        matches.append(c)
+    if not matches:
+        return DEFAULT_CAMPAIGN_ID
+    matches.sort(
+        key=lambda x: (
+            int(x.get("priority") or 100),
+            0 if (x.get("target_city_county") or "").strip() else 1,
+            int(x.get("campaign_id") or 0),
+        )
+    )
+    return int(matches[0].get("campaign_id") or DEFAULT_CAMPAIGN_ID)
+
+
+class CampaignItem(BaseModel):
+    campaignId: int
+    name: str = "DEFAULT"
+    active: bool = True
+    targetCityCounty: Optional[str] = None
+    startDate: Optional[str] = None
+    endDate: Optional[str] = None
+    projectType: Optional[ProjectType] = None
+    priority: int = 100
+
+
+class ActiveCampaignsResponse(BaseModel):
+    defaultCampaignId: int
+    items: List[CampaignItem] = Field(default_factory=list)
+
+
+@app.get(
+    "/api/v1/campaigns/active",
+    response_model=ActiveCampaignsResponse,
+    summary="활성 캠페인 조회(확장 포인트)",
+    description="활성 캠페인 목록. FE는 보통 campaignId를 전송하지 않고(내부용), 필요 시 화면 표시/선택을 위해 조회할 수 있습니다.",
+)
+async def get_active_campaigns(db: Session = Depends(get_db)):
+    rows = _fetch_active_campaign_rows(db)
+    if not rows:
+        return ActiveCampaignsResponse(
+            defaultCampaignId=DEFAULT_CAMPAIGN_ID,
+            items=[CampaignItem(campaignId=DEFAULT_CAMPAIGN_ID, name="DEFAULT", active=True)],
+        )
+    items: List[CampaignItem] = []
+    for r in rows:
+        sd = _parse_date_any(r.get("start_date"))
+        ed = _parse_date_any(r.get("end_date"))
+        items.append(
+            CampaignItem(
+                campaignId=int(r.get("campaign_id")),
+                name=(r.get("campaign_name") or "DEFAULT"),
+                active=bool(r.get("is_active", True)),
+                targetCityCounty=(r.get("target_city_county") or None),
+                startDate=sd.isoformat() if sd else None,
+                endDate=ed.isoformat() if ed else None,
+                projectType=ProjectType(r["project_type"]) if (r.get("project_type") in ("STAY", "TOUR")) else None,
+                priority=int(r.get("priority") or 100),
+            )
+        )
+    items.sort(key=lambda x: (x.priority, x.campaignId))
+    return ActiveCampaignsResponse(defaultCampaignId=DEFAULT_CAMPAIGN_ID, items=items)
 
 
 def _check_s3_connection() -> Tuple[bool, Optional[str]]:
@@ -487,13 +679,15 @@ async def get_presigned_url(
             # receiptId 재사용은 "같은 신청(같은 type)"에 한해서만 허용 (STAY↔TOUR 엉킴 방지)
             if (existing.project_type or "").strip() and existing.project_type != type:
                 raise HTTPException(status_code=409, detail="receiptId type mismatch")
+            # campaign_id는 presigned 최초 생성 시 서버가 고정. 기존 submission에서는 덮어쓰지 않는다.
         else:
+            campaign_id = _resolve_campaign_id_for_presigned(db, userUuid, type)
             db.add(
                 Submission(
                     submission_id=receipt_id,
                     user_uuid=userUuid,
                     project_type=type,
-                    campaign_id=1,
+                    campaign_id=campaign_id,
                     status="PENDING",
                     total_amount=0,
                 )
@@ -581,13 +775,19 @@ async def _submit_receipt_common(req: CompleteRequest, background_tasks: Backgro
     if (submission.project_type or "").strip() and submission.project_type != req.type:
         raise HTTPException(status_code=409, detail="receiptId type mismatch")
 
+    # campaignId는 서버가 submission 생성 시 고정한다.
+    # FE가 값 전달 시에도 변경은 허용하지 않고, mismatch만 차단(보안/혼동 방지).
+    if req.campaignId is not None and submission.campaign_id and submission.campaign_id != req.campaignId:
+        raise HTTPException(status_code=409, detail="campaignId mismatch")
+    if not submission.campaign_id:
+        submission.campaign_id = _resolve_campaign_id_for_presigned(db, submission.user_uuid, req.type)
+
     if submission.status in ("FIT", "UNFIT", "ERROR"):
         raise HTTPException(status_code=409, detail="Submission already completed")
 
     if submission.status in ("PROCESSING", "VERIFYING"):
         return {"status": submission.status, "receiptId": req.receiptId}
 
-    submission.campaign_id = req.campaignId
     submission.status = "PROCESSING"
     db.commit()
 
@@ -611,7 +811,7 @@ async def submit_receipt(req: CompleteRequestV2, background_tasks: BackgroundTas
         receiptId=req.receiptId,
         userUuid=req.userUuid,
         type=req.type,
-        campaignId=req.campaignId,
+        campaignId=None,
         documents=req.documents,
         data=None,
     )
@@ -974,6 +1174,234 @@ async def get_status_alt(receiptId: str, db: Session = Depends(get_db)):
 async def get_status_proxy(receiptId: str, db: Session = Depends(get_db)):
     """프론트엔드 프록시 경로: /api/v1/receipts/{id}/status 와 동일 응답"""
     return await get_status(receiptId, db)
+
+
+# 5-0. 캠페인 관리/조회 API
+class AdminCampaignItem(BaseModel):
+    campaignId: int
+    name: Optional[str] = None
+    active: bool = True
+    targetCityCounty: Optional[str] = None
+    startDate: Optional[str] = None
+    endDate: Optional[str] = None
+    projectType: Optional[ProjectType] = None
+    priority: int = 100
+    createdAt: Optional[str] = None
+    updatedAt: Optional[str] = None
+
+
+class AdminCampaignListResponse(BaseModel):
+    total: int
+    items: List[AdminCampaignItem] = Field(default_factory=list)
+
+
+class AdminCampaignUpsertRequest(BaseModel):
+    name: str
+    active: bool = True
+    targetCityCounty: Optional[str] = None
+    startDate: Optional[str] = None  # YYYY-MM-DD
+    endDate: Optional[str] = None    # YYYY-MM-DD
+    projectType: Optional[ProjectType] = None
+    priority: int = 100
+
+
+def _admin_fetch_campaign_rows(db: Session) -> List[Dict[str, Any]]:
+    try:
+        rows = db.execute(
+            sql_text(
+                "SELECT campaign_id, campaign_name, is_active, target_city_county, start_date, end_date, created_at, "
+                "COALESCE(priority, 100) AS priority, project_type, updated_at "
+                "FROM campaigns ORDER BY COALESCE(priority, 100) ASC, campaign_id ASC"
+            )
+        ).mappings().all()
+        return [dict(r) for r in rows]
+    except Exception:
+        rows = db.execute(
+            sql_text(
+                "SELECT campaign_id, campaign_name, is_active, target_city_county, start_date, end_date, created_at "
+                "FROM campaigns ORDER BY campaign_id ASC"
+            )
+        ).mappings().all()
+        items: List[Dict[str, Any]] = []
+        for r in rows:
+            d = dict(r)
+            d["priority"] = 100
+            d["project_type"] = None
+            d["updated_at"] = None
+            items.append(d)
+        return items
+
+
+@app.get(
+    "/api/v1/admin/campaigns",
+    response_model=AdminCampaignListResponse,
+    summary="캠페인 목록 조회(관리자)",
+)
+async def admin_list_campaigns(db: Session = Depends(get_db), actor: str = Depends(require_admin)):
+    rows = _admin_fetch_campaign_rows(db)
+    items: List[AdminCampaignItem] = []
+    for r in rows:
+        sd = _parse_date_any(r.get("start_date"))
+        ed = _parse_date_any(r.get("end_date"))
+        items.append(
+            AdminCampaignItem(
+                campaignId=int(r.get("campaign_id")),
+                name=r.get("campaign_name"),
+                active=bool(r.get("is_active", True)),
+                targetCityCounty=(r.get("target_city_county") or None),
+                startDate=sd.isoformat() if sd else None,
+                endDate=ed.isoformat() if ed else None,
+                projectType=ProjectType(r["project_type"]) if (r.get("project_type") in ("STAY", "TOUR")) else None,
+                priority=int(r.get("priority") or 100),
+                createdAt=(r.get("created_at").isoformat() if isinstance(r.get("created_at"), datetime) else None),
+                updatedAt=(r.get("updated_at").isoformat() if isinstance(r.get("updated_at"), datetime) else None),
+            )
+        )
+    return AdminCampaignListResponse(total=len(items), items=items)
+
+
+@app.post(
+    "/api/v1/admin/campaigns",
+    response_model=AdminCampaignItem,
+    summary="캠페인 생성(관리자)",
+)
+async def admin_create_campaign(
+    body: AdminCampaignUpsertRequest, db: Session = Depends(get_db), actor: str = Depends(require_admin)
+):
+    sd = _parse_date_any(body.startDate)
+    ed = _parse_date_any(body.endDate)
+    target = (body.targetCityCounty or "").strip() or None
+    pt = body.projectType.value if body.projectType else None
+    pr = int(body.priority or 100)
+
+    # 기본 컬럼으로 먼저 생성
+    res = db.execute(
+        sql_text(
+            "INSERT INTO campaigns (campaign_name, is_active, target_city_county, start_date, end_date, created_at) "
+            "VALUES (:name, :active, :target, :sd, :ed, NOW()) "
+            "RETURNING campaign_id"
+        ),
+        {"name": body.name.strip(), "active": bool(body.active), "target": target, "sd": sd, "ed": ed},
+    ).fetchone()
+    cid = int(res[0]) if res else 0
+    # 확장 컬럼이 있으면 업데이트
+    try:
+        db.execute(
+            sql_text(
+                "UPDATE campaigns SET priority=:pr, project_type=:pt, updated_at=NOW() WHERE campaign_id=:cid"
+            ),
+            {"pr": pr, "pt": pt, "cid": cid},
+        )
+    except Exception:
+        pass
+    db.commit()
+
+    _audit_log(
+        db,
+        actor=actor,
+        action="CAMPAIGN_CREATE",
+        target_type="campaign",
+        target_id=str(cid),
+        after_json={
+            "campaignId": cid,
+            "name": body.name,
+            "active": body.active,
+            "targetCityCounty": target,
+            "startDate": body.startDate,
+            "endDate": body.endDate,
+            "projectType": pt,
+            "priority": pr,
+        },
+    )
+    db.commit()
+    return AdminCampaignItem(
+        campaignId=cid,
+        name=body.name,
+        active=bool(body.active),
+        targetCityCounty=target,
+        startDate=sd.isoformat() if sd else None,
+        endDate=ed.isoformat() if ed else None,
+        projectType=body.projectType,
+        priority=pr,
+    )
+
+
+@app.put(
+    "/api/v1/admin/campaigns/{campaignId}",
+    response_model=AdminCampaignItem,
+    summary="캠페인 수정(관리자)",
+)
+async def admin_update_campaign(
+    campaignId: int,
+    body: AdminCampaignUpsertRequest,
+    db: Session = Depends(get_db),
+    actor: str = Depends(require_admin),
+):
+    # before snapshot
+    before_rows = _admin_fetch_campaign_rows(db)
+    before = next((r for r in before_rows if int(r.get("campaign_id")) == int(campaignId)), None)
+
+    sd = _parse_date_any(body.startDate)
+    ed = _parse_date_any(body.endDate)
+    target = (body.targetCityCounty or "").strip() or None
+    pt = body.projectType.value if body.projectType else None
+    pr = int(body.priority or 100)
+
+    db.execute(
+        sql_text(
+            "UPDATE campaigns SET campaign_name=:name, is_active=:active, target_city_county=:target, "
+            "start_date=:sd, end_date=:ed WHERE campaign_id=:cid"
+        ),
+        {
+            "name": body.name.strip(),
+            "active": bool(body.active),
+            "target": target,
+            "sd": sd,
+            "ed": ed,
+            "cid": int(campaignId),
+        },
+    )
+    try:
+        db.execute(
+            sql_text(
+                "UPDATE campaigns SET priority=:pr, project_type=:pt, updated_at=NOW() WHERE campaign_id=:cid"
+            ),
+            {"pr": pr, "pt": pt, "cid": int(campaignId)},
+        )
+    except Exception:
+        pass
+    db.commit()
+
+    _audit_log(
+        db,
+        actor=actor,
+        action="CAMPAIGN_UPDATE",
+        target_type="campaign",
+        target_id=str(campaignId),
+        before_json=before,
+        after_json={
+            "campaignId": int(campaignId),
+            "name": body.name,
+            "active": body.active,
+            "targetCityCounty": target,
+            "startDate": body.startDate,
+            "endDate": body.endDate,
+            "projectType": pt,
+            "priority": pr,
+        },
+    )
+    db.commit()
+
+    return AdminCampaignItem(
+        campaignId=int(campaignId),
+        name=body.name,
+        active=bool(body.active),
+        targetCityCounty=target,
+        startDate=sd.isoformat() if sd else None,
+        endDate=ed.isoformat() if ed else None,
+        projectType=body.projectType,
+        priority=pr,
+    )
 
 
 # 5-1. 판정 규칙 관리 API (관리자)
@@ -2494,7 +2922,15 @@ async def analyze_receipt_task(req: CompleteRequest):
                     ):
                         item_fail = "BIZ_001"
                     if not item_fail and req.campaignId:
-                        ok, c_fail = validate_campaign_rules(db, req.campaignId, location, pay_date_stored)
+                        # OCR 결과 기반 캠페인 자동 선택(확장)
+                        selected_campaign_id = _resolve_campaign_id_for_receipt(
+                            db, req.type, location, pay_date_stored
+                        )
+                        if selected_campaign_id and submission.campaign_id != selected_campaign_id:
+                            submission.campaign_id = selected_campaign_id
+                        ok, c_fail = validate_campaign_rules(
+                            db, int(submission.campaign_id or DEFAULT_CAMPAIGN_ID), location, pay_date_stored
+                        )
                         if not ok and c_fail:
                             item_fail = c_fail
 
@@ -2615,7 +3051,14 @@ async def analyze_receipt_task(req: CompleteRequest):
                     ):
                         item_fail = "BIZ_001"
                     if not item_fail and req.campaignId:
-                        ok, c_fail = validate_campaign_rules(db, req.campaignId, location, pay_date_stored)
+                        selected_campaign_id = _resolve_campaign_id_for_receipt(
+                            db, req.type, location, pay_date_stored
+                        )
+                        if selected_campaign_id and submission.campaign_id != selected_campaign_id:
+                            submission.campaign_id = selected_campaign_id
+                        ok, c_fail = validate_campaign_rules(
+                            db, int(submission.campaign_id or DEFAULT_CAMPAIGN_ID), location, pay_date_stored
+                        )
                         if not ok and c_fail:
                             item_fail = c_fail
 

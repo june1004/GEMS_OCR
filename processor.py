@@ -183,7 +183,8 @@ def validate_campaign_rules(
     end_date = getattr(row, "end_date", None)
     if start_date is not None and end_date is not None and pay_date_str:
         try:
-            receipt_date = datetime.strptime(pay_date_str.strip()[:10], "%Y-%m-%d").date()
+            s = pay_date_str.strip()[:10].replace("/", "-")
+            receipt_date = datetime.strptime(s, "%Y-%m-%d").date()
             if not (start_date <= receipt_date <= end_date):
                 return False, ERR_CAMPAIGN_EXPIRED
         except ValueError:

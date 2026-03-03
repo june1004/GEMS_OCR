@@ -438,6 +438,20 @@ BE 저장 시점에 정규화:
 
 ---
 
+## 8. 캠페인 운영(확장 포인트)
+
+캠페인은 향후 “기간/지역 이벤트(시군구 축제 등)” 확장을 위한 운영 요소입니다.
+
+- **FE 원칙**: FE는 보통 `campaignId`를 전송하지 않습니다(내부용). BE가 submission에 campaign_id를 고정/선택합니다.
+- **관리자 운영**: 아래 API로 활성 캠페인을 관리할 수 있습니다.
+  - `GET /api/v1/admin/campaigns` (목록)
+  - `POST /api/v1/admin/campaigns` (생성)
+  - `PUT /api/v1/admin/campaigns/{campaignId}` (수정)
+
+> DB 스키마: `PROJECT/migrations/campaigns_filtering.sql`, 확장 컬럼: `PROJECT/migrations/campaigns_routing_ext.sql`
+
+---
+
 ## 7. 관리자 웹 구현 템플릿 (TypeScript)
 
 > 아래 타입/함수는 관리자 웹(`gems_ocr-9f4d37f5`)에서 그대로 복사해 붙여 사용할 수 있는 최소 템플릿입니다.

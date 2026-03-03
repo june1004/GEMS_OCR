@@ -568,13 +568,6 @@ async def upload_receipt_via_api(
     return {"uploadUrl": "", "receiptId": receipt_id, "objectKey": object_key}
 
 
-@app.post(
-    "/api/v1/receipts/complete",
-    response_model=CompleteResponse,
-    summary="검증 완료 요청",
-    description="receiptId 기준 1회 호출. documents 배열에 해당 신청의 모든 이미지(imageKey=objectKey, docType) 전달. "
-    "documents 사용 시 data는 생략(null) 가능. 분석 완료 시 OCR_RESULT_CALLBACK_URL이 설정된 경우 FE로 결과 POST(재시도 없음).",
-)
 async def _submit_receipt_common(req: CompleteRequest, background_tasks: BackgroundTasks, db: Session):
     """3단계 공통 처리: 비동기 분석 시작. 1건 신청 = 1 receiptId = complete 1회."""
     submission = db.query(Submission).filter(Submission.submission_id == req.receiptId).first()
@@ -602,6 +595,13 @@ async def _submit_receipt_common(req: CompleteRequest, background_tasks: Backgro
     return {"status": "PROCESSING", "receiptId": req.receiptId}
 
 
+@app.post(
+    "/api/v1/receipts/complete",
+    response_model=CompleteResponse,
+    summary="검증 완료 요청",
+    description="receiptId 기준 1회 호출. documents 배열에 해당 신청의 모든 이미지(imageKey=objectKey, docType) 전달. "
+    "v1 연동은 documents-only로 운영(legacy data는 별도 경로). 분석 완료 시 OCR_RESULT_CALLBACK_URL이 설정된 경우 FE로 결과 POST(재시도 없음).",
+)
 async def submit_receipt(req: CompleteRequestV2, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
     v1은 FE 연동을 위해 documents-only로 고정한다.

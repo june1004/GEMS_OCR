@@ -377,12 +377,42 @@ class CompleteRequestV2(BaseModel):
 
         return v
 
-# 5. API 엔드포인트
+# 5. API 엔드포인트 (Swagger 태그 구성)
+OPENAPI_TAGS = [
+    {
+        "name": "FE - Step 1: Presigned URL",
+        "description": "신청(receiptId) 생성 및 이미지 업로드용 presigned URL 발급",
+    },
+    {
+        "name": "FE - Step 1b: Upload (fallback)",
+        "description": "스토리지 CORS 불가 등 예외 상황에서 서버로 multipart 업로드(대안)",
+    },
+    {
+        "name": "FE - Step 3: Complete",
+        "description": "업로드된 objectKey 목록(documents)으로 분석 시작",
+    },
+    {
+        "name": "FE - Step 6: Status",
+        "description": "결과 조회(폴링/스케줄러 복구). 콜백 누락 대비",
+    },
+    {
+        "name": "FE - Campaigns",
+        "description": "(선택) 활성 캠페인 조회. 다중 캠페인 운영 확장 포인트",
+    },
+    {"name": "Admin - Rules", "description": "판정 규칙 운영(관리자)"},
+    {"name": "Admin - Stores", "description": "신규 상점 후보군 관리/승인(관리자)"},
+    {"name": "Admin - Submissions", "description": "신청 검색/상세/override/콜백 재전송(관리자)"},
+    {"name": "Admin - Campaigns", "description": "캠페인 운영(관리자, 확장)"},
+    {"name": "Ops", "description": "헬스 체크 등 운영용 엔드포인트"},
+]
+
+# 5-1. FastAPI 앱
 app = FastAPI(
     title="GEMS OCR API",
     version="1.0.0",
     description="강원 여행 인센티브 영수증 인식 API",
     servers=[{"url": "https://api.nanum.online", "description": "Production"}],
+    openapi_tags=OPENAPI_TAGS,
 )
 app.add_middleware(
     CORSMiddleware,
@@ -552,6 +582,7 @@ class ActiveCampaignsResponse(BaseModel):
     response_model=ActiveCampaignsResponse,
     summary="활성 캠페인 조회(확장 포인트)",
     description="활성 캠페인 목록. FE는 보통 campaignId를 전송하지 않고(내부용), 필요 시 화면 표시/선택을 위해 조회할 수 있습니다.",
+    tags=["FE - Campaigns"],
 )
 async def get_active_campaigns(db: Session = Depends(get_db)):
     rows = _fetch_active_campaign_rows(db)
@@ -616,7 +647,7 @@ def _check_db_connection() -> Tuple[bool, Optional[str]]:
         return False, f"DB 오류: {str(e)}"
 
 
-@app.get("/api/health", summary="헬스 체크 (S3·DB 연결 확인)")
+@app.get("/api/health", summary="헬스 체크 (S3·DB 연결 확인)", tags=["Ops"])
 async def health_check():
     """S3 버킷 접근 및 DB 연결·테이블 존재 여부를 확인합니다. 배포/프록시에서 사용."""
     s3_ok, s3_msg = _check_s3_connection()
@@ -632,7 +663,11 @@ async def health_check():
     return {"status": "ok", "s3": "ok", "db": "ok"}
 
 
-@app.post("/api/v1/receipts/presigned-url", response_model=PresignedUrlResponse)
+@app.post(
+    "/api/v1/receipts/presigned-url",
+    response_model=PresignedUrlResponse,
+    tags=["FE - Step 1: Presigned URL"],
+)
 async def get_presigned_url(
     fileName: str,
     contentType: str,
@@ -716,7 +751,11 @@ async def get_presigned_url_proxy(
     return await get_presigned_url(fileName, contentType, userUuid, type, receiptId, db)
 
 
-@app.post("/api/v1/receipts/upload", response_model=PresignedUrlResponse)
+@app.post(
+    "/api/v1/receipts/upload",
+    response_model=PresignedUrlResponse,
+    tags=["FE - Step 1b: Upload (fallback)"],
+)
 async def upload_receipt_via_api(
     file: UploadFile = File(...),
     userUuid: str = Form(...),
@@ -801,6 +840,7 @@ async def _submit_receipt_common(req: CompleteRequest, background_tasks: Backgro
     summary="검증 완료 요청",
     description="receiptId 기준 1회 호출. documents 배열에 해당 신청의 모든 이미지(imageKey=objectKey, docType) 전달. "
     "v1 연동은 documents-only로 운영(legacy data는 별도 경로). 분석 완료 시 OCR_RESULT_CALLBACK_URL이 설정된 경우 FE로 결과 POST(재시도 없음).",
+    tags=["FE - Step 3: Complete"],
 )
 async def submit_receipt(req: CompleteRequestV2, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
@@ -1087,6 +1127,7 @@ async def _send_result_callback(receipt_id: str, payload: Dict[str, Any], target
     summary="결과 조회(폴링/스케줄러 복구)",
     description="receiptId 단위 최종 판정. 동일 receiptId에 대해 언제든 반복 호출 가능(FE 스케줄러 누락 복구용). "
     "콜백과 동일한 JSON 구조(콜백 시 Body에 receiptId 추가하여 전송).",
+    tags=["FE - Step 6: Status"],
 )
 async def get_status(receiptId: str, db: Session = Depends(get_db)):
     """4단계: 최종 결과 조회. receiptId 단위 적합/부적합, DB 기준 최신값 반환."""
@@ -1236,6 +1277,7 @@ def _admin_fetch_campaign_rows(db: Session) -> List[Dict[str, Any]]:
     "/api/v1/admin/campaigns",
     response_model=AdminCampaignListResponse,
     summary="캠페인 목록 조회(관리자)",
+    tags=["Admin - Campaigns"],
 )
 async def admin_list_campaigns(db: Session = Depends(get_db), actor: str = Depends(require_admin)):
     rows = _admin_fetch_campaign_rows(db)
@@ -1264,6 +1306,7 @@ async def admin_list_campaigns(db: Session = Depends(get_db), actor: str = Depen
     "/api/v1/admin/campaigns",
     response_model=AdminCampaignItem,
     summary="캠페인 생성(관리자)",
+    tags=["Admin - Campaigns"],
 )
 async def admin_create_campaign(
     body: AdminCampaignUpsertRequest, db: Session = Depends(get_db), actor: str = Depends(require_admin)
@@ -1330,6 +1373,7 @@ async def admin_create_campaign(
     "/api/v1/admin/campaigns/{campaignId}",
     response_model=AdminCampaignItem,
     summary="캠페인 수정(관리자)",
+    tags=["Admin - Campaigns"],
 )
 async def admin_update_campaign(
     campaignId: int,
@@ -1426,6 +1470,7 @@ class JudgmentRuleConfigUpdateRequest(BaseModel):
     "/api/v1/admin/rules/judgment",
     response_model=JudgmentRuleConfigResponse,
     summary="판정 규칙 조회",
+    tags=["Admin - Rules"],
 )
 async def get_judgment_rule_config(db: Session = Depends(get_db), actor: str = Depends(require_admin)):
     cfg = _get_judgment_rule_config(db)
@@ -1443,6 +1488,7 @@ async def get_judgment_rule_config(db: Session = Depends(get_db), actor: str = D
     "/api/v1/admin/rules/judgment",
     response_model=JudgmentRuleConfigResponse,
     summary="판정 규칙 수정",
+    tags=["Admin - Rules"],
 )
 async def update_judgment_rule_config(
     body: JudgmentRuleConfigUpdateRequest, db: Session = Depends(get_db), actor: str = Depends(require_admin)
@@ -1532,6 +1578,7 @@ class ApproveCandidatesResponse(BaseModel):
     response_model=CandidatesListResponse,
     summary="신규 상점 후보군 목록",
     description="마스터에 없으나 OCR로 유효 판별된 상점을 빈도순/최신순으로 조회. 증거(recent_receipt_id)로 영수증 확인 가능.",
+    tags=["Admin - Stores"],
 )
 async def list_candidate_stores(
     city_county: Optional[str] = None,
@@ -1579,6 +1626,7 @@ async def list_candidate_stores(
     response_model=ApproveCandidatesResponse,
     summary="후보 상점 마스터 편입",
     description="선택한 후보를 master_stores로 이관. 이후 해당 상점 영수증은 FIT 판정.",
+    tags=["Admin - Stores"],
 )
 async def approve_candidate_stores(
     body: ApproveCandidatesRequest,
@@ -1650,6 +1698,7 @@ class AdminSubmissionListResponse(BaseModel):
     "/api/v1/admin/submissions",
     response_model=AdminSubmissionListResponse,
     summary="신청 목록 검색(관리자)",
+    tags=["Admin - Submissions"],
 )
 async def admin_list_submissions(
     status: Optional[str] = None,
@@ -1725,6 +1774,7 @@ def _build_status_payload_admin(submission: Submission, item_rows: List[ReceiptI
     "/api/v1/admin/submissions/{receiptId}",
     response_model=AdminSubmissionDetailResponse,
     summary="신청 단건 상세(관리자)",
+    tags=["Admin - Submissions"],
 )
 async def admin_get_submission(receiptId: str, db: Session = Depends(get_db), actor: str = Depends(require_admin)):
     rid = _sanitize_receipt_id(receiptId)
@@ -1773,6 +1823,7 @@ class AdminReceiptImagesResponse(BaseModel):
     "/api/v1/admin/receipts/{receiptId}/images",
     response_model=AdminReceiptImagesResponse,
     summary="신청 이미지 presigned GET(관리자)",
+    tags=["Admin - Submissions"],
 )
 async def admin_get_receipt_images(receiptId: str, db: Session = Depends(get_db), actor: str = Depends(require_admin)):
     rid = _sanitize_receipt_id(receiptId)
@@ -1821,6 +1872,7 @@ class AdminOverrideResponse(BaseModel):
     "/api/v1/admin/submissions/{receiptId}/override",
     response_model=AdminOverrideResponse,
     summary="수동 판정 변경(override)",
+    tags=["Admin - Submissions"],
 )
 async def admin_override_submission(
     receiptId: str,
@@ -1897,6 +1949,7 @@ class AdminCallbackResendResponse(BaseModel):
     "/api/v1/admin/submissions/{receiptId}/callback/resend",
     response_model=AdminCallbackResendResponse,
     summary="콜백 재전송(관리자)",
+    tags=["Admin - Submissions"],
 )
 async def admin_resend_callback(
     receiptId: str,

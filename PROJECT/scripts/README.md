@@ -105,7 +105,34 @@ Presigned URL로 **PUT** 할 때 반드시:
 - **Content-Type**: Presigned URL 발급 시 사용한 `contentType`과 **동일**하게 전송 (예: `image/png`, `image/jpeg`).
 - **하지 말 것**: `body: JSON.stringify(...)`, `FormData`를 body로 전송, base64 문자열만 보내기.
 
-### 3) Git push 시 자동 실행
+### 3) MinIO–DB 정합성(리콘실리레이션)
+
+MinIO에는 이미지가 있는데 DB에 해당 submission이 없거나, Complete가 호출되지 않아 `receipt_items`가 없는 경우를 점검합니다. 정책은 `PROJECT/MinIO-DB_정합성_및_OCR미인식_정책.md` 참고.
+
+유효일은 **관리자 설정** (`GET/PUT /api/v1/admin/rules/judgment` 의 `orphan_object_days`, `expired_candidate_days`)을 사용하며, **기본 각 1일**입니다. `--days N`을 주면 해당 N일로 고아/만료 후보 모두 적용합니다.
+
+```bash
+# DB 설정값(기본 1일)으로 보고 (삭제 없음)
+python3 PROJECT/scripts/reconcile_minio_db.py
+
+# 3일로 통일해서 보고
+python3 PROJECT/scripts/reconcile_minio_db.py --days 3
+
+# 고아 객체 유효기간 경과분만 실제 삭제 (DB 설정값 사용)
+python3 PROJECT/scripts/reconcile_minio_db.py --delete
+```
+
+- **[A]** MinIO에만 있음(DB에 submission 없음)  
+- **[B]** DB에 submission 있으나 receipt_items 없음(Complete 미호출), 그중 N일 경과 만료 후보  
+- **[C]** Complete 완료 또는 receipt_items 있음  
+
+### 4) OCR 미인식(ERROR_OCR) 검증
+
+- `PROJECT/scripts/status_원인_분석.sql` **쿼리 8**: OCR_001 건수 및 submission_id·image_key 샘플.  
+- 샘플의 `image_key`로 `check_s3_image_object.py` 실행해 이미지 바이너리 여부 확인.  
+- 정책·주기 점검: `PROJECT/MinIO-DB_정합성_및_OCR미인식_정책.md` §3 참고.
+
+### 5) Git push 시 자동 실행
 
 `main`/`master` 브랜치에 push하면 `.github/workflows/check-s3-image.yml`이 실행되어 `check_s3_image_object.py`가 동작합니다.  
 Repository Secrets에 `S3_ENDPOINT`, `S3_ACCESS_KEY`, `S3_SECRET_KEY`, (선택) `S3_BUCKET`, `S3_CHECK_OBJECT_KEY`(검사할 객체 키)를 넣어 두면 해당 객체에 대해 진단이 수행됩니다. `S3_CHECK_OBJECT_KEY`를 비워 두면 스크립트만 실행되고(인자 없음) 단계는 성공 처리됩니다.

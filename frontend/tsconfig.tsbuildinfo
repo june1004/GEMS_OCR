@@ -1,0 +1,1 @@
+{"root":["./src/adminapp.tsx","./src/app.tsx","./src/receiptapp.tsx","./src/main.tsx","./src/types.ts","./src/vite-env.d.ts","./src/api/admin.ts","./src/api/receipts.ts","./src/components/receiptcard.tsx","./src/components/admin/admincandidates.tsx","./src/components/admin/adminrules.tsx","./src/components/admin/adminsubmissions.tsx"],"version":"5.9.3"}

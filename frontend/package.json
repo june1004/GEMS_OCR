@@ -5,6 +5,7 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
+    "dev:admin": "vite --port 8080",
     "build": "tsc -b && vite build",
     "preview": "vite preview"
   },

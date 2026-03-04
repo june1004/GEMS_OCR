@@ -26,7 +26,7 @@ from store_classifier import (
 from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends, UploadFile, Header, Query
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator, UUID4, ConfigDict
-from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Float, DateTime, JSON, Boolean, ARRAY, ForeignKey
+from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Float, DateTime, JSON, Boolean, ARRAY, ForeignKey, update
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.dialects.postgresql import JSONB
@@ -150,6 +150,9 @@ class JudgmentRuleConfig(Base):
     enable_gemini_classifier = Column(Boolean, default=True)
     min_amount_stay = Column(Integer, default=60000)
     min_amount_tour = Column(Integer, default=50000)
+    # MinIO–DB 정합: 고아 객체/만료 후보 유효일(일). 관리자 설정, 기본 1일
+    orphan_object_days = Column(Integer, default=1)       # MinIO에만 있고 DB에 없는 객체
+    expired_candidate_days = Column(Integer, default=1)   # DB에 submission만 있고 receipt_items 없음
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -204,6 +207,7 @@ class ErrorCode(str, Enum):
     OCR_001 = "OCR_001"
     OCR_002 = "OCR_002"
     OCR_003 = "OCR_003"
+    OCR_004 = "OCR_004"  # 인식 불량(핵심 필드 누락 또는 저신뢰도) → 수동 검수 보정
     PENDING_NEW = "PENDING_NEW"
     PENDING_VERIFICATION = "PENDING_VERIFICATION"
     UNFIT_CATEGORY = "UNFIT_CATEGORY"
@@ -838,7 +842,10 @@ async def upload_receipt_via_api(
 
 
 async def _submit_receipt_common(req: CompleteRequest, background_tasks: BackgroundTasks, db: Session):
-    """3단계 공통 처리: 비동기 분석 시작. 1건 신청 = 1 receiptId = complete 1회."""
+    """
+    3단계 공통 처리: 비동기 분석 시작. 1건 신청 = 1 receiptId = complete 1회.
+    동일 receiptId에 대한 동시 Complete 요청 시 한 건만 PROCESSING으로 전환되도록 원자적 업데이트 사용.
+    """
     submission = db.query(Submission).filter(Submission.submission_id == req.receiptId).first()
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
@@ -851,7 +858,6 @@ async def _submit_receipt_common(req: CompleteRequest, background_tasks: Backgro
         raise HTTPException(status_code=409, detail="receiptId type mismatch")
 
     # campaignId는 서버가 submission 생성 시 고정한다.
-    # FE가 값 전달 시에도 변경은 허용하지 않고, mismatch만 차단(보안/혼동 방지).
     if req.campaignId is not None and submission.campaign_id and submission.campaign_id != req.campaignId:
         raise HTTPException(status_code=409, detail="campaignId mismatch")
     if not submission.campaign_id:
@@ -863,10 +869,27 @@ async def _submit_receipt_common(req: CompleteRequest, background_tasks: Backgro
     if submission.status in ("PROCESSING", "VERIFYING"):
         return {"status": submission.status, "receiptId": req.receiptId}
 
-    submission.status = "PROCESSING"
-    if req.data is not None:
-        submission.user_input_snapshot = req.data.model_dump()
+    # 원자적 전환: PENDING → PROCESSING. 동시 요청 시 한 건만 성공하여 중복 백그라운드 태스크 방지.
+    if not submission.campaign_id:
+        submission.campaign_id = _resolve_campaign_id_for_presigned(db, submission.user_uuid, req.type)
+    snap = req.data.model_dump() if req.data is not None else None
+    values = {"status": "PROCESSING", "user_input_snapshot": snap}
+    if submission.campaign_id:
+        values["campaign_id"] = submission.campaign_id
+    stmt = (
+        update(Submission)
+        .where(
+            Submission.submission_id == req.receiptId,
+            Submission.status == "PENDING",
+        )
+        .values(**values)
+    )
+    result = db.execute(stmt)
     db.commit()
+    if result.rowcount == 0:
+        # 이미 다른 요청이 PROCESSING/VERIFYING으로 전환함 → 현재 상태 반환
+        refetched = db.query(Submission).filter(Submission.submission_id == req.receiptId).first()
+        return {"status": (refetched.status if refetched else "PROCESSING"), "receiptId": req.receiptId}
 
     background_tasks.add_task(analyze_receipt_task, req)
     return {"status": "PROCESSING", "receiptId": req.receiptId}
@@ -911,7 +934,7 @@ class ExtractedData(BaseModel):
     amount: int = Field(0, description="인식된 금액")
     pay_date: Optional[str] = Field(None, description="결제일자")
     address: Optional[str] = Field(None, description="상점 주소")
-    card_num: str = Field("0000", description="카드번호 앞 4자리 (현금/미인식 시 0000)")
+    card_num: str = Field("1000", description="카드번호 앞 4자리. 현금=0000, 카드번호 없음/****=1000, 유효 시 마지막 4자리")
 
 
 class ReceiptItemSchema(BaseModel):
@@ -983,6 +1006,8 @@ def _get_judgment_rule_config(db: Session) -> JudgmentRuleConfig:
         enable_gemini_classifier=True,
         min_amount_stay=60000,
         min_amount_tour=50000,
+        orphan_object_days=1,
+        expired_candidate_days=1,
         updated_at=datetime.utcnow(),
     )
     db.add(cfg)
@@ -1067,7 +1092,7 @@ def _build_status_payload(submission: Submission, item_rows: List[Any]) -> Dict[
     if first_item:
         address = (first_item.address or first_item.location or first_item.store_name or "").strip() or None
         card_prefix = first_item.card_num or None
-    if submission.status in ("VERIFYING", "PROCESSING") and card_prefix == "0000":
+    if submission.status in ("VERIFYING", "PROCESSING") and card_prefix in (CARD_NUM_CASH, CARD_NUM_NO_CARD):
         card_prefix = None
     audit_trail_raw = (submission.audit_trail or submission.audit_log or "")
     audit_trail_truncated = False
@@ -1085,7 +1110,7 @@ def _build_status_payload(submission: Submission, item_rows: List[Any]) -> Dict[
                 "amount": it.amount or 0,
                 "pay_date": it.pay_date,
                 "address": it.address,
-                "card_num": it.card_num or "0000",
+                "card_num": it.card_num or CARD_NUM_NO_CARD,
             }
         err_msg = it.error_message
         if (
@@ -1185,8 +1210,8 @@ async def get_status(receiptId: str, db: Session = Depends(get_db)):
     if first_item:
         address = (first_item.address or first_item.location or first_item.store_name or "").strip() or None
         card_prefix = first_item.card_num or None
-    # VERIFYING/PROCESSING 중 placeholder만 있을 땐 카드 미확정으로 null 반환 (0000 노출 방지)
-    if submission.status in ("VERIFYING", "PROCESSING") and card_prefix == "0000":
+    # VERIFYING/PROCESSING 중 placeholder만 있을 땐 카드 미확정으로 null 반환 (0000/1000 노출 방지)
+    if submission.status in ("VERIFYING", "PROCESSING") and card_prefix in (CARD_NUM_CASH, CARD_NUM_NO_CARD):
         card_prefix = None
     item_details: List[ReceiptItemSchema] = []
     for it in item_rows:
@@ -1197,7 +1222,7 @@ async def get_status(receiptId: str, db: Session = Depends(get_db)):
                 amount=it.amount or 0,
                 pay_date=it.pay_date,
                 address=it.address,
-                card_num=it.card_num or "0000",
+                card_num=it.card_num or CARD_NUM_NO_CARD,
             )
         item_details.append(
             ReceiptItemSchema(
@@ -1492,6 +1517,8 @@ class JudgmentRuleConfigResponse(BaseModel):
     enable_gemini_classifier: bool = Field(..., description="신규 상점 분류 시 Gemini 사용 여부")
     min_amount_stay: int = Field(..., description="STAY 최소 금액")
     min_amount_tour: int = Field(..., description="TOUR 최소 금액")
+    orphan_object_days: int = Field(1, description="고아 객체 유효일(일). MinIO에만 있고 DB에 없는 경우")
+    expired_candidate_days: int = Field(1, description="만료 후보 유효일(일). submission만 있고 receipt_items 없음")
     updated_at: Optional[str] = None
 
 
@@ -1501,6 +1528,8 @@ class JudgmentRuleConfigUpdateRequest(BaseModel):
     enable_gemini_classifier: Optional[bool] = None
     min_amount_stay: Optional[int] = None
     min_amount_tour: Optional[int] = None
+    orphan_object_days: Optional[int] = Field(None, ge=1, le=365, description="고아 객체 유효일(일)")
+    expired_candidate_days: Optional[int] = Field(None, ge=1, le=365, description="만료 후보 유효일(일)")
 
 
 @app.get(
@@ -1517,6 +1546,8 @@ async def get_judgment_rule_config(db: Session = Depends(get_db), actor: str = D
         enable_gemini_classifier=bool(cfg.enable_gemini_classifier),
         min_amount_stay=int(cfg.min_amount_stay or 60000),
         min_amount_tour=int(cfg.min_amount_tour or 50000),
+        orphan_object_days=int(cfg.orphan_object_days if cfg.orphan_object_days is not None else 1),
+        expired_candidate_days=int(cfg.expired_candidate_days if cfg.expired_candidate_days is not None else 1),
         updated_at=cfg.updated_at.isoformat() if cfg.updated_at else None,
     )
 
@@ -1537,11 +1568,12 @@ async def update_judgment_rule_config(
         "enable_gemini_classifier": bool(cfg.enable_gemini_classifier),
         "min_amount_stay": int(cfg.min_amount_stay or 60000),
         "min_amount_tour": int(cfg.min_amount_tour or 50000),
+        "orphan_object_days": int(cfg.orphan_object_days if cfg.orphan_object_days is not None else 1),
+        "expired_candidate_days": int(cfg.expired_candidate_days if cfg.expired_candidate_days is not None else 1),
     }
     if body.unknown_store_policy is not None:
         cfg.unknown_store_policy = _normalize_unknown_store_policy(body.unknown_store_policy)
     if body.auto_register_threshold is not None:
-        # 운영 실수를 막기 위해 0~1 범위로 클램프
         cfg.auto_register_threshold = max(0.0, min(1.0, float(body.auto_register_threshold)))
     if body.enable_gemini_classifier is not None:
         cfg.enable_gemini_classifier = bool(body.enable_gemini_classifier)
@@ -1549,6 +1581,10 @@ async def update_judgment_rule_config(
         cfg.min_amount_stay = max(0, int(body.min_amount_stay))
     if body.min_amount_tour is not None:
         cfg.min_amount_tour = max(0, int(body.min_amount_tour))
+    if body.orphan_object_days is not None:
+        cfg.orphan_object_days = max(1, min(365, int(body.orphan_object_days)))
+    if body.expired_candidate_days is not None:
+        cfg.expired_candidate_days = max(1, min(365, int(body.expired_candidate_days)))
     cfg.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(cfg)
@@ -1558,6 +1594,8 @@ async def update_judgment_rule_config(
         "enable_gemini_classifier": bool(cfg.enable_gemini_classifier),
         "min_amount_stay": int(cfg.min_amount_stay or 60000),
         "min_amount_tour": int(cfg.min_amount_tour or 50000),
+        "orphan_object_days": int(cfg.orphan_object_days if cfg.orphan_object_days is not None else 1),
+        "expired_candidate_days": int(cfg.expired_candidate_days if cfg.expired_candidate_days is not None else 1),
     }
     _audit_log(
         db,
@@ -1575,6 +1613,8 @@ async def update_judgment_rule_config(
         enable_gemini_classifier=bool(cfg.enable_gemini_classifier),
         min_amount_stay=int(cfg.min_amount_stay or 60000),
         min_amount_tour=int(cfg.min_amount_tour or 50000),
+        orphan_object_days=int(cfg.orphan_object_days if cfg.orphan_object_days is not None else 1),
+        expired_candidate_days=int(cfg.expired_candidate_days if cfg.expired_candidate_days is not None else 1),
         updated_at=cfg.updated_at.isoformat() if cfg.updated_at else None,
     )
 
@@ -1876,9 +1916,15 @@ async def admin_get_receipt_images(receiptId: str, db: Session = Depends(get_db)
         key = (it.image_key or "").strip()
         if not key:
             continue
+        params = {"Bucket": S3_BUCKET, "Key": key}
+        # 저장 시 Content-Type이 잘못돼 있어도 브라우저가 이미지로 렌더하도록 응답 타입 지정
+        if key.lower().endswith(".png"):
+            params["ResponseContentType"] = "image/png"
+        elif key.lower().endswith((".jpg", ".jpeg")):
+            params["ResponseContentType"] = "image/jpeg"
         url = s3_client.generate_presigned_url(
             "get_object",
-            Params={"Bucket": S3_BUCKET, "Key": key},
+            Params=params,
             ExpiresIn=600,
         )
         items.append(
@@ -2020,9 +2066,13 @@ async def admin_resend_callback(
 
 
 # 6. Naver 영수증 OCR 연동 (CLOVA Document OCR > 영수증)
-# - 권장: multipart(바이너리) + 리사이징/압축으로 전송량·비용 절감
-MAX_OCR_DIMENSION = 2000
-JPEG_QUALITY = 80
+# - 공식 권장: 장축 1960px 이하, JPEG 품질은 인식률 위해 90 권장 (PROJECT/네이버_CLOVA_OCR_레퍼런스_및_인식률_검토.md)
+MAX_OCR_DIMENSION = int(os.getenv("OCR_MAX_DIMENSION", "1960"))
+OCR_JPEG_QUALITY = int(os.getenv("OCR_JPEG_QUALITY", "90"))
+# 인식률 향상: 저해상도 업스케일(1=활성), 업스케일 적용 한계(이 값 미만이면 장축 1960까지 확대), 작은 이미지 PNG 전송(1=활성)
+OCR_UPSCALE_SMALL = os.getenv("OCR_UPSCALE_SMALL", "0").strip().lower() in ("1", "true", "yes")
+OCR_UPSCALE_MAX_SIDE = int(os.getenv("OCR_UPSCALE_MAX_SIDE", "1200"))
+OCR_SEND_PNG_WHEN_SMALL = os.getenv("OCR_SEND_PNG_WHEN_SMALL", "0").strip().lower() in ("1", "true", "yes")
 
 
 def _get_image_bytes_from_s3(object_key: str) -> Tuple[bytes, str]:
@@ -2037,26 +2087,37 @@ def _resize_and_compress_for_ocr(
     image_bytes: bytes, content_type: str
 ) -> Tuple[bytes, str]:
     """
-    리사이징(가로/세로 최대 2000px) + JPEG 압축(quality 80). 전송량·OCR 비용 절감.
-    실패 시 원본 반환. 반환: (bytes, content_type).
+    리사이징(장축 최대 MAX_OCR_DIMENSION) + 압축. 인식률 향상 옵션:
+    - 저해상도 업스케일(OCR_UPSCALE_SMALL=1): 장축이 OCR_UPSCALE_MAX_SIDE 미만이면 1960까지 확대.
+    - 작은 이미지 PNG 전송(OCR_SEND_PNG_WHEN_SMALL=1): 최종 장축이 작으면 JPEG 대신 PNG로 전송(경계 보존).
     """
     try:
         img = Image.open(io.BytesIO(image_bytes))
-        # EXIF 방향 보정 (촬영 방향 뒤집힘 방지)
         img = ImageOps.exif_transpose(img)
         if img.mode in ("RGBA", "P"):
             img = img.convert("RGB")
         elif img.mode != "RGB":
             img = img.convert("RGB")
-        # 가벼운 대비/선명도 보정으로 OCR 안정성 향상
         img = ImageOps.autocontrast(img, cutoff=1)
         img = ImageEnhance.Sharpness(img).enhance(1.2)
         w, h = img.size
+        long_side = max(w, h)
         if w > MAX_OCR_DIMENSION or h > MAX_OCR_DIMENSION:
             ratio = min(MAX_OCR_DIMENSION / w, MAX_OCR_DIMENSION / h)
             img = img.resize((int(w * ratio), int(h * ratio)), Image.Resampling.LANCZOS)
+        elif OCR_UPSCALE_SMALL and long_side < OCR_UPSCALE_MAX_SIDE and long_side > 0:
+            ratio = MAX_OCR_DIMENSION / long_side
+            nw, nh = int(w * ratio), int(h * ratio)
+            if nw > 0 and nh > 0:
+                img = img.resize((nw, nh), Image.Resampling.LANCZOS)
+        w, h = img.size
+        long_side = max(w, h)
+        use_png = OCR_SEND_PNG_WHEN_SMALL and long_side <= OCR_UPSCALE_MAX_SIDE
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=JPEG_QUALITY, optimize=True)
+        if use_png:
+            img.save(buf, format="PNG", optimize=True)
+            return buf.getvalue(), "image/png"
+        img.save(buf, format="JPEG", quality=OCR_JPEG_QUALITY, optimize=True)
         return buf.getvalue(), "image/jpeg"
     except Exception:
         return image_bytes, content_type
@@ -2118,12 +2179,35 @@ def _normalize_pay_date_canonical(raw: Optional[str]) -> Optional[str]:
         return raw if raw.strip() else None
 
 
+def _validate_naver_ocr_response(ocr_data: Any, receipt_id: str) -> None:
+    """
+    네이버 OCR 응답 검증. 형식 오류 시 ValueError 발생 → 호출부에서 ERROR_OCR 처리.
+    - 200 OK이지만 body에 error 또는 images 누락/비정상 시 분석 불가로 간주.
+    - 영수증 API는 images[].receipt.result 구조; inferResult는 있는 경우만 검사.
+    """
+    if not isinstance(ocr_data, dict):
+        raise ValueError(f"Naver OCR response is not a dict: type={type(ocr_data).__name__}")
+    if ocr_data.get("error"):
+        err = ocr_data["error"]
+        msg = err.get("message", err) if isinstance(err, dict) else str(err)
+        raise ValueError(f"Naver OCR error in response: {msg}")
+    images = ocr_data.get("images")
+    if not isinstance(images, list) or len(images) == 0:
+        raise ValueError("Naver OCR response has no images or empty images array")
+    first = images[0] if isinstance(images[0], dict) else {}
+    infer_result = first.get("inferResult") or first.get("message")
+    if infer_result is not None and isinstance(infer_result, str):
+        if infer_result.upper() not in ("SUCCESS", "SUCCESS_OK"):
+            raise ValueError(f"Naver OCR inferResult not success: {infer_result}")
+
+
 async def _call_naver_ocr_binary(
     image_binary: bytes, receipt_id: str, image_format: str = "jpg"
 ) -> dict:
     """
     CLOVA OCR 영수증 API — multipart/form-data(바이너리) 전송.
     Base64 대비 용량·메모리 효율적이며 네이버 권장 방식.
+    응답 검증 후 반환; 형식 오류 시 ValueError로 호출부에서 ERROR_OCR 처리.
     """
     message = {
         "version": "V2",
@@ -2140,7 +2224,13 @@ async def _call_naver_ocr_binary(
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(NAVER_OCR_URL, headers=headers, files=files)
         response.raise_for_status()
-        return response.json()
+        try:
+            ocr_data = response.json()
+        except Exception as e:
+            logger.warning("Naver OCR response is not JSON: %s", e)
+            raise ValueError(f"Naver OCR response is not valid JSON: {e}") from e
+        _validate_naver_ocr_response(ocr_data, receipt_id)
+        return ocr_data
 
 
 async def _call_naver_ocr_with_retry(
@@ -2245,17 +2335,25 @@ def _extract_business_num(ocr_data: dict) -> Optional[str]:
         return None
 
 
+# 카드번호 구분: 현금=0000, 카드번호 없음/마스킹(****)=1000, 유효한 번호=마지막 4자리
+CARD_NUM_CASH = "0000"
+CARD_NUM_NO_CARD = "1000"
+
+
 def _normalize_card_num(raw: Optional[str]) -> str:
     """
     카드번호 정규화:
     - 숫자 4자리 이상이면 마지막 4자리 저장
-    - 비어 있거나 은행명/문자열 등 카드번호가 아니면 '0000'
+    - 비어 있거나 **** 등 마스킹/미표시면 '1000'(카드번호 없음)
+    - 현금 여부는 _extract_card_num에서 OCR 전체로 판별 → '0000'
     """
     text = (raw or "").strip()
+    if not text or re.match(r"^[\s*\-]+$", text):
+        return CARD_NUM_NO_CARD
     digits = re.sub(r"[^0-9]", "", text)
     if len(digits) >= 4:
         return digits[-4:]
-    return "0000"
+    return CARD_NUM_NO_CARD
 
 
 def _digits_only(raw: Optional[str]) -> str:
@@ -2318,18 +2416,35 @@ def _normalize_address(raw: Optional[str]) -> Optional[str]:
     return s
 
 
+def _is_cash_payment(ocr_data: dict) -> bool:
+    """OCR 결과에서 결제 수단이 현금인지 여부."""
+    try:
+        blob = json.dumps(ocr_data, ensure_ascii=False)
+        return "현금" in blob
+    except Exception:
+        return False
+
+
 def _extract_card_num(ocr_data: dict) -> str:
-    """OCR 결과에서 카드번호(last4)를 추출. 없거나 비정상이면 0000."""
+    """
+    OCR 결과에서 카드번호(last4) 추출.
+    - 결제 수단이 '현금'이면 '0000'
+    - 카드번호 없음/**** 마스킹/미표시면 '1000'
+    - 유효한 숫자 4자리 이상이면 마지막 4자리
+    """
     try:
         images = ocr_data.get("images") or []
         if not images:
-            return "0000"
+            return CARD_NUM_NO_CARD
         result = (images[0].get("receipt") or {}).get("result") or {}
+        if _is_cash_payment(ocr_data):
+            return CARD_NUM_CASH
         card_info = (result.get("paymentInfo") or {}).get("cardInfo") or {}
         card_num_obj = card_info.get("number") or {}
-        return _normalize_card_num(card_num_obj.get("text"))
+        raw_text = card_num_obj.get("text")
+        return _normalize_card_num(raw_text)
     except Exception:
-        return "0000"
+        return CARD_NUM_NO_CARD
 
 
 def _extract_confidence_score(ocr_data: dict) -> Optional[int]:
@@ -2377,8 +2492,29 @@ def _check_duplicate_receipt_item(
 
 # 유흥업소 등 부적격 업태 키워드 (BIZ_008)
 FORBIDDEN_BUSINESS_KEYWORDS = ("단란주점", "유흥주점", "유흥주점영업", "무도장", "사교춤장")
-OCR_CONFIDENCE_THRESHOLD = 90  # >= 90%면 OCR 우선 신뢰
+OCR_CONFIDENCE_THRESHOLD = int(os.getenv("OCR_CONFIDENCE_THRESHOLD", "90"))  # >= 이 값이면 OCR 우선 신뢰(사용자 입력 대체 안 함)
+# 저신뢰도 또는 핵심 필드(상점명·사업자번호·주소) 누락 시 수동 검수(보정) 유도
+OCR_LOW_CONFIDENCE_REVIEW_THRESHOLD = int(os.getenv("OCR_LOW_CONFIDENCE_REVIEW_THRESHOLD", "70"))
+OCR_KEY_FIELDS_MIN_FILLED = int(os.getenv("OCR_KEY_FIELDS_MIN_FILLED", "2"))  # 3개 중 최소 채워져야 하는 개수
 AMOUNT_MISMATCH_RATIO_THRESHOLD = 0.10  # 10% 이상 차이 시 수동 검증 보류
+
+
+def _should_require_manual_review_for_low_quality(
+    store_name: Optional[str],
+    biz_num: Optional[str],
+    address: Optional[str],
+    confidence: Optional[int],
+) -> bool:
+    """
+    상점명·사업자번호·주소 중 충분히 채워지지 않았고, 컨피던스가 낮으면 수동 검수(보정) 대상.
+    반환 True 시 PENDING_VERIFICATION(OCR_004) 처리하여 관리자가 보정할 수 있게 함.
+    """
+    filled = sum(1 for v in (store_name, biz_num, address) if v and str(v).strip())
+    if filled >= OCR_KEY_FIELDS_MIN_FILLED:
+        return False
+    if confidence is not None and confidence >= OCR_LOW_CONFIDENCE_REVIEW_THRESHOLD:
+        return False
+    return True
 
 
 def _ocr_contains_forbidden_business(ocr_data: dict) -> bool:
@@ -2572,6 +2708,7 @@ def _fail_message(code: Optional[str]) -> Optional[str]:
         "OCR_001": "OCR_001 (영수증 판독 불가)",
         "OCR_002": "OCR_002 (결제일 형식 오류)",
         "OCR_003": "OCR_003 (마스터 상호 미등록)",
+        "OCR_004": "OCR_004 (인식 불량·수동 검수 보정)",
         "PENDING_NEW": "PENDING_NEW (신규 상점 검수 대기)",
         "PENDING_VERIFICATION": "PENDING_VERIFICATION (사용자 입력값- OCR 불일치)",
         "UNFIT_CATEGORY": "UNFIT_CATEGORY (제외 업종)",
@@ -2587,7 +2724,7 @@ def _normalize_error_code(code: Optional[str]) -> Optional[str]:
     """에러 문자열에서 표준 코드 토큰 추출."""
     if not code:
         return None
-    m = re.search(
+    m =     re.search(
         r"\b((?:BIZ|OCR)_[0-9]{3}|PENDING_NEW|PENDING_VERIFICATION|UNFIT_CATEGORY|UNFIT_REGION|UNFIT_DATE|UNFIT_DUPLICATE|ERROR_OCR)\b",
         str(code),
     )
@@ -2629,7 +2766,7 @@ def _status_for_code(code: Optional[str]) -> str:
         return "UNFIT_CATEGORY"
     if c == "PENDING_NEW":
         return "PENDING_NEW"
-    if c == "PENDING_VERIFICATION":
+    if c in ("PENDING_VERIFICATION", "OCR_004"):
         return "PENDING_VERIFICATION"
     if c.startswith("BIZ_"):
         return "UNFIT"
@@ -2793,7 +2930,7 @@ async def _run_ocr_for_document(receipt_id: str, image_key: str, doc_type: str) 
         }
     else:
         parsed = _parse_ota_invoice_result(ocr_data)
-        parsed["cardNum"] = "0000"
+        parsed["cardNum"] = CARD_NUM_NO_CARD
         parsed["confidenceScore"] = _extract_confidence_score(ocr_data)
 
     return {
@@ -2805,7 +2942,11 @@ async def _run_ocr_for_document(receipt_id: str, image_key: str, doc_type: str) 
 
 
 async def analyze_receipt_task(req: CompleteRequest):
-    """1:N 구조 기준 OCR 분석: submission(parent) + receipt_items(children) 자산화."""
+    """
+    1:N 구조 기준 OCR 분석: submission(parent) + receipt_items(children) 자산화.
+    receiptId당 1개만 실행되도록 Complete 단계에서 원자적 PENDING→PROCESSING 전환 사용.
+    태스크마다 별도 DB 세션(SessionLocal()) 사용 → 서로 다른 receiptId 간 병렬 처리 시 충돌 없음.
+    """
     db = SessionLocal()
     submission = db.query(Submission).filter(Submission.submission_id == req.receiptId).first()
     if not submission:
@@ -2849,7 +2990,7 @@ async def analyze_receipt_task(req: CompleteRequest):
                         seq_no=idx,
                         doc_type=d.get("docType", "RECEIPT"),
                         image_key=(d.get("imageKey") or "").strip(),
-                        card_num="0000",
+                        card_num=CARD_NUM_NO_CARD,
                         status="PENDING",
                     )
                 )
@@ -3063,6 +3204,12 @@ async def analyze_receipt_task(req: CompleteRequest):
                         if _is_amount_mismatch(user_amt, base_amount):
                             item_fail = "PENDING_VERIFICATION"
 
+                    # 인식 불량(상점명·사업자번호·주소 누락 또는 저신뢰도) → 수동 검수(보정) 유도
+                    if not item_fail and _should_require_manual_review_for_low_quality(
+                        store_name, biz_num, address, confidence
+                    ):
+                        item_fail = "OCR_004"
+
                     if item_fail:
                         mark_item(ri, _status_for_code(item_fail), item_fail)
                         fail_code = item_fail
@@ -3184,6 +3331,12 @@ async def analyze_receipt_task(req: CompleteRequest):
                         )
                         if not ok and c_fail:
                             item_fail = c_fail
+
+                    # 인식 불량(핵심 필드 누락 또는 저신뢰도) → 수동 검수(보정) 유도
+                    if not item_fail:
+                        conf = p.get("confidenceScore") if isinstance(p.get("confidenceScore"), int) else None
+                        if _should_require_manual_review_for_low_quality(store_name, biz_num, address, conf):
+                            item_fail = "OCR_004"
 
                     if item_fail:
                         mark_item(i, _status_for_code(item_fail), item_fail)

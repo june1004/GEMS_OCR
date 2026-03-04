@@ -108,7 +108,7 @@
 | audit_trail | string | 판정 근거 요약 |
 | rewardAmount | int | 10000(TOUR FIT) / 30000(STAY FIT) / 0 |
 | address | string \| null | 가맹점 주소(첫 장 기준) |
-| cardPrefix | string \| null | 카드 앞 4자리 |
+| cardPrefix | string \| null | 카드 앞 4자리. **0000**=현금, **1000**=카드번호 없음/****, 그 외=실제 마지막 4자리 |
 | shouldPoll | boolean | true면 같은 URL로 재호출 권장 |
 | recommendedPollIntervalMs | int \| null | 권장 폴링 간격(ms) |
 | reviewRequired | boolean | 관리자 검토 대기 여부 |
@@ -123,7 +123,7 @@
 | status | string | 해당 장 판정 (FIT / PENDING / UNFIT_* / ERROR_OCR 등) |
 | **error_code** | string \| null | **장별 에러코드** (부적합/오류 시) |
 | **error_message** | string \| null | **에러 메시지(한글)** |
-| extracted_data | object \| null | store_name, amount, pay_date, address, card_num |
+| extracted_data | object \| null | store_name, amount, pay_date, address, card_num(0000=현금, 1000=카드없음, 4자리=실제) |
 | image_url | string | MinIO object key |
 | ocr_raw | object \| null | 원본 OCR JSON (있을 경우) |
 
@@ -179,6 +179,7 @@
 | **OCR_001** | OCR_001 (영수증 판독 불가) | OCR 실패·판독 불가 |
 | **OCR_002** | OCR_002 (결제일 형식 오류) | 결제일 파싱 실패 |
 | **OCR_003** | OCR_003 (마스터 상호 미등록) | 마스터에 없는 상점(내부용, FE에는 PENDING_NEW 등으로 노출) |
+| **OCR_004** | OCR_004 (인식 불량·수동 검수 보정) | 상점명·사업자·주소 등 누락 또는 저신뢰도 → 관리자 검수 후 보정 |
 | **PENDING_NEW** | PENDING_NEW (신규 상점 검수 대기) | 신규 상점으로 관리자 검토 대기 |
 | **PENDING_VERIFICATION** | PENDING_VERIFICATION (사용자 입력값- OCR 불일치) | 금액 등 사용자 입력과 OCR 불일치로 수동 검증 대기 |
 | **UNFIT_CATEGORY** | UNFIT_CATEGORY (제외 업종) | 제외 업종(BIZ_008 등과 동일 의미로 정규화) |

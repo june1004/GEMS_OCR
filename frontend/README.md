@@ -12,9 +12,19 @@ npm run dev
 
 브라우저: http://localhost:5173
 
+**관리자 페이지 (8080 포트)**  
+관리자 전용으로 포트 8080에서 실행할 때:
+
+```bash
+npm run dev:admin
+```
+
+브라우저: http://localhost:8080 → `#admin` 해시로 이동 (예: http://localhost:8080/#admin)  
+운영 서버(예: 169.254.240.5:8080)에서 제공 시, `.env`에 `VITE_API_BASE_URL`을 FastAPI 서버 주소(예: `http://169.254.240.5:8000`)로 설정 후 빌드.
+
 ## 환경 변수
 
-- `VITE_API_BASE_URL`: API 서버 주소 (기본 `http://localhost:8000`)
+- `VITE_API_BASE_URL`: API 서버 주소 (기본 `http://localhost:8000`, 관리자 연동 시 FastAPI 주소)
 - `.env.example`을 복사해 `.env` 생성 후 설정
 
 ## 구조

@@ -1,51 +1,25 @@
 # PROJECT 문서 인덱스
 
-중복 문서를 정리하고, 실제 운영 시 참고할 핵심 문서를 아래로 통합했습니다.
+> **문서 역할 정리·중복 제거** 는 **[문서_정리_통합.md](문서_정리_통합.md)** 에 통합되어 있습니다.  
+> **읽는 순서** 는 **[00_문서_읽는_순서.md](00_문서_읽는_순서.md)** 를 참고하세요.
 
 ---
 
-## 1) FE ↔ BE 연동 (기준 문서)
+## 진입점
 
-- `FE_FASTAPI_API_SPEC.md`  
-  - FE 업로드/complete/status 전체 스펙
-  - 장별 에러코드 표
-  - 폴링 정책
-  - **결과 콜백(BE→FE) 및 FE 스케줄러 복구 정책 포함**
-
-- `FE_FASTAPI_DEVELOPER_GUIDE.md`
-  - FE 개발자가 실제 구현할 때 헷갈리는 포인트 중심(Submission=receiptId, FormData 업로드 대안, documents 구성 규칙, 콜백/복구, 체크리스트)
-
-> 기존 QA/요약 문서는 중복되어 제거하고, 위 문서로 통합했습니다.
+| 목적 | 문서 |
+|------|------|
+| 문서 전체 정리·역할·중복 제거 | [문서_정리_통합.md](문서_정리_통합.md) |
+| 읽는 순서(번호별) | [00_문서_읽는_순서.md](00_문서_읽는_순서.md) |
+| FE 개발사 전달 | [FE_API_규격_문서_외부전달용.md](FE_API_규격_문서_외부전달용.md) |
+| 관리자 추가 개발 | [관리자_페이지_추가_개발_지침.md](관리자_페이지_추가_개발_지침.md) |
 
 ---
 
-## 2) 운영용 요약 (외부 공유용)
+## 분류별 요약
 
-- `FE_API_SPEC_EXTERNAL.md`  
-  - 외부 파트너 공유용 흐름 요약
-- `FE_API_SPEC_ONE_PAGE.md`  
-  - 실무 연동용 1페이지 요약 스펙
-
----
-
-## 3) 판정 규칙/자동 분류 설계
-
-- `JUDGMENT_RULE_SYSTEM_DESIGN.md`  
-  - 판정 규칙 운영 구조(관리자 규칙 API 포함)
-- `ADMIN_PORTAL_GUIDE.md`
-  - 관리자 웹 연동 체크리스트/운영 보강 지침
-- `GEMINI_CLASSIFIER_GUIDE.md`  
-  - 업종 자동 분류의 Gemini 연동 가이드
-
----
-
-## 4) 마이그레이션/운영 가이드
-
-- `DBEAVER_MIGRATION_GUIDE.md`
-- `migrations/*.sql`
-
-### 캠페인(확장)
-
-- 기본 캠페인 테이블/필터: `migrations/campaigns_filtering.sql`
-- 라우팅 확장 컬럼(priority, project_type 등): `migrations/campaigns_routing_ext.sql`
+- **FE 연동**: FE_API_규격_문서_외부전달용, 테스트용_FE_적용_가이드, FE_FASTAPI_DEVELOPER_GUIDE, FE_FASTAPI_API_SPEC (상세는 문서_정리_통합 §2.1).
+- **검수·폼데이터**: 검수_유무_별_프로세스_및_API_정리, FE_폼데이터_요청_응답_및_여러폼데이터_적용_설명, 검수있는구조_API_변경사항_및_FE입력_OCR비교.
+- **관리자·BE·운영**: ADMIN_PORTAL_GUIDE, 관리자_페이지_추가_개발_지침, FE_API_규격_문서(내부), 백엔드_병렬처리_및_OCR-DB_흐름, MinIO-DB_정합성_및_OCR미인식_정책, JUDGMENT_RULE_SYSTEM_DESIGN, GEMINI_CLASSIFIER_GUIDE.
+- **마이그레이션·스크립트**: DBEAVER_MIGRATION_GUIDE, migrations/*.sql, scripts/README.md.
 

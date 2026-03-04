@@ -25,7 +25,6 @@ export function ReceiptCard({
   disabled,
 }: ReceiptCardProps) {
   const meta = { ...emptyMeta, ...entry.metadata };
-  const isComplete = entry.status === "COMPLETE";
   const isError = entry.status === "ERROR";
 
   const handleFile = (e: React.ChangeEvent<HTMLInputElement>) => {

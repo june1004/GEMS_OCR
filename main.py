@@ -93,6 +93,7 @@ class Submission(Base):
     audit_trail = Column(String)
     fail_reason = Column(String)
     audit_log = Column(String)
+    user_input_snapshot = Column(JSONB, nullable=True)  # Complete 시 FE가 보낸 data (방식2: items[])
     created_at = Column(DateTime, default=datetime.utcnow)
     items = relationship("ReceiptItem", back_populates="submission", cascade="all, delete-orphan")
 
@@ -243,6 +244,20 @@ class TourData(BaseModel):
     )
 
 
+class PerDocumentFormData(BaseModel):
+    """장별 사용자 입력 (방식2). documents[i]와 data.items[i] 1:1 대응."""
+    amount: int
+    payDate: str
+    storeName: Optional[str] = None
+    location: Optional[str] = None
+    cardPrefix: Optional[str] = None
+
+
+class DataWithItems(BaseModel):
+    """방식2: 여러 폼데이터. items[]는 documents[]와 동일 순서·길이."""
+    items: List[PerDocumentFormData]
+
+
 class ReceiptMetadata(BaseModel):
     imageKey: str
     docType: Literal["RECEIPT", "OTA_INVOICE"]
@@ -266,18 +281,16 @@ class CompleteRequest(BaseModel):
         "FE 신규 연동에서는 생략 권장(서버가 저장된 campaign_id를 사용).",
         json_schema_extra={"deprecated": True},
     )
-    data: Optional[Union[StayData, TourData]] = Field(
+    data: Optional[Union[StayData, TourData, DataWithItems]] = Field(
         default=None,
-        description="(Legacy) FE 수기 입력 보정용 데이터. documents 방식 사용 시 data는 생략 권장. "
-        "자산화/관리 목적 필드(location 등)는 OCR 인식 결과를 기준으로 저장됩니다.",
-        json_schema_extra={"deprecated": True},
+        description="FE 수기 입력. 방식2: data.items[] (documents와 동일 순서). 레거시: StayData/TourData 단일 객체.",
     )
     documents: Optional[List[ReceiptMetadata]] = None
 
     @model_validator(mode="before")
     @classmethod
     def validate_data_by_type(cls, v):
-        """type에 따라 data를 StayData 또는 TourData로 검증 (밸리데이션 에러 명확화)"""
+        """type에 따라 data를 StayData / TourData / DataWithItems 로 검증."""
         if not isinstance(v, dict) or "type" not in v:
             return v
         t = v.get("type")
@@ -316,7 +329,11 @@ class CompleteRequest(BaseModel):
                     raise ValueError("TOUR supports RECEIPT documents only")
 
         if data is not None and isinstance(data, dict):
-            if t == "STAY":
+            if "items" in data and isinstance(data.get("items"), list):
+                v["data"] = DataWithItems.model_validate(data)
+                if v.get("documents") is not None and len(v["data"].items) != len(v["documents"]):
+                    raise ValueError("data.items length must match documents length")
+            elif t == "STAY":
                 v["data"] = StayData.model_validate(data)
             elif t == "TOUR":
                 v["data"] = TourData.model_validate(data)
@@ -329,15 +346,15 @@ class CompleteRequest(BaseModel):
 
 class CompleteRequestV2(BaseModel):
     """
-    FE 연동 전용: documents-only 요청 모델.
-    - FE는 업로드된 objectKey를 documents로 전달하고, OCR/판정/자산화는 BE가 처리한다.
-    - 레거시 data(수기 보정값)는 v1에서만 지원(Deprecated).
+    FE 연동 전용. documents 필수, data(방식2: items[]) 선택.
+    - data 사용 시 data.items[]는 documents와 동일 순서·길이.
     """
 
     receiptId: str
     userUuid: str
     type: ProjectType
     documents: List[ReceiptMetadata]
+    data: Optional[DataWithItems] = None
 
     @model_validator(mode="before")
     @classmethod
@@ -348,6 +365,7 @@ class CompleteRequestV2(BaseModel):
         if isinstance(t, ProjectType):
             t = t.value
         docs = v.get("documents")
+        data = v.get("data")
         if t not in ("STAY", "TOUR"):
             raise ValueError("type must be STAY or TOUR")
         if not isinstance(docs, list) or len(docs) == 0:
@@ -361,6 +379,13 @@ class CompleteRequestV2(BaseModel):
                 raise ValueError("docType must be RECEIPT or OTA_INVOICE")
             normalized_docs.append(md)
         v["documents"] = normalized_docs
+
+        if data is not None and isinstance(data, dict) and "items" in data:
+            v["data"] = DataWithItems.model_validate(data)
+            if len(v["data"].items) != len(normalized_docs):
+                raise ValueError("data.items length must match documents length")
+        else:
+            v["data"] = None
 
         if t == "STAY":
             receipt_cnt = len([d for d in normalized_docs if d.docType == "RECEIPT"])
@@ -414,9 +439,20 @@ app = FastAPI(
     servers=[{"url": "https://api.nanum.online", "description": "Production"}],
     openapi_tags=OPENAPI_TAGS,
 )
+# CORS: FE/관리자 페이지 오리진 (관리자 페이지 169.254.240.5:8080 포함)
+CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").strip()
+_cors_list = [
+    "http://localhost:5173",
+    "http://localhost:8080",
+    "http://169.254.240.5:8080",
+    "https://easy.gwd.go.kr",
+    "https://api.nanum.online",
+]
+if CORS_ORIGINS:
+    _cors_list = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "https://easy.gwd.go.kr", "https://api.nanum.online"],
+    allow_origins=_cors_list,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -828,6 +864,8 @@ async def _submit_receipt_common(req: CompleteRequest, background_tasks: Backgro
         return {"status": submission.status, "receiptId": req.receiptId}
 
     submission.status = "PROCESSING"
+    if req.data is not None:
+        submission.user_input_snapshot = req.data.model_dump()
     db.commit()
 
     background_tasks.add_task(analyze_receipt_task, req)
@@ -838,14 +876,13 @@ async def _submit_receipt_common(req: CompleteRequest, background_tasks: Backgro
     "/api/v1/receipts/complete",
     response_model=CompleteResponse,
     summary="검증 완료 요청",
-    description="receiptId 기준 1회 호출. documents 배열에 해당 신청의 모든 이미지(imageKey=objectKey, docType) 전달. "
-    "v1 연동은 documents-only로 운영(legacy data는 별도 경로). 분석 완료 시 OCR_RESULT_CALLBACK_URL이 설정된 경우 FE로 결과 POST(재시도 없음).",
+    description="receiptId 기준 1회 호출. documents 필수, data(방식2: items[]) 선택. "
+    "data.items[]는 documents와 동일 순서·길이. 분석 완료 시 OCR_RESULT_CALLBACK_URL이 설정된 경우 FE로 결과 POST(재시도 없음).",
     tags=["FE - Step 3: Complete"],
 )
 async def submit_receipt(req: CompleteRequestV2, background_tasks: BackgroundTasks, db: Session = Depends(get_db)):
     """
-    v1은 FE 연동을 위해 documents-only로 고정한다.
-    - legacy data(수기 보정값)는 혼동을 줄이기 위해 별도 legacy 엔드포인트로 분리(스키마 비노출).
+    FE 연동. documents 필수, data(방식2: items[]) 선택. data 있으면 user_input_snapshot 저장·OCR 비교에 사용.
     """
     v1_req = CompleteRequest(
         receiptId=req.receiptId,
@@ -853,7 +890,7 @@ async def submit_receipt(req: CompleteRequestV2, background_tasks: BackgroundTas
         type=req.type,
         campaignId=None,
         documents=req.documents,
-        data=None,
+        data=req.data,
     )
     return await _submit_receipt_common(v1_req, background_tasks, db)
 
@@ -1801,6 +1838,7 @@ async def admin_get_submission(receiptId: str, db: Session = Depends(get_db), ac
             "fail_reason": submission.fail_reason,
             "audit_trail": submission.audit_trail,
             "created_at": submission.created_at.isoformat() if submission.created_at else None,
+            "user_input_snapshot": getattr(submission, "user_input_snapshot", None),
         },
         statusPayload=status_payload,
     )
@@ -2378,6 +2416,37 @@ def _is_amount_mismatch(user_amount: Optional[int], ocr_amount: Optional[int]) -
     return ratio >= AMOUNT_MISMATCH_RATIO_THRESHOLD
 
 
+def _get_user_input_for_document(
+    data: Optional[Union[StayData, TourData, DataWithItems]], doc_index: int
+) -> Tuple[Optional[int], Optional[str], Optional[str]]:
+    """장 인덱스에 대한 사용자 입력 (amount, pay_date, location). 없으면 (None, None, None)."""
+    if data is None:
+        return None, None, None
+    if isinstance(data, DataWithItems):
+        if doc_index < 0 or doc_index >= len(data.items):
+            return None, None, None
+        it = data.items[doc_index]
+        return it.amount, it.payDate or None, it.location
+    if isinstance(data, StayData) and doc_index == 0:
+        return data.amount, data.payDate or None, data.location
+    if isinstance(data, TourData):
+        return data.amount, data.payDate or None, None
+    return None, None, None
+
+
+def _get_user_total_amount(
+    data: Optional[Union[StayData, TourData, DataWithItems]], doc_count: int
+) -> Optional[int]:
+    """TOUR 시 사용자 입력 합산 금액 (DataWithItems면 items 합산, 아니면 단일 amount)."""
+    if data is None:
+        return None
+    if isinstance(data, DataWithItems):
+        return sum(data.items[i].amount for i in range(min(len(data.items), doc_count)))
+    if isinstance(data, TourData):
+        return data.amount
+    return None
+
+
 def _auto_register_store(
     db: Session,
     submission_id: str,
@@ -2888,10 +2957,11 @@ async def analyze_receipt_task(req: CompleteRequest):
                 confidence = rp.get("confidenceScore") if isinstance(rp.get("confidenceScore"), int) else 0
 
                 # OCR 신뢰도가 낮으면 사용자 입력을 참조값으로 사용 (고신뢰 OCR은 그대로 우선)
-                if confidence < OCR_CONFIDENCE_THRESHOLD and isinstance(req.data, StayData):
-                    amount = req.data.amount
-                    pay_date = req.data.payDate or pay_date
-                    location = req.data.location or location
+                user_amt, user_pd, user_loc = _get_user_input_for_document(req.data, ri)
+                if confidence < OCR_CONFIDENCE_THRESHOLD and user_amt is not None:
+                    amount = user_amt
+                    pay_date = user_pd or pay_date
+                    location = user_loc or location
                     rp["amount"] = amount
                     rp["payDate"] = pay_date
                     rp["location"] = location
@@ -2988,9 +3058,9 @@ async def analyze_receipt_task(req: CompleteRequest):
                             item_fail = c_fail
 
                     # 사용자 입력 대비 OCR 금액 10% 이상 차이 시 수동검증 보류
-                    if not item_fail and isinstance(req.data, StayData):
+                    if not item_fail and user_amt is not None:
                         base_amount = ocr_amount if isinstance(ocr_amount, int) else amount
-                        if _is_amount_mismatch(req.data.amount, base_amount):
+                        if _is_amount_mismatch(user_amt, base_amount):
                             item_fail = "PENDING_VERIFICATION"
 
                     if item_fail:
@@ -3124,7 +3194,8 @@ async def analyze_receipt_task(req: CompleteRequest):
                     amount_parts.append(str(amount))
 
                 total_amount = total
-                if isinstance(req.data, TourData) and _is_amount_mismatch(req.data.amount, total_amount):
+                user_total = _get_user_total_amount(req.data, len(receipt_idx))
+                if user_total is not None and _is_amount_mismatch(user_total, total_amount):
                     for i in receipt_idx:
                         if ocr_assets[i].get("status") == "FIT":
                             mark_item(i, "PENDING_VERIFICATION", "PENDING_VERIFICATION")

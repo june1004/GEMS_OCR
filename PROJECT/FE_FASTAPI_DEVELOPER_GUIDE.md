@@ -44,7 +44,7 @@
 }
 ```
 
-**중요**
+**중요**image.png
 - 첫 이미지에서 받은 `receiptId`를 **신청 ID로 저장**하세요.
 - 추가 이미지 업로드 시엔 `receiptId`를 재사용해야 “1건 신청”으로 묶입니다.
 - `receiptId` 재사용은 **같은 type(STAY↔STAY, TOUR↔TOUR)** 에서만 허용됩니다. 다른 type으로 재사용 시 **409(type mismatch)** 로 차단됩니다.
@@ -97,6 +97,7 @@ Form fields:
 - `data` (레거시): documents 대신 사용할 수 있으나 필수 필드가 많아 운영에선 documents 방식 권장
   - STAY의 `location`은 FE 입력이 없어도 되며(null 허용), 운영/자산화 목적의 location은 OCR 인식 결과를 기준으로 저장됩니다.
   - FE 신규 구현은 `data`를 사용하지 않는 것을 권장합니다. (혼동 방지를 위해 v1 연동은 documents-only로 운영)
+- **data(폼 데이터)를 보낼 때**: BE는 **OCR 데이터를 우선**하여 비교·판정합니다. OCR 신뢰도가 높으면 OCR 값만 사용하고, 낮을 때만 FE 입력(금액·결제일·지역 등)을 참조값으로 사용합니다. FE 입력 금액과 OCR 금액이 10% 이상 차이나면 `PENDING_VERIFICATION`(수동 검증 대기)으로 두어, 관리자가 상세 조회 후 **override** API로 FIT/UNFIT 등 최종 판정(검수 완료)을 내리도록 되어 있습니다.
 
 예시(STAY):
 

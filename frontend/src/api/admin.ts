@@ -205,3 +205,24 @@ export async function adminResendCallback(
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
+
+export type AdminCallbackVerifyResult =
+  | { skipped: true; reason: string }
+  | { receiptId: string; url: string; purpose: string; ok: boolean; status: number; elapsed_ms: number }
+  | { receiptId: string; url: string; purpose: string; ok: false; error: string };
+
+export async function adminVerifyCallback(
+  receiptId: string,
+  auth?: AdminAuth
+): Promise<AdminCallbackVerifyResult> {
+  const r = await fetch(
+    `${API_BASE}/api/v1/admin/submissions/${encodeURIComponent(receiptId)}/callback/verify`,
+    {
+      method: "POST",
+      headers: buildAdminHeaders(auth),
+      body: JSON.stringify({}),
+    }
+  );
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}

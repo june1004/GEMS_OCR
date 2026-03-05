@@ -160,7 +160,7 @@ class AdminAuditLog(Base):
     __tablename__ = "admin_audit_log"
     id = Column(BigInteger, primary_key=True, autoincrement=True)
     actor = Column(String(128))
-    action = Column(String(64), nullable=False)       # RULE_UPDATE | CANDIDATE_APPROVE | SUBMISSION_OVERRIDE | CALLBACK_RESEND
+    action = Column(String(64), nullable=False)       # RULE_UPDATE | CANDIDATE_APPROVE | SUBMISSION_OVERRIDE | CALLBACK_SEND | CALLBACK_RESEND | CALLBACK_VERIFY
     target_type = Column(String(64))                  # judgment_rule_config | unregistered_store | submission
     target_id = Column(String(128))
     before_json = Column(JSONB)
@@ -1158,28 +1158,115 @@ def _build_status_payload(submission: Submission, item_rows: List[Any]) -> Dict[
     return payload
 
 
-async def _send_result_callback(receipt_id: str, payload: Dict[str, Any], target_url: Optional[str] = None) -> None:
-    """분석 완료 시 FE 지정 URL로 결과 POST. 재시도 없음, 실패 시 로그 후 종료."""
+async def _send_result_callback(
+    receipt_id: str,
+    payload: Dict[str, Any],
+    target_url: Optional[str] = None,
+    *,
+    purpose: str = "auto",  # auto | resend
+    actor: str = "system",
+) -> Dict[str, Any]:
+    """분석 완료 시 FE 지정 URL로 결과 POST. 재시도 없음. 성공/실패를 로그 + AdminAuditLog에 기록."""
     url = (target_url or "").strip() if target_url else None
     url = url or OCR_RESULT_CALLBACK_URL
     if not url:
-        return
+        return {"skipped": True, "reason": "OCR_RESULT_CALLBACK_URL is not set"}
     payload_with_id = {
         "schemaVersion": OCR_CALLBACK_SCHEMA_VERSION,
         "receiptId": receipt_id,
         **payload,
     }
     try:
+        started = time.time()
         async with httpx.AsyncClient(timeout=OCR_CALLBACK_TIMEOUT_SEC) as client:
             r = await client.post(
                 url,
                 json=payload_with_id,
                 headers={"Content-Type": "application/json"},
             )
-            if r.status_code >= 400:
-                logger.warning("OCR result callback failed: receiptId=%s status=%s body=%s", receipt_id, r.status_code, r.text[:200])
+            elapsed_ms = int(round((time.time() - started) * 1000.0))
+            ok = r.status_code < 400
+            if ok:
+                logger.info(
+                    "OCR result callback sent: receiptId=%s purpose=%s url=%s status=%s elapsedMs=%s",
+                    receipt_id,
+                    purpose,
+                    url,
+                    r.status_code,
+                    elapsed_ms,
+                )
+            else:
+                logger.warning(
+                    "OCR result callback failed: receiptId=%s purpose=%s url=%s status=%s elapsedMs=%s body=%s",
+                    receipt_id,
+                    purpose,
+                    url,
+                    r.status_code,
+                    elapsed_ms,
+                    (r.text or "")[:200],
+                )
+
+            # 콜백 송출 결과를 DB에 남겨, Coolify/관리자 화면에서 추적 가능하게 한다.
+            try:
+                db2 = SessionLocal()
+                _audit_log(
+                    db2,
+                    actor=actor,
+                    action="CALLBACK_SEND",
+                    target_type="submission",
+                    target_id=receipt_id,
+                    meta={
+                        "purpose": purpose,
+                        "url": url,
+                        "status": int(r.status_code),
+                        "ok": bool(ok),
+                        "elapsed_ms": elapsed_ms,
+                        "response_body": (None if ok else (r.text or "")[:200]),
+                    },
+                )
+                db2.commit()
+            except Exception:
+                pass
+            finally:
+                try:
+                    db2.close()  # type: ignore[name-defined]
+                except Exception:
+                    pass
+            return {
+                "receiptId": receipt_id,
+                "url": url,
+                "purpose": purpose,
+                "ok": bool(ok),
+                "status": int(r.status_code),
+                "elapsed_ms": elapsed_ms,
+            }
     except Exception as e:
-        logger.warning("OCR result callback error (no retry): receiptId=%s err=%s", receipt_id, e)
+        logger.warning(
+            "OCR result callback error (no retry): receiptId=%s purpose=%s url=%s err=%s",
+            receipt_id,
+            purpose,
+            url,
+            e,
+        )
+        try:
+            db2 = SessionLocal()
+            _audit_log(
+                db2,
+                actor=actor,
+                action="CALLBACK_SEND",
+                target_type="submission",
+                target_id=receipt_id,
+                meta={"purpose": purpose, "url": url, "ok": False, "error": str(e)[:200]},
+            )
+            db2.commit()
+        except Exception:
+            pass
+        finally:
+            try:
+                db2.close()  # type: ignore[name-defined]
+            except Exception:
+                pass
+        return {"receiptId": receipt_id, "url": url, "purpose": purpose, "ok": False, "error": str(e)[:200]}
 
 
 @app.get(
@@ -2002,7 +2089,7 @@ async def admin_override_submission(
             .all()
         )
         payload = _build_status_payload(submission, item_rows)
-        await _send_result_callback(rid, payload)
+        await _send_result_callback(rid, payload, purpose="resend", actor=actor)
         _audit_log(
             db,
             actor=actor,
@@ -2052,7 +2139,7 @@ async def admin_resend_callback(
         .all()
     )
     payload = _build_status_payload(submission, item_rows)
-    await _send_result_callback(rid, payload, target_url=body.target_url)
+    await _send_result_callback(rid, payload, target_url=body.target_url, purpose="resend", actor=actor)
     _audit_log(
         db,
         actor=actor,
@@ -2063,6 +2150,79 @@ async def admin_resend_callback(
     )
     db.commit()
     return AdminCallbackResendResponse(receiptId=rid, sent=True)
+
+
+@app.post(
+    "/api/v1/admin/submissions/{receiptId}/callback/verify",
+    summary="콜백 검증(관리자 클릭 시 즉시 송출)",
+    tags=["Admin - Submissions"],
+)
+async def admin_verify_callback(
+    receiptId: str,
+    db: Session = Depends(get_db),
+    actor: str = Depends(require_admin),
+):
+    rid = _sanitize_receipt_id(receiptId)
+    submission = db.query(Submission).filter(Submission.submission_id == rid).first()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    item_rows = (
+        db.query(ReceiptItem)
+        .filter(ReceiptItem.submission_id == rid)
+        .order_by(ReceiptItem.seq_no.asc())
+        .all()
+    )
+    payload = _build_status_payload(submission, item_rows)
+    result = await _send_result_callback(rid, payload, purpose="verify", actor=actor)
+    _audit_log(
+        db,
+        actor=actor,
+        action="CALLBACK_VERIFY",
+        target_type="submission",
+        target_id=rid,
+        meta={"result": result},
+    )
+    db.commit()
+    return result
+
+
+@app.get(
+    "/api/v1/admin/submissions/{receiptId}/callback/logs",
+    summary="콜백 전송 로그 조회(관리자)",
+    tags=["Admin - Submissions"],
+)
+async def admin_get_callback_logs(
+    receiptId: str,
+    limit: int = Query(20, ge=1, le=200),
+    db: Session = Depends(get_db),
+    actor: str = Depends(require_admin),
+):
+    rid = _sanitize_receipt_id(receiptId)
+    rows = (
+        db.query(AdminAuditLog)
+        .filter(
+            AdminAuditLog.target_type == "submission",
+            AdminAuditLog.target_id == rid,
+            AdminAuditLog.action.in_(["CALLBACK_SEND", "CALLBACK_RESEND", "CALLBACK_VERIFY"]),
+        )
+        .order_by(AdminAuditLog.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    _ = actor  # 권한 체크용
+    return {
+        "receiptId": rid,
+        "items": [
+            {
+                "id": int(r.id),
+                "action": r.action,
+                "actor": r.actor,
+                "created_at": r.created_at.isoformat() if r.created_at else None,
+                "meta": r.meta,
+            }
+            for r in rows
+        ],
+    }
 
 
 # 6. Naver 영수증 OCR 연동 (CLOVA Document OCR > 영수증)
@@ -3382,7 +3542,7 @@ async def analyze_receipt_task(req: CompleteRequest):
         submission.audit_trail = submission.audit_log
         db.commit()
         payload = _build_status_payload(submission, item_rows)
-        await _send_result_callback(req.receiptId, payload)
+        await _send_result_callback(req.receiptId, payload, purpose="auto", actor="system")
 
     except Exception as e:
         logger.error("analyze_receipt_task failed: %s", e, exc_info=True)
@@ -3401,6 +3561,6 @@ async def analyze_receipt_task(req: CompleteRequest):
             .all()
         )
         payload = _build_status_payload(submission, item_rows_ex)
-        await _send_result_callback(req.receiptId, payload)
+        await _send_result_callback(req.receiptId, payload, purpose="auto", actor="system")
     finally:
         db.close()

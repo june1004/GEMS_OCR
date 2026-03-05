@@ -4,6 +4,8 @@ import {
   adminGetSubmission,
   adminOverrideSubmission,
   adminResendCallback,
+  adminVerifyCallback,
+  type AdminCallbackVerifyResult,
   type AdminSubmissionListItem,
   type AdminAuth,
 } from "../../api/admin";
@@ -28,6 +30,9 @@ export function AdminSubmissions({ auth }: AdminSubmissionsProps) {
   const [overrideReward, setOverrideReward] = useState<number | "">("");
   const [resendCallbackFlag, setResendCallbackFlag] = useState(true);
   const [submitting, setSubmitting] = useState(false);
+  const [callbackVerifyResult, setCallbackVerifyResult] = useState<AdminCallbackVerifyResult | null>(
+    null
+  );
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -106,6 +111,21 @@ export function AdminSubmissions({ auth }: AdminSubmissionsProps) {
       loadDetail(detailId);
     } catch (e) {
       setError(e instanceof Error ? e.message : "콜백 재전송 실패");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  const handleVerifyCallback = async () => {
+    if (!detailId) return;
+    setSubmitting(true);
+    setError(null);
+    setCallbackVerifyResult(null);
+    try {
+      const res = await adminVerifyCallback(detailId, auth);
+      setCallbackVerifyResult(res);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : "콜백 검증 실패");
     } finally {
       setSubmitting(false);
     }
@@ -294,7 +314,21 @@ export function AdminSubmissions({ auth }: AdminSubmissionsProps) {
                 >
                   콜백만 재전송
                 </button>
+                <button
+                  type="button"
+                  onClick={handleVerifyCallback}
+                  disabled={submitting}
+                  className="min-h-[44px] rounded-lg bg-emerald-600 px-4 py-2 text-sm font-medium text-white hover:bg-emerald-700 disabled:opacity-50"
+                >
+                  콜백 검증(즉시 송출)
+                </button>
               </div>
+              {callbackVerifyResult && (
+                <div className="mt-3 rounded-lg border border-slate-100 bg-slate-50 p-3 text-xs text-slate-700">
+                  <div className="font-medium text-slate-800">콜백 검증 결과</div>
+                  <pre className="mt-2 overflow-auto">{JSON.stringify(callbackVerifyResult, null, 2)}</pre>
+                </div>
+              )}
             </>
           )}
         </div>

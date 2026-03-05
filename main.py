@@ -23,7 +23,7 @@ from store_classifier import (
     is_forbidden as _classifier_is_forbidden,
     AUTO_REGISTER_THRESHOLD as CLASSIFIER_AUTO_THRESHOLD,
 )
-from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends, UploadFile, Header, Query
+from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends, UploadFile, Header, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator, UUID4, ConfigDict
 from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Float, DateTime, JSON, Boolean, ARRAY, ForeignKey, update
@@ -1032,6 +1032,28 @@ def require_admin(
     return (x_admin_actor or "admin").strip() or "admin"
 
 
+def _dict_for_jsonb(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    """JSONB 저장용: date/datetime을 ISO 문자열로 변환해 직렬화 오류 방지."""
+    if d is None:
+        return None
+    out: Dict[str, Any] = {}
+    for k, v in d.items():
+        if v is None:
+            out[k] = None
+        elif hasattr(v, "isoformat"):
+            out[k] = v.isoformat()
+        elif isinstance(v, dict):
+            out[k] = _dict_for_jsonb(v)
+        elif isinstance(v, (list, tuple)):
+            out[k] = [
+                (x.isoformat() if hasattr(x, "isoformat") else _dict_for_jsonb(x) if isinstance(x, dict) else x)
+                for x in v
+            ]
+        else:
+            out[k] = v
+    return out
+
+
 def _audit_log(
     db: Session,
     actor: str,
@@ -1049,9 +1071,9 @@ def _audit_log(
                 action=action,
                 target_type=target_type,
                 target_id=target_id,
-                before_json=before_json,
-                after_json=after_json,
-                meta=meta,
+                before_json=_dict_for_jsonb(before_json),
+                after_json=_dict_for_jsonb(after_json),
+                meta=_dict_for_jsonb(meta),
             )
         )
     except Exception:
@@ -1545,17 +1567,31 @@ async def admin_create_campaign(
     "/api/v1/admin/campaigns/{campaignId}",
     response_model=AdminCampaignItem,
     summary="캠페인 수정(관리자)",
+    description="campaignId는 경로에 숫자로 지정. 요청 본문에 name(필수), active, startDate, endDate, projectType, priority 등 전송.",
     tags=["Admin - Campaigns"],
 )
 async def admin_update_campaign(
     campaignId: int,
-    body: AdminCampaignUpsertRequest,
+    body: AdminCampaignUpsertRequest = Body(
+        ...,
+        example={
+            "name": "캠페인명",
+            "active": True,
+            "targetCityCounty": None,
+            "startDate": None,
+            "endDate": None,
+            "projectType": "STAY",
+            "priority": 100,
+        },
+    ),
     db: Session = Depends(get_db),
     actor: str = Depends(require_admin),
 ):
-    # before snapshot
+    # before snapshot (JSONB 저장용 직렬화 가능 dict로 감사 로그에 전달)
     before_rows = _admin_fetch_campaign_rows(db)
     before = next((r for r in before_rows if int(r.get("campaign_id")) == int(campaignId)), None)
+    if not before:
+        raise HTTPException(status_code=404, detail="Campaign not found")
 
     sd = _parse_date_any(body.startDate)
     ed = _parse_date_any(body.endDate)

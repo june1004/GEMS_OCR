@@ -687,9 +687,9 @@ def _check_db_connection() -> Tuple[bool, Optional[str]]:
         return False, f"DB 오류: {str(e)}"
 
 
-@app.get("/api/health", summary="헬스 체크 (S3·DB 연결 확인)", tags=["Ops"])
+@app.get("/api/health", summary="헬스 체크 (S3·DB·콜백 URL 확인)", tags=["Ops"])
 async def health_check():
-    """S3 버킷 접근 및 DB 연결·테이블 존재 여부를 확인합니다. 배포/프록시에서 사용."""
+    """S3 버킷 접근, DB 연결·테이블 존재 여부, 콜백 URL 적용 여부를 확인합니다. 배포/프록시에서 사용."""
     s3_ok, s3_msg = _check_s3_connection()
     db_ok, db_msg = _check_db_connection()
     ok = s3_ok and db_ok
@@ -700,7 +700,9 @@ async def health_check():
         detail["db"] = db_msg
     if not ok:
         raise HTTPException(status_code=503, detail=detail)
-    return {"status": "ok", "s3": "ok", "db": "ok"}
+    # 콜백 URL 적용 여부만 노출 (URL 값은 보안상 반환하지 않음)
+    ocr_callback_configured = bool(OCR_RESULT_CALLBACK_URL)
+    return {"status": "ok", "s3": "ok", "db": "ok", "ocr_callback_configured": ocr_callback_configured}
 
 
 @app.post(

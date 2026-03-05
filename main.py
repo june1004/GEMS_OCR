@@ -1280,6 +1280,25 @@ async def _send_result_callback(
     "콜백과 동일한 JSON 구조(콜백 시 Body에 receiptId 추가하여 전송).",
     tags=["FE - Step 6: Status"],
 )
+def _safe_process_status(raw: Optional[str]) -> str:
+    """DB 값이 ProcessStatus enum에 없으면 PENDING 반환 (직렬화 500 방지)."""
+    if not raw or not isinstance(raw, str):
+        return "PENDING"
+    s = raw.strip().upper()
+    if s in (e.value for e in ProcessStatus):
+        return s
+    return "PENDING"
+
+
+def _safe_pay_date_str(raw: Any) -> Optional[str]:
+    """날짜/문자열을 응답용 문자열로. None이면 None, date/datetime이면 isoformat."""
+    if raw is None:
+        return None
+    if hasattr(raw, "isoformat"):
+        return raw.isoformat()
+    return str(raw).strip() or None
+
+
 async def get_status(receiptId: str, db: Session = Depends(get_db)):
     """4단계: 최종 결과 조회. receiptId 단위 적합/부적합, DB 기준 최신값 반환."""
     receipt_id = _sanitize_receipt_id(receiptId)
@@ -1308,35 +1327,37 @@ async def get_status(receiptId: str, db: Session = Depends(get_db)):
         if it.status != "ERROR":
             extracted = ExtractedData(
                 store_name=it.store_name,
-                amount=it.amount or 0,
-                pay_date=it.pay_date,
+                amount=int(it.amount) if it.amount is not None else 0,
+                pay_date=_safe_pay_date_str(it.pay_date),
                 address=it.address,
                 card_num=it.card_num or CARD_NUM_NO_CARD,
             )
         item_details.append(
             ReceiptItemSchema(
-                item_id=it.item_id,
-                status=it.status or "PENDING",
+                item_id=str(it.item_id) if it.item_id is not None else "",
+                status=_safe_process_status(it.status),
                 error_code=_normalize_error_code(it.error_code),
                 error_message=it.error_message,
                 extracted_data=extracted,
-                image_url=it.image_key,
+                image_url=(it.image_key or "").strip() or "",
                 ocr_raw=it.ocr_raw,
             )
         )
+    sub_status = _safe_process_status(submission.status)
     should_poll, poll_interval_ms, review_required, status_stage = _polling_hint_by_status(submission.status)
+    total = submission.total_amount if submission.total_amount is not None else 0
     return StatusResponse(
         submission_id=submission.submission_id,
-        project_type=submission.project_type,
-        overall_status=submission.status,
-        total_amount=submission.total_amount,
+        project_type=submission.project_type or "STAY",
+        overall_status=sub_status,
+        total_amount=total,
         global_fail_reason=submission.global_fail_reason or submission.fail_reason,
         items=item_details,
         audit_trail=(submission.audit_trail or submission.audit_log or ""),
-        status=submission.status,
-        amount=submission.total_amount,
+        status=sub_status,
+        amount=total,
         failReason=submission.fail_reason,
-        rewardAmount=30000 if submission.project_type == "STAY" and submission.status == "FIT" else 10000 if submission.status == "FIT" else 0,
+        rewardAmount=30000 if submission.project_type == "STAY" and sub_status == "FIT" else 10000 if sub_status == "FIT" else 0,
         address=address,
         cardPrefix=card_prefix,
         shouldPoll=should_poll,
@@ -2121,8 +2142,10 @@ class AdminCallbackResendResponse(BaseModel):
 @app.post(
     "/api/v1/admin/submissions/{receiptId}/callback/resend",
     response_model=AdminCallbackResendResponse,
+    responses={404: {"description": "Submission not found"}},
     summary="콜백 재전송(관리자)",
-    tags=["Admin - Submissions"],
+    description="OCR 결과를 지정 URL(또는 환경변수 OCR_RESULT_CALLBACK_URL)로 재전송. 관리자 검수 완료 후 FE에 결과를 다시 보낼 때 사용.",
+    tags=["Admin - Callback"],
 )
 async def admin_resend_callback(
     receiptId: str,
@@ -2156,8 +2179,10 @@ async def admin_resend_callback(
 
 @app.post(
     "/api/v1/admin/submissions/{receiptId}/callback/verify",
-    summary="콜백 검증(관리자 클릭 시 즉시 송출)",
-    tags=["Admin - Submissions"],
+    responses={404: {"description": "Submission not found"}},
+    summary="콜백 검증(즉시 송출)",
+    description="현재 DB 기준 상태를 콜백 URL로 즉시 전송하고, 전송 결과(성공/실패/스킵)를 응답으로 반환. 콜백 URL 설정 여부 확인 및 수동 재전송 테스트용.",
+    tags=["Admin - Callback"],
 )
 async def admin_verify_callback(
     receiptId: str,
@@ -2190,8 +2215,10 @@ async def admin_verify_callback(
 
 @app.get(
     "/api/v1/admin/submissions/{receiptId}/callback/logs",
-    summary="콜백 전송 로그 조회(관리자)",
-    tags=["Admin - Submissions"],
+    responses={404: {"description": "Submission not found"}},
+    summary="콜백 전송 로그 조회",
+    description="해당 receiptId에 대한 콜백 전송/재전송/검증 시도 이력을 조회. CALLBACK_SEND, CALLBACK_RESEND, CALLBACK_VERIFY 액션만 포함.",
+    tags=["Admin - Callback"],
 )
 async def admin_get_callback_logs(
     receiptId: str,

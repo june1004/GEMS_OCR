@@ -1271,15 +1271,6 @@ async def _send_result_callback(
         return {"receiptId": receipt_id, "url": url, "purpose": purpose, "ok": False, "error": str(e)[:200]}
 
 
-@app.get(
-    "/api/v1/receipts/{receiptId}/status",
-    response_model=StatusResponse,
-    responses={404: {"description": "Receipt not found"}},
-    summary="결과 조회(폴링/스케줄러 복구)",
-    description="receiptId 단위 최종 판정. 동일 receiptId에 대해 언제든 반복 호출 가능(FE 스케줄러 누락 복구용). "
-    "콜백과 동일한 JSON 구조(콜백 시 Body에 receiptId 추가하여 전송).",
-    tags=["FE - Step 6: Status"],
-)
 def _safe_process_status(raw: Optional[str]) -> str:
     """DB 값이 ProcessStatus enum에 없으면 PENDING 반환 (직렬화 500 방지)."""
     if not raw or not isinstance(raw, str):
@@ -1299,6 +1290,15 @@ def _safe_pay_date_str(raw: Any) -> Optional[str]:
     return str(raw).strip() or None
 
 
+@app.get(
+    "/api/v1/receipts/{receiptId}/status",
+    response_model=StatusResponse,
+    responses={404: {"description": "Receipt not found"}},
+    summary="결과 조회(폴링/스케줄러 복구)",
+    description="receiptId 단위 최종 판정. 동일 receiptId에 대해 언제든 반복 호출 가능(FE 스케줄러 누락 복구용). "
+    "콜백과 동일한 JSON 구조(콜백 시 Body에 receiptId 추가하여 전송).",
+    tags=["FE - Step 6: Status"],
+)
 async def get_status(receiptId: str, db: Session = Depends(get_db)):
     """4단계: 최종 결과 조회. receiptId 단위 적합/부적합, DB 기준 최신값 반환."""
     receipt_id = _sanitize_receipt_id(receiptId)

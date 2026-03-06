@@ -438,9 +438,8 @@ OPENAPI_TAGS = [
     {"name": "Admin - Submissions", "description": "신청 검색/상세/override/콜백 재전송(관리자)"},
     {"name": "Admin - Campaigns", "description": "캠페인 운영(관리자, 확장)"},
     {"name": "Admin - Callback", "description": "콜백 검증/재전송/로그(관리자)"},
-    {"name": "Admin - Regions", "description": "행정구역(시도/시군구) 목록(관리자)"},
+    {"name": "Admin - Regions", "description": "행정구역(시도/시군구) 목록·행정지도 SVG URL(관리자)"},
     {"name": "Admin - Stats", "description": "행정구역별 집계/통계(관리자)"},
-    {"name": "Admin - Maps", "description": "행정지도 SVG URL(statgarten/maps, SGIS 기반)(관리자)"},
     {"name": "Admin - Jobs", "description": "운영 잡(VERIFYING 타임아웃 처리 등, 관리자/배치)"},
     {"name": "Ops", "description": "헬스 체크 등 운영용 엔드포인트"},
 ]
@@ -2122,7 +2121,7 @@ class AdminMapSvgUrlResponse(BaseModel):
         "- level=sido: 전국 시도 경계 지도\n"
         "- level=sigungu&sido={code}: 해당 시도의 시군구 경계 지도"
     ),
-    tags=["Admin - Maps"],
+    tags=["Admin - Regions"],
 )
 async def admin_maps_svg_url(
     level: str = Query(..., description="sido(전국 시도) | sigungu(시군구)"),

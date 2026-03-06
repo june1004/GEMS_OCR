@@ -440,6 +440,7 @@ OPENAPI_TAGS = [
     {"name": "Admin - Callback", "description": "콜백 검증/재전송/로그(관리자)"},
     {"name": "Admin - Regions", "description": "행정구역(시도/시군구) 목록(관리자)"},
     {"name": "Admin - Stats", "description": "행정구역별 집계/통계(관리자)"},
+    {"name": "Admin - Maps", "description": "행정지도 SVG URL(statgarten/maps, SGIS 기반)(관리자)"},
     {"name": "Admin - Jobs", "description": "운영 잡(VERIFYING 타임아웃 처리 등, 관리자/배치)"},
     {"name": "Ops", "description": "헬스 체크 등 운영용 엔드포인트"},
 ]
@@ -2077,6 +2078,84 @@ async def admin_list_sigungu(
     return AdminSigunguListResponse(sidoCode=str(sido_code), sidoName=sido_name, items=items)
 
 
+# 행정지도 SVG: statgarten/maps (SGIS 통계청 API 기반) raw GitHub URL
+STATGARTEN_MAPS_BASE = "https://raw.githubusercontent.com/statgarten/maps/main/svg"
+
+
+def _get_statgarten_svg_url(level: str, sido_code: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """
+    level=sido → 전국 시도 경계 SVG URL
+    level=sigungu, sido_code=42 → 해당 시도 시군구 경계 SVG URL
+    반환: (url, sido_name). 없으면 (None, None).
+    """
+    data = _load_regions_data()
+    statgarten = (data or {}).get("statgarten_svg") or {}
+    if level == "sido":
+        filename = statgarten.get("sido") or "전국_시도_경계.svg"
+        return (f"{STATGARTEN_MAPS_BASE}/{filename}", None)
+    if level == "sigungu" and sido_code:
+        filename = statgarten.get(str(sido_code).strip())
+        if not filename:
+            return (None, None)
+        for it in (data.get("sido") or []):
+            if str(it.get("code") or "").strip() == str(sido_code).strip():
+                return (f"{STATGARTEN_MAPS_BASE}/{filename}", str(it.get("name") or "").strip())
+        return (f"{STATGARTEN_MAPS_BASE}/{filename}", None)
+    return (None, None)
+
+
+class AdminMapSvgUrlResponse(BaseModel):
+    url: str = Field(..., description="SVG 직접 로드 URL (img src 또는 object data)")
+    source: str = Field(default="statgarten/maps (SGIS)", description="출처")
+    level: str = Field(..., description="sido | sigungu")
+    sidoCode: Optional[str] = None
+    sidoName: Optional[str] = None
+
+
+@app.get(
+    "/api/v1/admin/maps/svg/url",
+    response_model=AdminMapSvgUrlResponse,
+    summary="행정지도 SVG URL 조회",
+    description=(
+        "관리자 페이지에서 행정지도 SVG를 표시할 때 사용할 URL을 반환. "
+        "데이터 출처: [statgarten/maps](https://github.com/statgarten/maps) (통계청 SGIS API 기반).\n"
+        "- level=sido: 전국 시도 경계 지도\n"
+        "- level=sigungu&sido={code}: 해당 시도의 시군구 경계 지도"
+    ),
+    tags=["Admin - Maps"],
+)
+async def admin_maps_svg_url(
+    level: str = Query(..., description="sido(전국 시도) | sigungu(시군구)"),
+    sido: Optional[str] = Query(None, description="시도 코드(예: 42). level=sigungu 일 때 필수"),
+    db: Session = Depends(get_db),
+    actor: str = Depends(require_admin),
+):
+    _ = db
+    _ = actor
+    level = (level or "").strip().lower()
+    if level not in ("sido", "sigungu"):
+        raise HTTPException(status_code=400, detail="level must be 'sido' or 'sigungu'")
+    sido_code = (sido or "").strip() or None
+    if level == "sigungu" and not sido_code:
+        raise HTTPException(status_code=400, detail="sido required when level=sigungu")
+    data = _load_regions_data()
+    if level == "sigungu" and re.fullmatch(r"\d+", str(sido_code)) is None:
+        alias_map = _build_sido_alias_map(data)
+        mapped = _normalize_sido_from_raw(sido_code, alias_map)
+        if mapped:
+            sido_code = mapped["code"]
+    url, sido_name = _get_statgarten_svg_url(level, sido_code)
+    if not url:
+        raise HTTPException(status_code=404, detail="Map SVG not found for given level/sido")
+    return AdminMapSvgUrlResponse(
+        url=url,
+        source="statgarten/maps (SGIS)",
+        level=level,
+        sidoCode=sido_code,
+        sidoName=sido_name,
+    )
+
+
 class AdminRegionStatsItem(BaseModel):
     regionCode: Optional[str] = None
     regionName: str
@@ -2107,8 +2186,10 @@ class AdminRegionStatsResponse(BaseModel):
 async def admin_stats_by_region(
     sido: Optional[str] = Query(None, description="시도 코드 또는 이름"),
     sigungu: Optional[str] = Query(None, description="시군구 코드 또는 이름"),
-    dateFrom: Optional[str] = Query(None, description="기간 시작(YYYY-MM-DD 등 파서 허용)"),
-    dateTo: Optional[str] = Query(None, description="기간 끝(YYYY-MM-DD 등 파서 허용)"),
+    dateFrom: Optional[str] = Query(None, description="기간 시작(YYYY-MM-DD). from 과 동일."),
+    dateTo: Optional[str] = Query(None, description="기간 끝(YYYY-MM-DD). to 와 동일."),
+    from_: Optional[str] = Query(None, alias="from", description="기간 시작(YYYY-MM-DD 등). 관리자 페이지 권장."),
+    to: Optional[str] = Query(None, description="기간 끝(YYYY-MM-DD 등). 관리자 페이지 권장."),
     projectType: Optional[str] = Query(None, description="STAY | TOUR"),
     db: Session = Depends(get_db),
     actor: str = Depends(require_admin),
@@ -2120,16 +2201,20 @@ async def admin_stats_by_region(
 
     dt_from = None
     dt_to = None
-    if dateFrom:
-        try:
-            dt_from = dateutil_parser.parse(dateFrom)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid dateFrom")
-    if dateTo:
-        try:
-            dt_to = dateutil_parser.parse(dateTo)
-        except Exception:
-            raise HTTPException(status_code=400, detail="Invalid dateTo")
+    for raw in (dateFrom, from_):
+        if raw:
+            try:
+                dt_from = dateutil_parser.parse(raw)
+                break
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid dateFrom/from")
+    for raw in (dateTo, to):
+        if raw:
+            try:
+                dt_to = dateutil_parser.parse(raw)
+                break
+            except Exception:
+                raise HTTPException(status_code=400, detail="Invalid dateTo/to")
 
     # 파라미터 정규화
     sido_code = None
@@ -2283,6 +2368,8 @@ async def admin_stats_by_region(
         "sidoCode": sido_code,
         "sigungu": sigungu_name or sigungu,
         "sigunguCode": sigungu_code,
+        "from": dt_from.isoformat() if dt_from else None,
+        "to": dt_to.isoformat() if dt_to else None,
         "dateFrom": dt_from.isoformat() if dt_from else None,
         "dateTo": dt_to.isoformat() if dt_to else None,
         "projectType": projectType.strip().upper() if projectType else None,

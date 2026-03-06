@@ -187,7 +187,7 @@
 |------|------|
 | **Method** | `GET` |
 | **Path** | `/api/v1/admin/stats/by-region` |
-| **Query** | `sido`(선택), `sigungu`(선택), `dateFrom`(선택), `dateTo`(선택), `projectType`(선택: STAY/TOUR) |
+| **Query** | `sido`(선택), `sigungu`(선택), `from`/`to`(선택, 기간. `dateFrom`/`dateTo` 와 동일), `projectType`(선택: STAY/TOUR) |
 | **Response** | `{ \"level\": \"SIDO|SIGUNGU|SINGLE\", \"scope\": { ... }, \"items\": [ { \"regionCode\", \"regionName\", \"submissionCount\", \"fitCount\", \"totalAmount\" } ] }` |
 | **집계 기준** | submission 당 **첫 장(seq_no=1)** 의 `address/location` 기반(대표 지역) |
 
@@ -196,6 +196,20 @@
 - 파라미터가 없으면: **시도별 집계** (`level=SIDO`)
 - `sido`만 주면: 해당 시도의 **시군구별 집계** (`level=SIGUNGU`)
 - `sigungu`를 주면: 해당 시군구 **단일 집계** (`level=SINGLE`)
+
+---
+
+### 3.11 행정지도 SVG URL (statgarten/maps, SGIS)
+
+관리자 페이지에서 **행정경계 지도**를 표시할 때 사용하는 SVG URL을 반환합니다. 출처: [statgarten/maps](https://github.com/statgarten/maps)(통계청 SGIS 기반).
+
+| 항목 | 내용 |
+|------|------|
+| **Method** | `GET` |
+| **Path** | `/api/v1/admin/maps/svg/url` |
+| **Query** | `level` = `sido`(전국 시도) \| `sigungu`(시군구). `level=sigungu` 시 `sido` = 시도 코드(또는 이름) 필수. |
+| **Response** | `{ "url": "https://raw.githubusercontent.com/...", "source": "statgarten/maps (SGIS)", "level", "sidoCode", "sidoName" }` |
+| **FE 표시** | 응답 `url`을 `<img src={url}>` 또는 `<object data={url} type="image/svg+xml">` 로 사용. |
 
 ---
 

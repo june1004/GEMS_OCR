@@ -49,8 +49,10 @@ def main():
                 use_cli_days = True
             except ValueError:
                 pass
+    orphan_minutes = orphan_days * 24 * 60
+    expired_minutes = expired_days * 24 * 60
     if not use_cli_days:
-        # DB에서 관리자 설정값 읽기 (기본 1일)
+        # DB에서 관리자 설정값 읽기. 분 단위 우선, 없으면 일 단위
         DATABASE_URL = os.getenv("DATABASE_URL")
         if DATABASE_URL:
             if DATABASE_URL.startswith("postgres://"):
@@ -61,15 +63,26 @@ def main():
                 from sqlalchemy import create_engine, text
                 engine = create_engine(DATABASE_URL)
                 with engine.connect() as conn:
-                    row = conn.execute(
-                        text("SELECT orphan_object_days, expired_candidate_days FROM judgment_rule_config WHERE id = 1")
-                    ).fetchone()
-                if row:
-                    orphan_days = max(1, int(row[0] or 1))
-                    expired_days = max(1, int(row[1] or 1))
+                    try:
+                        row = conn.execute(
+                            text("""
+                                SELECT COALESCE(orphan_object_minutes, orphan_object_days * 1440),
+                                       COALESCE(expired_candidate_minutes, expired_candidate_days * 1440)
+                                FROM judgment_rule_config WHERE id = 1
+                            """)
+                        ).fetchone()
+                    except Exception:
+                        row = conn.execute(
+                            text("SELECT orphan_object_days, expired_candidate_days FROM judgment_rule_config WHERE id = 1")
+                        ).fetchone()
+                        if row:
+                            row = (int(row[0] or 1) * 1440, int(row[1] or 1) * 1440)
+                    if row:
+                        orphan_minutes = max(1, int(row[0] or 1440))
+                        expired_minutes = max(1, int(row[1] or 1440))
             except Exception:
                 pass
-    days = expired_days  # 만료 후보 기준일(보고용)
+    days = expired_minutes / (24 * 60)  # 만료 후보 기준(보고용, 일 단위 표시)
 
     if not all([S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY]):
         print("❌ S3_ENDPOINT, S3_ACCESS_KEY, S3_SECRET_KEY 설정 필요")
@@ -116,8 +129,8 @@ def main():
 
     engine = create_engine(DATABASE_URL)
     sids = list(keys_by_sid.keys())
-    cutoff_expired = (datetime.now(timezone.utc) - timedelta(days=expired_days)).replace(tzinfo=None)
-    cutoff_orphan = (datetime.now(timezone.utc) - timedelta(days=orphan_days)).replace(tzinfo=None)
+    cutoff_expired = (datetime.now(timezone.utc) - timedelta(minutes=expired_minutes)).replace(tzinfo=None)
+    cutoff_orphan = (datetime.now(timezone.utc) - timedelta(minutes=orphan_minutes)).replace(tzinfo=None)
 
     # submission 존재 여부, created_at, status, receipt_items 개수
     db_info = {}
@@ -160,7 +173,7 @@ def main():
             completed_or_has_items.append((sid, objs, info))
 
     # 4) 보고
-    print(f"=== MinIO–DB 정합성 (고아 객체 유효일 {orphan_days}일, 만료 후보 유효일 {expired_days}일, 삭제={'예' if do_delete else '아니오(dry-run)'}) ===\n")
+    print(f"=== MinIO–DB 정합성 (고아 객체 유효 {orphan_minutes}분, 만료 후보 유효 {expired_minutes}분, 삭제={'예' if do_delete else '아니오(dry-run)'}) ===\n")
     print(f"MinIO 객체 수: {sum(len(v) for v in keys_by_sid.values())} (submission_id 수: {len(keys_by_sid)})\n")
 
     if only_minio:

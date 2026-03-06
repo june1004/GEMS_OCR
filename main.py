@@ -11,11 +11,11 @@ import httpx
 import boto3
 from PIL import Image, ImageOps, ImageEnhance
 from botocore.exceptions import ClientError, BotoCoreError
-from datetime import datetime, date
+from datetime import datetime, date, timedelta, timezone
 from typing import Any, Dict, List, Optional, Union, Tuple, Literal
 from dotenv import load_dotenv
 from dateutil import parser as dateutil_parser
-from sqlalchemy import text as sql_text
+from sqlalchemy import text as sql_text, func
 
 from processor import validate_and_match, validate_campaign_rules, match_store_in_master
 from store_classifier import (
@@ -95,6 +95,7 @@ class Submission(Base):
     audit_log = Column(String)
     user_input_snapshot = Column(JSONB, nullable=True)  # Complete 시 FE가 보낸 data (방식2: items[])
     created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)  # VERIFYING 타임아웃 등 판단용
     items = relationship("ReceiptItem", back_populates="submission", cascade="all, delete-orphan")
 
 
@@ -145,14 +146,18 @@ class UnregisteredStore(Base):
 class JudgmentRuleConfig(Base):
     __tablename__ = "judgment_rule_config"
     id = Column(Integer, primary_key=True, default=1)
-    unknown_store_policy = Column(String(32), default="AUTO_REGISTER")  # AUTO_REGISTER | PENDING_NEW
+    unknown_store_policy = Column(String(32), default="AUTO_REGISTER")  # 기본: 자동 상점추가(데이터 자산화). PENDING_NEW=검수 대기
     auto_register_threshold = Column(Float, default=0.90)  # 0.0 ~ 1.0
     enable_gemini_classifier = Column(Boolean, default=True)
     min_amount_stay = Column(Integer, default=60000)
     min_amount_tour = Column(Integer, default=50000)
-    # MinIO–DB 정합: 고아 객체/만료 후보 유효일(일). 관리자 설정, 기본 1일
-    orphan_object_days = Column(Integer, default=1)       # MinIO에만 있고 DB에 없는 객체
-    expired_candidate_days = Column(Integer, default=1)   # DB에 submission만 있고 receipt_items 없음
+    # MinIO–DB 정합: 고아 객체/만료 후보 유효기간. 분 단위 우선, 없으면 일 단위 사용
+    orphan_object_days = Column(Integer, default=1)       # 하위 호환
+    expired_candidate_days = Column(Integer, default=1)   # 하위 호환
+    orphan_object_minutes = Column(Integer, default=1440)   # 1440 = 1일. NULL이면 orphan_object_days*1440
+    expired_candidate_minutes = Column(Integer, default=1440)
+    verifying_timeout_minutes = Column(Integer, default=0)   # 0 = 비활성. VERIFYING 대기 허용(분)
+    verifying_timeout_action = Column(String(16), default="UNFIT")  # UNFIT | ERROR
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -1010,12 +1015,32 @@ def _get_judgment_rule_config(db: Session) -> JudgmentRuleConfig:
         min_amount_tour=50000,
         orphan_object_days=1,
         expired_candidate_days=1,
+        orphan_object_minutes=1440,
+        expired_candidate_minutes=1440,
+        verifying_timeout_minutes=0,
+        verifying_timeout_action="UNFIT",
         updated_at=datetime.utcnow(),
     )
     db.add(cfg)
     db.commit()
     db.refresh(cfg)
     return cfg
+
+
+def _cfg_orphan_minutes(cfg: JudgmentRuleConfig) -> int:
+    """고아 객체 유효기간(분). 분 컬럼 우선, 없으면 일*1440."""
+    m = getattr(cfg, "orphan_object_minutes", None)
+    if m is not None and m > 0:
+        return int(m)
+    return (getattr(cfg, "orphan_object_days", None) or 1) * 1440
+
+
+def _cfg_expired_minutes(cfg: JudgmentRuleConfig) -> int:
+    """만료 후보 유효기간(분). 분 컬럼 우선, 없으면 일*1440."""
+    m = getattr(cfg, "expired_candidate_minutes", None)
+    if m is not None and m > 0:
+        return int(m)
+    return (getattr(cfg, "expired_candidate_days", None) or 1) * 1440
 
 
 def require_admin(
@@ -1291,6 +1316,53 @@ async def _send_result_callback(
             except Exception:
                 pass
         return {"receiptId": receipt_id, "url": url, "purpose": purpose, "ok": False, "error": str(e)[:200]}
+
+
+async def _process_verifying_timeout_run(db: Session, actor: str = "system") -> Tuple[int, List[str]]:
+    """
+    VERIFYING/PENDING_VERIFICATION 상태로 설정된 지 verifying_timeout_minutes를 초과한 건을
+    UNFIT 또는 ERROR로 변경하고 FE 콜백 URL로 전송. 기관 정책(판정 규칙)에 따라 동작.
+    """
+    cfg = _get_judgment_rule_config(db)
+    timeout_min = int(getattr(cfg, "verifying_timeout_minutes", None) or 0)
+    if timeout_min <= 0:
+        return 0, []
+    action = (getattr(cfg, "verifying_timeout_action", None) or "UNFIT").strip().upper()
+    if action not in ("UNFIT", "ERROR"):
+        action = "UNFIT"
+    cutoff_naive = datetime.utcnow() - timedelta(minutes=timeout_min)
+    overdue = (
+        db.query(Submission)
+        .filter(
+            Submission.status.in_(["VERIFYING", "PENDING_VERIFICATION"]),
+            func.coalesce(Submission.updated_at, Submission.created_at) < cutoff_naive,
+        )
+        .all()
+    )
+    if not overdue:
+        return 0, []
+    processed: List[str] = []
+    reason = "VERIFYING_TIMEOUT (대기 시간 초과)"
+    for sub in overdue:
+        try:
+            sub.status = action
+            sub.fail_reason = reason
+            sub.global_fail_reason = reason
+            sub.updated_at = datetime.utcnow()
+            db.commit()
+            item_rows = (
+                db.query(ReceiptItem)
+                .filter(ReceiptItem.submission_id == sub.submission_id)
+                .order_by(ReceiptItem.seq_no.asc())
+                .all()
+            )
+            payload = _build_status_payload(sub, item_rows)
+            await _send_result_callback(sub.submission_id, payload, purpose="verifying_timeout", actor=actor)
+            processed.append(sub.submission_id)
+        except Exception as e:
+            logger.warning("verifying_timeout process failed for %s: %s", sub.submission_id, e)
+            db.rollback()
+    return len(processed), processed
 
 
 def _safe_process_status(raw: Optional[str]) -> str:
@@ -1657,25 +1729,51 @@ async def admin_update_campaign(
 
 
 # 5-1. 판정 규칙 관리 API (관리자)
+ValidityUnit = Literal["days", "hours", "minutes"]
+VERIFYING_TIMEOUT_ACTION = Literal["UNFIT", "ERROR"]
+MAX_VALIDITY_MINUTES = 365 * 24 * 60  # 525600
+
+
+def _minutes_from_value_unit(value: int, unit: str) -> int:
+    """value + unit( days | hours | minutes ) → 분."""
+    if unit == "days":
+        return value * 24 * 60
+    if unit == "hours":
+        return value * 60
+    return value  # minutes
+
+
 class JudgmentRuleConfigResponse(BaseModel):
-    unknown_store_policy: str = Field(..., description="AUTO_REGISTER | PENDING_NEW")
+    unknown_store_policy: str = Field(..., description="AUTO_REGISTER(기본, 자동 상점추가·데이터 자산화) | PENDING_NEW(신규상점 검수 대기)")
     auto_register_threshold: float = Field(..., description="0.0~1.0")
     enable_gemini_classifier: bool = Field(..., description="신규 상점 분류 시 Gemini 사용 여부")
     min_amount_stay: int = Field(..., description="STAY 최소 금액")
     min_amount_tour: int = Field(..., description="TOUR 최소 금액")
-    orphan_object_days: int = Field(1, description="고아 객체 유효일(일). MinIO에만 있고 DB에 없는 경우")
-    expired_candidate_days: int = Field(1, description="만료 후보 유효일(일). submission만 있고 receipt_items 없음")
+    orphan_object_days: int = Field(1, description="고아 객체 유효(일). 하위호환, orphan_object_minutes/1440")
+    expired_candidate_days: int = Field(1, description="만료 후보 유효(일). 하위호환")
+    orphan_object_minutes: int = Field(1440, description="고아 객체 유효기간(분). 일/시간/분 단위 설정 가능")
+    expired_candidate_minutes: int = Field(1440, description="만료 후보 유효기간(분)")
+    verifying_timeout_minutes: int = Field(0, description="VERIFYING 대기 허용(분). 0=비활성, 초과 시 action 적용 후 콜백")
+    verifying_timeout_action: str = Field("UNFIT", description="대기 초과 시 적용: UNFIT | ERROR")
     updated_at: Optional[str] = None
 
 
 class JudgmentRuleConfigUpdateRequest(BaseModel):
-    unknown_store_policy: Optional[str] = Field(None, description="AUTO_REGISTER | PENDING_NEW")
+    unknown_store_policy: Optional[str] = Field(None, description="AUTO_REGISTER(기본) | PENDING_NEW")
     auto_register_threshold: Optional[float] = Field(None, description="0.0~1.0")
     enable_gemini_classifier: Optional[bool] = None
     min_amount_stay: Optional[int] = None
     min_amount_tour: Optional[int] = None
-    orphan_object_days: Optional[int] = Field(None, ge=1, le=365, description="고아 객체 유효일(일)")
-    expired_candidate_days: Optional[int] = Field(None, ge=1, le=365, description="만료 후보 유효일(일)")
+    orphan_object_days: Optional[int] = Field(None, ge=1, le=365, description="고아 객체 유효(일). 하위호환")
+    expired_candidate_days: Optional[int] = Field(None, ge=1, le=365, description="만료 후보 유효(일). 하위호환")
+    orphan_object_minutes: Optional[int] = Field(None, ge=1, le=MAX_VALIDITY_MINUTES, description="고아 객체 유효(분)")
+    expired_candidate_minutes: Optional[int] = Field(None, ge=1, le=MAX_VALIDITY_MINUTES, description="만료 후보 유효(분)")
+    orphan_object_value: Optional[int] = Field(None, ge=1, description="value+unit으로 설정 시 값")
+    orphan_object_unit: Optional[ValidityUnit] = Field(None, description="days | hours | minutes")
+    expired_candidate_value: Optional[int] = Field(None, ge=1, description="value+unit으로 설정 시 값")
+    expired_candidate_unit: Optional[ValidityUnit] = Field(None, description="days | hours | minutes")
+    verifying_timeout_minutes: Optional[int] = Field(None, ge=0, le=MAX_VALIDITY_MINUTES, description="VERIFYING 대기(분). 0=비활성")
+    verifying_timeout_action: Optional[VERIFYING_TIMEOUT_ACTION] = Field(None, description="UNFIT | ERROR")
 
 
 @app.get(
@@ -1686,14 +1784,20 @@ class JudgmentRuleConfigUpdateRequest(BaseModel):
 )
 async def get_judgment_rule_config(db: Session = Depends(get_db), actor: str = Depends(require_admin)):
     cfg = _get_judgment_rule_config(db)
+    o_min = _cfg_orphan_minutes(cfg)
+    e_min = _cfg_expired_minutes(cfg)
     return JudgmentRuleConfigResponse(
         unknown_store_policy=_normalize_unknown_store_policy(cfg.unknown_store_policy),
         auto_register_threshold=float(cfg.auto_register_threshold or 0.90),
         enable_gemini_classifier=bool(cfg.enable_gemini_classifier),
         min_amount_stay=int(cfg.min_amount_stay or 60000),
         min_amount_tour=int(cfg.min_amount_tour or 50000),
-        orphan_object_days=int(cfg.orphan_object_days if cfg.orphan_object_days is not None else 1),
-        expired_candidate_days=int(cfg.expired_candidate_days if cfg.expired_candidate_days is not None else 1),
+        orphan_object_days=o_min // 1440,
+        expired_candidate_days=e_min // 1440,
+        orphan_object_minutes=o_min,
+        expired_candidate_minutes=e_min,
+        verifying_timeout_minutes=int(getattr(cfg, "verifying_timeout_minutes", None) or 0),
+        verifying_timeout_action=(getattr(cfg, "verifying_timeout_action", None) or "UNFIT"),
         updated_at=cfg.updated_at.isoformat() if cfg.updated_at else None,
     )
 
@@ -1708,14 +1812,20 @@ async def update_judgment_rule_config(
     body: JudgmentRuleConfigUpdateRequest, db: Session = Depends(get_db), actor: str = Depends(require_admin)
 ):
     cfg = _get_judgment_rule_config(db)
+    o_min = _cfg_orphan_minutes(cfg)
+    e_min = _cfg_expired_minutes(cfg)
     before = {
         "unknown_store_policy": cfg.unknown_store_policy,
         "auto_register_threshold": float(cfg.auto_register_threshold or 0.90),
         "enable_gemini_classifier": bool(cfg.enable_gemini_classifier),
         "min_amount_stay": int(cfg.min_amount_stay or 60000),
         "min_amount_tour": int(cfg.min_amount_tour or 50000),
-        "orphan_object_days": int(cfg.orphan_object_days if cfg.orphan_object_days is not None else 1),
-        "expired_candidate_days": int(cfg.expired_candidate_days if cfg.expired_candidate_days is not None else 1),
+        "orphan_object_days": o_min // 1440,
+        "expired_candidate_days": e_min // 1440,
+        "orphan_object_minutes": o_min,
+        "expired_candidate_minutes": e_min,
+        "verifying_timeout_minutes": int(getattr(cfg, "verifying_timeout_minutes", None) or 0),
+        "verifying_timeout_action": getattr(cfg, "verifying_timeout_action", None) or "UNFIT",
     }
     if body.unknown_store_policy is not None:
         cfg.unknown_store_policy = _normalize_unknown_store_policy(body.unknown_store_policy)
@@ -1731,17 +1841,35 @@ async def update_judgment_rule_config(
         cfg.orphan_object_days = max(1, min(365, int(body.orphan_object_days)))
     if body.expired_candidate_days is not None:
         cfg.expired_candidate_days = max(1, min(365, int(body.expired_candidate_days)))
+    if body.orphan_object_value is not None and body.orphan_object_unit:
+        cfg.orphan_object_minutes = max(1, min(MAX_VALIDITY_MINUTES, _minutes_from_value_unit(body.orphan_object_value, body.orphan_object_unit)))
+    elif body.orphan_object_minutes is not None:
+        cfg.orphan_object_minutes = max(1, min(MAX_VALIDITY_MINUTES, body.orphan_object_minutes))
+    if body.expired_candidate_value is not None and body.expired_candidate_unit:
+        cfg.expired_candidate_minutes = max(1, min(MAX_VALIDITY_MINUTES, _minutes_from_value_unit(body.expired_candidate_value, body.expired_candidate_unit)))
+    elif body.expired_candidate_minutes is not None:
+        cfg.expired_candidate_minutes = max(1, min(MAX_VALIDITY_MINUTES, body.expired_candidate_minutes))
+    if body.verifying_timeout_minutes is not None:
+        cfg.verifying_timeout_minutes = max(0, min(MAX_VALIDITY_MINUTES, body.verifying_timeout_minutes))
+    if body.verifying_timeout_action is not None:
+        cfg.verifying_timeout_action = body.verifying_timeout_action if body.verifying_timeout_action in ("UNFIT", "ERROR") else "UNFIT"
     cfg.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(cfg)
+    o_min_after = _cfg_orphan_minutes(cfg)
+    e_min_after = _cfg_expired_minutes(cfg)
     after = {
         "unknown_store_policy": cfg.unknown_store_policy,
         "auto_register_threshold": float(cfg.auto_register_threshold or 0.90),
         "enable_gemini_classifier": bool(cfg.enable_gemini_classifier),
         "min_amount_stay": int(cfg.min_amount_stay or 60000),
         "min_amount_tour": int(cfg.min_amount_tour or 50000),
-        "orphan_object_days": int(cfg.orphan_object_days if cfg.orphan_object_days is not None else 1),
-        "expired_candidate_days": int(cfg.expired_candidate_days if cfg.expired_candidate_days is not None else 1),
+        "orphan_object_days": o_min_after // 1440,
+        "expired_candidate_days": e_min_after // 1440,
+        "orphan_object_minutes": o_min_after,
+        "expired_candidate_minutes": e_min_after,
+        "verifying_timeout_minutes": int(getattr(cfg, "verifying_timeout_minutes", None) or 0),
+        "verifying_timeout_action": getattr(cfg, "verifying_timeout_action", None) or "UNFIT",
     }
     _audit_log(
         db,
@@ -1759,10 +1887,39 @@ async def update_judgment_rule_config(
         enable_gemini_classifier=bool(cfg.enable_gemini_classifier),
         min_amount_stay=int(cfg.min_amount_stay or 60000),
         min_amount_tour=int(cfg.min_amount_tour or 50000),
-        orphan_object_days=int(cfg.orphan_object_days if cfg.orphan_object_days is not None else 1),
-        expired_candidate_days=int(cfg.expired_candidate_days if cfg.expired_candidate_days is not None else 1),
+        orphan_object_days=o_min_after // 1440,
+        expired_candidate_days=e_min_after // 1440,
+        orphan_object_minutes=o_min_after,
+        expired_candidate_minutes=e_min_after,
+        verifying_timeout_minutes=int(getattr(cfg, "verifying_timeout_minutes", None) or 0),
+        verifying_timeout_action=(getattr(cfg, "verifying_timeout_action", None) or "UNFIT"),
         updated_at=cfg.updated_at.isoformat() if cfg.updated_at else None,
     )
+
+
+class ProcessVerifyingTimeoutResponse(BaseModel):
+    processed: int = Field(0, description="처리된 건수")
+    submission_ids: List[str] = Field(default_factory=list, description="처리된 receiptId 목록")
+    reason: Optional[str] = Field(None, description="비활성 시 사유")
+
+
+@app.post(
+    "/api/v1/admin/jobs/process-verifying-timeout",
+    response_model=ProcessVerifyingTimeoutResponse,
+    summary="VERIFYING 대기 시간 초과 처리",
+    description="판정 규칙의 verifying_timeout_minutes를 초과한 VERIFYING/PENDING_VERIFICATION 건을 UNFIT 또는 ERROR로 변경하고 FE 콜백 URL로 전송. cron/스케줄러에서 호출.",
+    tags=["Admin - Jobs"],
+)
+async def admin_process_verifying_timeout(
+    db: Session = Depends(get_db),
+    actor: str = Depends(require_admin),
+):
+    cfg = _get_judgment_rule_config(db)
+    timeout_min = int(getattr(cfg, "verifying_timeout_minutes", None) or 0)
+    if timeout_min <= 0:
+        return ProcessVerifyingTimeoutResponse(processed=0, submission_ids=[], reason="verifying_timeout_minutes 비활성(0)")
+    processed, ids = await _process_verifying_timeout_run(db, actor=actor)
+    return ProcessVerifyingTimeoutResponse(processed=processed, submission_ids=ids)
 
 
 # 5-2. 신규 상점 후보군(Unregistered Stores) 관리 API
@@ -2117,6 +2274,7 @@ async def admin_override_submission(
     before = {"status": submission.status, "fail_reason": submission.fail_reason, "total_amount": submission.total_amount or 0}
     prev_status = submission.status or ""
     submission.status = body.status.strip()
+    submission.updated_at = datetime.utcnow()
     submission.fail_reason = None if submission.status == "FIT" else (body.reason.strip() or submission.fail_reason)
     submission.global_fail_reason = submission.fail_reason
     # 감사/추적을 위해 audit_trail에 override 기록을 append
@@ -2355,22 +2513,35 @@ def _image_format_from_content_type(content_type: str) -> str:
     return "jpg"
 
 
+def _strip_trailing_date_junk(s: str) -> str:
+    """
+    날짜 문자열 끝의 괄호·요일 등 비날짜 접미사 제거.
+    예: "26.02.22 (일)" → "26.02.22", "26-02-22-(일)" → "26-02-22"
+    """
+    if not s:
+        return s
+    s = re.sub(r"[(\（].*$", "", s.strip())
+    return s.strip(" -")
+
+
 def _normalize_and_validate_2026_date(date_text: str) -> Tuple[bool, Optional[str]]:
     """
     OCR 날짜 정규화 후 2026년 유효성 검사.
-    Step1: 구분자(., /, 공백)를 '-'로 치환
-    Step2: 2026 또는 26으로 시작하는지 확인
-    Step3: dateutil.parser로 파싱 후 유효한 날짜인지 검증
+    Step1: 괄호·요일 등 비날짜 접미사 제거 (예: "26.02.22 (일)" → "26.02.22")
+    Step2: 구분자(., /, 공백)를 '-'로 치환
+    Step3: 2026 또는 26으로 시작하는지 확인
+    Step4: dateutil.parser로 파싱 후 유효한 날짜인지 검증
     반환: (2026년 유효 여부, 정규화된 날짜 문자열 또는 None)
     """
     if not date_text or not isinstance(date_text, str):
         return False, None
     s = date_text.strip()
+    s = _strip_trailing_date_junk(s)
     s = re.sub(r"[/.\s]+", "-", s)
     s = re.sub(r"-+", "-", s).strip("- ")
     if not re.match(r"^(2026|26)", s):
         return False, None
-    if s.startswith("26"):
+    if s.startswith("26") and (len(s) == 2 or s[2] in "-./"):
         s = "20" + s
     try:
         parsed = dateutil_parser.parse(s)
@@ -2384,7 +2555,7 @@ def _normalize_and_validate_2026_date(date_text: str) -> Tuple[bool, Optional[st
 
 def _normalize_pay_date_canonical(raw: Optional[str]) -> Optional[str]:
     """
-    결제일자를 YYYY/MM/DD 형식으로 통일. (26/01/10 → 2026/01/10, 2026.1.10 → 2026/01/10)
+    결제일자를 YYYY/MM/DD 형식으로 통일. (26/01/10 → 2026/01/10, 26.02.22 (일) → 2026/02/22)
     파싱 실패 시 원문 반환(또는 None). receipt_item 저장·API 응답에 사용.
     """
     if not raw or not isinstance(raw, str):
@@ -2392,6 +2563,7 @@ def _normalize_pay_date_canonical(raw: Optional[str]) -> Optional[str]:
     s = raw.strip()
     if not s:
         return None
+    s = _strip_trailing_date_junk(s)
     s = re.sub(r"[/.\s]+", "-", s)
     s = re.sub(r"-+", "-", s).strip("- ")
     # 26-01-10 → 2026-01-10
@@ -2624,6 +2796,65 @@ def _normalize_tel(raw: Optional[str]) -> Optional[str]:
     if len(d) == 11:
         return f"{d[:3]}-{d[3:7]}-{d[7:]}"
     return s
+
+
+def _normalize_text_line(raw: Optional[str]) -> Optional[str]:
+    """한 줄 텍스트 정규화: trim, 연속 공백 1칸. receipt_items store_name/location 등 자산화용."""
+    if raw is None:
+        return None
+    s = (raw if isinstance(raw, str) else str(raw)).strip()
+    if not s:
+        return None
+    s = re.sub(r"\s+", " ", s).strip()
+    return s or None
+
+
+def _normalize_store_name(raw: Optional[str]) -> Optional[str]:
+    """상호명 정규화: _normalize_text_line과 동일."""
+    return _normalize_text_line(raw)
+
+
+def _normalize_location(raw: Optional[str]) -> Optional[str]:
+    """위치/시군 정규화: _normalize_text_line과 동일."""
+    return _normalize_text_line(raw)
+
+
+def _normalize_amount(raw: Optional[Any]) -> Optional[int]:
+    """금액 정규화: 정수만 저장. str이면 쉼표 제거 후 파싱, 음수/비정상 → None."""
+    if raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    s = (raw if isinstance(raw, str) else str(raw)).strip().replace(",", "")
+    digits = re.sub(r"[^0-9]", "", s)
+    if not digits:
+        return None
+    try:
+        n = int(digits)
+        return n if n >= 0 else None
+    except (ValueError, TypeError):
+        return None
+
+
+def _normalize_pay_date_for_storage(raw: Optional[str]) -> Optional[str]:
+    """결제일자 저장용: YYYY-MM-DD(ISO)로 통일. receipt_items.pay_date 자산화용."""
+    if not raw or not isinstance(raw, str):
+        return None
+    s = raw.strip()
+    if not s:
+        return None
+    s = re.sub(r"[/.\s]+", "-", s)
+    s = re.sub(r"-+", "-", s).strip("- ")
+    if len(s) >= 2 and s[:2] == "26" and (len(s) == 2 or s[2] in "-."):
+        s = "20" + s
+    try:
+        parsed = dateutil_parser.parse(s)
+        return parsed.strftime("%Y-%m-%d")
+    except (ValueError, TypeError):
+        c = _normalize_pay_date_canonical(raw)
+        if c:
+            return c.replace("/", "-")  # YYYY/MM/DD → YYYY-MM-DD
+        return None
 
 
 def _normalize_address(raw: Optional[str]) -> Optional[str]:
@@ -2949,11 +3180,24 @@ def _normalize_error_code(code: Optional[str]) -> Optional[str]:
     """에러 문자열에서 표준 코드 토큰 추출."""
     if not code:
         return None
-    m =     re.search(
+    m = re.search(
         r"\b((?:BIZ|OCR)_[0-9]{3}|PENDING_NEW|PENDING_VERIFICATION|UNFIT_CATEGORY|UNFIT_REGION|UNFIT_DATE|UNFIT_DUPLICATE|ERROR_OCR)\b",
-        str(code),
+        str(code).strip(),
     )
     return m.group(1) if m else None
+
+
+def _resolve_item_status_error(code: Optional[str]) -> Tuple[str, Optional[str], Optional[str]]:
+    """
+    코드 하나로 status / error_code / error_message 를 일관되게 결정.
+    반환: (status, normalized_error_code, error_message)
+    """
+    normalized = _normalize_error_code(code) or code
+    if not normalized:
+        return "FIT", None, None
+    status = _status_for_code(normalized)
+    msg = _fail_message(normalized)
+    return status, normalized, msg
 
 
 def _global_fail_reason(code: Optional[str]) -> Optional[str]:
@@ -3012,31 +3256,40 @@ def map_ocr_to_db(
     total_fit_amount = 0
     for idx, asset in enumerate(ocr_assets, start=1):
         p = asset.get("parsed") or {}
-        status = asset.get("status", "PENDING")
-        amount = p.get("amount") if isinstance(p.get("amount"), int) else None
+        raw_status = asset.get("status", "PENDING")
+        raw_code = asset.get("error_code")
+        code = _normalize_error_code(raw_code) or raw_code
+        if raw_status == "ERROR_OCR" and not code:
+            code = "OCR_001"
+        if code is None:
+            status = raw_status or "PENDING"
+            normalized_code = None
+            error_msg = None
+        else:
+            status, normalized_code, error_msg = _resolve_item_status_error(code)
+        amount = _normalize_amount(p.get("amount"))
         card_num = _normalize_card_num(p.get("cardNum"))
         raw_pay = (p.get("payDate") or "").strip() or None
-        pay_date_canonical = _normalize_pay_date_canonical(raw_pay) if raw_pay else None
-        raw_store_name = (p.get("storeName") or "").strip() or None
-        store_name = re.sub(r"\s+", " ", raw_store_name).strip() if raw_store_name else None
+        pay_date_stored = _normalize_pay_date_for_storage(raw_pay) if raw_pay else None
+        store_name = _normalize_store_name(p.get("storeName"))
         biz_num = _normalize_biz_num((p.get("businessNum") or "").strip()) if p.get("businessNum") else None
-        raw_addr = (p.get("address") or "").strip() or None
-        address = _normalize_address(raw_addr) if raw_addr else None
+        address = _normalize_address((p.get("address") or "").strip()) if (p.get("address") or "").strip() else None
+        location = _normalize_location(p.get("location"))
         item = ReceiptItem(
             submission_id=submission_id,
             seq_no=idx,
             doc_type=asset.get("docType", (documents[idx - 1].get("docType") if idx - 1 < len(documents) else "RECEIPT")),
-            image_key=(asset.get("imageKey") or "").strip(),
+            image_key=(asset.get("imageKey") or "").strip() or "",
             store_name=store_name,
             biz_num=biz_num,
-            pay_date=pay_date_canonical or raw_pay,
+            pay_date=pay_date_stored or raw_pay,
             amount=amount,
             address=address,
-            location=(p.get("location") or "").strip() or None,
+            location=location,
             card_num=card_num,
             status=status,
-            error_code=_normalize_error_code(asset.get("error_code")),
-            error_message=_fail_message(_normalize_error_code(asset.get("error_code"))),
+            error_code=normalized_code,
+            error_message=error_msg,
             confidence_score=p.get("confidenceScore") if isinstance(p.get("confidenceScore"), int) else None,
             ocr_raw=asset.get("ocrRaw"),
             parsed=p,
@@ -3050,10 +3303,15 @@ def map_ocr_to_db(
 def finalize_submission(submission: Submission, total_amount: int, min_criteria: int, fail_code: Optional[str]) -> None:
     """
     submission 최종 판정/감사로그 저장.
-    - FIT item 금액 합산 기준으로 최종 판정
+    - FIT item 금액 합산 기준으로 최종 판정.
+    - 1개 이상 영수증이 조건 충족(합산 >= 기준)이면 개별 장의 UNFIT(업종/지역/날짜)로 전체를 덮지 않고 FIT 처리.
     """
     submission.total_amount = total_amount
+    submission.updated_at = datetime.utcnow()
     resolved = _normalize_error_code(fail_code) or fail_code
+    # 1개 이상 조건 충족 시: 개별 장만의 사유(UNFIT_CATEGORY/REGION/DATE)는 전체를 UNFIT로 두지 않음
+    if total_amount >= min_criteria and resolved in ("UNFIT_CATEGORY", "UNFIT_REGION", "UNFIT_DATE"):
+        resolved = None
     if not resolved and total_amount >= min_criteria:
         submission.status = "FIT"
         submission.global_fail_reason = None
@@ -3190,6 +3448,7 @@ async def analyze_receipt_task(req: CompleteRequest):
         documents = _build_documents_from_request(req)
         if not documents:
             submission.status = "UNFIT"
+            submission.updated_at = datetime.utcnow()
             submission.total_amount = 0
             submission.fail_reason = _global_fail_reason("BIZ_010")
             submission.global_fail_reason = submission.fail_reason
@@ -3229,6 +3488,7 @@ async def analyze_receipt_task(req: CompleteRequest):
                 row.error_code = None
                 row.error_message = None
         submission.status = "VERIFYING"
+        submission.updated_at = datetime.utcnow()
         db.commit()
 
         # 1) 병렬 OCR 수행
@@ -3288,13 +3548,14 @@ async def analyze_receipt_task(req: CompleteRequest):
                 row.ocr_raw = mapped.ocr_raw
                 row.parsed = mapped.parsed
 
-        def mark_item(i: int, status: str, code: Optional[str]) -> None:
-            normalized = _normalize_error_code(code) or code
+        def mark_item(i: int, code: Optional[str]) -> None:
+            """code 기준으로 status / error_code / error_message 를 일관 설정."""
+            status, normalized_code, msg = _resolve_item_status_error(code)
             ocr_assets[i]["status"] = status
-            ocr_assets[i]["error_code"] = normalized
+            ocr_assets[i]["error_code"] = normalized_code
             item_rows[i].status = status
-            item_rows[i].error_code = normalized
-            item_rows[i].error_message = _fail_message(normalized)
+            item_rows[i].error_code = normalized_code
+            item_rows[i].error_message = msg
 
         fail_code: Optional[str] = None
         audit_lines: List[str] = []
@@ -3308,7 +3569,7 @@ async def analyze_receipt_task(req: CompleteRequest):
                 fail_code = "BIZ_010"
                 for i, a in enumerate(ocr_assets):
                     if a["status"] == "PENDING":
-                        mark_item(i, "UNFIT", "BIZ_010")
+                        mark_item(i, "BIZ_010")
             else:
                 ri = receipt_idx[0]
                 rp = ocr_assets[ri]["parsed"]
@@ -3331,19 +3592,19 @@ async def analyze_receipt_task(req: CompleteRequest):
                     rp["amount"] = amount
                     rp["payDate"] = pay_date
                     rp["location"] = location
-                    item_rows[ri].amount = amount
-                    item_rows[ri].pay_date = _normalize_pay_date_canonical(pay_date) or pay_date
-                    item_rows[ri].location = location
+                    item_rows[ri].amount = _normalize_amount(amount) if _normalize_amount(amount) is not None else amount
+                    item_rows[ri].pay_date = _normalize_pay_date_for_storage(pay_date) or _normalize_pay_date_canonical(pay_date) or pay_date
+                    item_rows[ri].location = _normalize_location(location)
 
                 if ocr_assets[ri]["status"] == "ERROR_OCR":
                     fail_code = "ERROR_OCR"
                 elif amount is None:
-                    mark_item(ri, "ERROR_OCR", "OCR_001")
+                    mark_item(ri, "OCR_001")
                     fail_code = "ERROR_OCR"
                 else:
                     _, normalized_date = _normalize_and_validate_2026_date(pay_date)
                     pay_date_stored = normalized_date or _normalize_pay_date_canonical(pay_date) or pay_date
-                    item_rows[ri].pay_date = pay_date_stored
+                    item_rows[ri].pay_date = _normalize_pay_date_for_storage(pay_date_stored) or pay_date_stored
                     item_fail: Optional[str] = None
                     if _ocr_contains_forbidden_business(ocr_assets[ri]["ocrRaw"]):
                         item_fail = "BIZ_008"
@@ -3387,15 +3648,8 @@ async def analyze_receipt_task(req: CompleteRequest):
                                             conf,
                                             ctype,
                                         )
-                                        matched_after, _ = match_store_in_master(db, store_name, location)
-                                        if not matched_after:
-                                            _register_new_candidate_store(
-                                                db, req.receiptId, rp, ocr_raw_ri,
-                                                predicted_category=pred_cat,
-                                                category_confidence=conf,
-                                                classifier_type=ctype,
-                                            )
-                                            item_fail = "PENDING_NEW"
+                                        # 자동 상점추가 후에는 검수 대기 없이 FIT. 데이터 자산화(master_stores + unregistered_stores) 완료.
+                                        # item_fail 유지 None → 아래 FIT 처리
                                     else:
                                         _register_new_candidate_store(
                                             db, req.receiptId, rp, ocr_raw_ri,
@@ -3436,27 +3690,27 @@ async def analyze_receipt_task(req: CompleteRequest):
                         item_fail = "OCR_004"
 
                     if item_fail:
-                        mark_item(ri, _status_for_code(item_fail), item_fail)
+                        mark_item(ri, item_fail)
                         fail_code = item_fail
                     else:
-                        mark_item(ri, "FIT", None)
+                        mark_item(ri, None)
                         total_amount = amount
 
                 if ota_idx:
                     oi = ota_idx[0]
                     if fail_code and total_amount <= 0:
                         if ocr_assets[oi]["status"] == "PENDING":
-                            mark_item(oi, _status_for_code(fail_code), fail_code)
+                            mark_item(oi, fail_code)
                     elif ocr_assets[oi]["status"] == "ERROR_OCR":
                         fail_code = fail_code or (ocr_assets[oi]["error_code"] or "OCR_001")
                     else:
                         op = ocr_assets[oi]["parsed"]
                         ota_amount = op.get("amount")
                         if total_amount and ota_amount is not None and ota_amount != total_amount:
-                            mark_item(oi, _status_for_code("BIZ_011"), "BIZ_011")
+                            mark_item(oi, "BIZ_011")
                             fail_code = fail_code or "BIZ_011"
                         else:
-                            mark_item(oi, "FIT", None)
+                            mark_item(oi, None)
                             audit_lines.append(f"영수증 금액({total_amount}) = 명세서 금액({ota_amount}) 일치")
 
         else:  # TOUR
@@ -3465,30 +3719,32 @@ async def analyze_receipt_task(req: CompleteRequest):
                 fail_code = "BIZ_010"
                 for i, a in enumerate(ocr_assets):
                     if a["status"] == "PENDING":
-                        mark_item(i, "UNFIT", "BIZ_010")
+                        mark_item(i, "BIZ_010")
             else:
                 total = 0
                 amount_parts: List[str] = []
+                # 동일 제출건 내 중복: 동일 (사업자번호, 결제일, 금액, 카드) 조합은 1매만 FIT, 나머지는 UNFIT_DUPLICATE
+                seen_fit_key: set = set()
                 for i in receipt_idx:
                     a = ocr_assets[i]
                     p = a["parsed"]
-                    amount = p.get("amount")
+                    amount = _normalize_amount(p.get("amount"))
                     pay_date = p.get("payDate") or ""
-                    store_name = p.get("storeName") or ""
-                    address = p.get("address") or ""
-                    location = p.get("location") or ""
-                    biz_num = p.get("businessNum")
-                    biz_num = _normalize_biz_num(biz_num)
+                    store_name = _normalize_store_name(p.get("storeName"))
+                    address = _normalize_address((p.get("address") or "").strip()) or ""
+                    location = _normalize_location(p.get("location"))
+                    biz_num = _normalize_biz_num(p.get("businessNum"))
                     card_num = _normalize_card_num(p.get("cardNum"))
+                    is_2026, norm_date = _normalize_and_validate_2026_date(pay_date)
+                    pay_date_stored = _normalize_pay_date_for_storage(norm_date or _normalize_pay_date_canonical(pay_date) or pay_date) or (norm_date or _normalize_pay_date_canonical(pay_date) or pay_date)
 
                     if a["status"] == "ERROR_OCR":
                         continue
                     if amount is None:
-                        mark_item(i, "ERROR_OCR", "OCR_001")
+                        mark_item(i, "OCR_001")
                         continue
 
-                    is_2026, norm_date = _normalize_and_validate_2026_date(pay_date)
-                    pay_date_stored = norm_date or _normalize_pay_date_canonical(pay_date) or pay_date
+                    fit_key = (biz_num or "", pay_date_stored or "", amount or 0, card_num or "")
                     item_fail: Optional[str] = None
                     if not is_2026:
                         item_fail = "BIZ_002"
@@ -3523,15 +3779,8 @@ async def analyze_receipt_task(req: CompleteRequest):
                                         conf,
                                         ctype,
                                     )
-                                    matched_after, _ = match_store_in_master(db, store_name, location)
-                                    if not matched_after:
-                                        _register_new_candidate_store(
-                                            db, req.receiptId, p, ocr_raw_a,
-                                            predicted_category=pred_cat,
-                                            category_confidence=conf,
-                                            classifier_type=ctype,
-                                        )
-                                        item_fail = "PENDING_NEW"
+                                    # 자동 상점추가 후에는 검수 대기 없이 FIT. 데이터 자산화(master_stores + unregistered_stores) 완료.
+                                    # item_fail 유지 None → 아래 FIT 처리
                                 else:
                                     _register_new_candidate_store(
                                         db, req.receiptId, p, ocr_raw_a,
@@ -3541,10 +3790,15 @@ async def analyze_receipt_task(req: CompleteRequest):
                                     )
                                     item_fail = "PENDING_NEW"
 
+                    # 타 제출건(FIT 확정 건)과 동일 영수증이면 중복 → 해당 장만 UNFIT (다른 장은 그대로 FIT 가능)
                     if not item_fail and _check_duplicate_receipt_item(
                         db, req.receiptId, biz_num, pay_date_stored, amount, card_num
                     ):
                         item_fail = "BIZ_001"
+                    # 동일 제출건 내 중복(A/A/A): 동일 키는 1매만 FIT, 나머지는 UNFIT_DUPLICATE(전체 fail_code에는 반영 안 함)
+                    if not item_fail and fit_key in seen_fit_key:
+                        mark_item(i, "BIZ_001")
+                        continue
                     if not item_fail and req.campaignId:
                         selected_campaign_id = _resolve_campaign_id_for_receipt(
                             db, req.type, location, pay_date_stored
@@ -3564,19 +3818,20 @@ async def analyze_receipt_task(req: CompleteRequest):
                             item_fail = "OCR_004"
 
                     if item_fail:
-                        mark_item(i, _status_for_code(item_fail), item_fail)
+                        mark_item(i, item_fail)
                         continue
 
-                    mark_item(i, "FIT", None)
+                    mark_item(i, None)
                     total += amount
                     amount_parts.append(str(amount))
+                    seen_fit_key.add(fit_key)
 
                 total_amount = total
                 user_total = _get_user_total_amount(req.data, len(receipt_idx))
                 if user_total is not None and _is_amount_mismatch(user_total, total_amount):
                     for i in receipt_idx:
                         if ocr_assets[i].get("status") == "FIT":
-                            mark_item(i, "PENDING_VERIFICATION", "PENDING_VERIFICATION")
+                            mark_item(i, "PENDING_VERIFICATION")
                     fail_code = fail_code or "PENDING_VERIFICATION"
                 if total_amount < min_amount_tour:
                     fail_code = "BIZ_003"
@@ -3590,18 +3845,22 @@ async def analyze_receipt_task(req: CompleteRequest):
         err_cnt = sum(1 for a in ocr_assets if a.get("status") in ("ERROR", "ERROR_OCR"))
         pending_new_cnt = sum(1 for a in ocr_assets if a.get("status") == "PENDING_NEW")
         pending_verification_cnt = sum(1 for a in ocr_assets if a.get("status") == "PENDING_VERIFICATION")
-        if not fail_code and pending_new_cnt > 0:
-            fail_code = "PENDING_NEW"
-        if not fail_code and pending_verification_cnt > 0:
-            fail_code = "PENDING_VERIFICATION"
+
+        # 4) 부모 상태 업데이트: total_amount는 반드시 item_rows FIT 합산으로 산출 (관리자 검증 정확도)
+        total_amount = sum(it.amount or 0 for it in item_rows if it.status == "FIT")
+        min_criteria = min_amount_stay if req.type == "STAY" else min_amount_tour
+        # 1개 이상 영수증이 조건 충족(금액 기준 이상)이면 리워드 지급. 다른 장의 PENDING_NEW/PENDING_VERIFICATION으로 전체를 덮지 않음.
+        condition_met = fit_cnt >= 1 and total_amount >= min_criteria
+        if not condition_met:
+            if not fail_code and pending_new_cnt > 0:
+                fail_code = "PENDING_NEW"
+            if not fail_code and pending_verification_cnt > 0:
+                fail_code = "PENDING_VERIFICATION"
         audit_lines.append(
             f"총 {len(ocr_assets)}매 중 적격 {fit_cnt}매, 부적격 {unfit_cnt}매, 오류 {err_cnt}매, "
             f"신규상점대기 {pending_new_cnt}매, 수동검증대기 {pending_verification_cnt}매"
         )
 
-        # 4) 부모 상태 업데이트: total_amount는 반드시 item_rows FIT 합산으로 산출 (관리자 검증 정확도)
-        total_amount = sum(it.amount or 0 for it in item_rows if it.status == "FIT")
-        min_criteria = min_amount_stay if req.type == "STAY" else min_amount_tour
         finalize_submission(submission, total_amount, min_criteria, fail_code)
         submission.audit_log = " | ".join(audit_lines) if audit_lines else (submission.fail_reason or "")
         submission.audit_trail = submission.audit_log
@@ -3612,6 +3871,7 @@ async def analyze_receipt_task(req: CompleteRequest):
     except Exception as e:
         logger.error("analyze_receipt_task failed: %s", e, exc_info=True)
         submission.status = "ERROR"
+        submission.updated_at = datetime.utcnow()
         submission.total_amount = 0
         submission.fail_reason = str(e)
         submission.global_fail_reason = submission.fail_reason

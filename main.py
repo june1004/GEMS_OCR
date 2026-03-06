@@ -26,7 +26,7 @@ from store_classifier import (
 from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends, UploadFile, Header, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, model_validator, UUID4, ConfigDict
-from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Float, DateTime, JSON, Boolean, ARRAY, ForeignKey, update
+from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Float, DateTime, JSON, Boolean, ARRAY, ForeignKey, update, case
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.dialects.postgresql import JSONB
@@ -437,6 +437,10 @@ OPENAPI_TAGS = [
     {"name": "Admin - Stores", "description": "신규 상점 후보군 관리/승인(관리자)"},
     {"name": "Admin - Submissions", "description": "신청 검색/상세/override/콜백 재전송(관리자)"},
     {"name": "Admin - Campaigns", "description": "캠페인 운영(관리자, 확장)"},
+    {"name": "Admin - Callback", "description": "콜백 검증/재전송/로그(관리자)"},
+    {"name": "Admin - Regions", "description": "행정구역(시도/시군구) 목록(관리자)"},
+    {"name": "Admin - Stats", "description": "행정구역별 집계/통계(관리자)"},
+    {"name": "Admin - Jobs", "description": "운영 잡(VERIFYING 타임아웃 처리 등, 관리자/배치)"},
     {"name": "Ops", "description": "헬스 체크 등 운영용 엔드포인트"},
 ]
 
@@ -1920,6 +1924,370 @@ async def admin_process_verifying_timeout(
         return ProcessVerifyingTimeoutResponse(processed=0, submission_ids=[], reason="verifying_timeout_minutes 비활성(0)")
     processed, ids = await _process_verifying_timeout_run(db, actor=actor)
     return ProcessVerifyingTimeoutResponse(processed=processed, submission_ids=ids)
+
+
+# 5-1b. 행정구역(시도/시군구) 및 통계 API (관리자)
+REGIONS_DATA_PATH = os.getenv(
+    "REGIONS_DATA_PATH",
+    os.path.join(os.path.dirname(__file__), "PROJECT", "data", "regions_kr.json"),
+)
+_REGIONS_CACHE: Dict[str, Any] = {"mtime": None, "data": None}
+
+
+def _load_regions_data() -> Dict[str, Any]:
+    """행정구역(시도/시군구) 데이터 로드. 파일이 없으면 빈 구조 반환."""
+    try:
+        st = os.stat(REGIONS_DATA_PATH)
+        mtime = int(st.st_mtime)
+        if _REGIONS_CACHE["data"] is not None and _REGIONS_CACHE["mtime"] == mtime:
+            return _REGIONS_CACHE["data"]
+        with open(REGIONS_DATA_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError("regions data is not a dict")
+        data.setdefault("sido", [])
+        data.setdefault("sigungu", {})
+        _REGIONS_CACHE["mtime"] = mtime
+        _REGIONS_CACHE["data"] = data
+        return data
+    except FileNotFoundError:
+        return {"sido": [], "sigungu": {}}
+    except Exception as e:
+        logger.warning("Failed to load regions data: %s", e)
+        return {"sido": [], "sigungu": {}}
+
+
+def _build_sido_alias_map(data: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+    """alias/name -> {code, name}"""
+    m: Dict[str, Dict[str, str]] = {}
+    for it in data.get("sido", []) or []:
+        code = str(it.get("code") or "").strip()
+        name = str(it.get("name") or "").strip()
+        if not code or not name:
+            continue
+        m[name] = {"code": code, "name": name}
+        for a in (it.get("aliases") or []):
+            a2 = str(a or "").strip()
+            if a2:
+                m[a2] = {"code": code, "name": name}
+    return m
+
+
+def _build_sigungu_name_map(data: Dict[str, Any]) -> Dict[str, Dict[str, str]]:
+    """sigungu name -> {code, name, sidoCode} (전체 통합, name 중복 가능성은 최초 매핑 우선)"""
+    out: Dict[str, Dict[str, str]] = {}
+    sigungu = data.get("sigungu") or {}
+    if not isinstance(sigungu, dict):
+        return out
+    for sido_code, items in sigungu.items():
+        for it in (items or []):
+            code = str(it.get("code") or "").strip()
+            name = str(it.get("name") or "").strip()
+            if not code or not name:
+                continue
+            out.setdefault(name, {"code": code, "name": name, "sidoCode": str(sido_code)})
+    return out
+
+
+def _normalize_sido_from_raw(raw: Optional[str], alias_map: Dict[str, Dict[str, str]]) -> Optional[Dict[str, str]]:
+    """raw(예: '강원', '강원특별자치도') -> {code,name}"""
+    if not raw:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    # address 토큰(예: '강원')을 alias로 매핑
+    return alias_map.get(s)
+
+
+class AdminRegionItem(BaseModel):
+    code: str
+    name: str
+
+
+class AdminSidoListResponse(BaseModel):
+    items: List[AdminRegionItem] = Field(default_factory=list)
+
+
+class AdminSigunguListResponse(BaseModel):
+    sidoCode: str
+    sidoName: str
+    items: List[AdminRegionItem] = Field(default_factory=list)
+
+
+@app.get(
+    "/api/v1/admin/regions/sido",
+    response_model=AdminSidoListResponse,
+    summary="행정구역: 시도 목록",
+    description="관리자 페이지 풀다운용 시도(도) 목록을 반환. 데이터 소스: PROJECT/data/regions_kr.json",
+    tags=["Admin - Regions"],
+)
+async def admin_list_sido(db: Session = Depends(get_db), actor: str = Depends(require_admin)):
+    _ = db
+    _ = actor
+    data = _load_regions_data()
+    items = []
+    for it in data.get("sido", []) or []:
+        code = str(it.get("code") or "").strip()
+        name = str(it.get("name") or "").strip()
+        if code and name:
+            items.append(AdminRegionItem(code=code, name=name))
+    return AdminSidoListResponse(items=items)
+
+
+@app.get(
+    "/api/v1/admin/regions/sigungu",
+    response_model=AdminSigunguListResponse,
+    summary="행정구역: 시군구 목록",
+    description="관리자 페이지 풀다운용 시군구 목록. query의 sido는 코드(예: 42) 또는 이름(예: 강원특별자치도/강원) 모두 허용.",
+    tags=["Admin - Regions"],
+)
+async def admin_list_sigungu(
+    sido: str = Query(..., description="시도 코드 또는 이름 (예: 42 또는 강원특별자치도)"),
+    db: Session = Depends(get_db),
+    actor: str = Depends(require_admin),
+):
+    _ = db
+    _ = actor
+    data = _load_regions_data()
+    alias_map = _build_sido_alias_map(data)
+    sido_raw = (sido or "").strip()
+    sido_code = None
+    sido_name = None
+    # code 우선
+    if re.fullmatch(r"\d+", sido_raw):
+        for it in data.get("sido", []) or []:
+            if str(it.get("code") or "").strip() == sido_raw:
+                sido_code = sido_raw
+                sido_name = str(it.get("name") or "").strip()
+                break
+    else:
+        mapped = _normalize_sido_from_raw(sido_raw, alias_map)
+        if mapped:
+            sido_code = mapped["code"]
+            sido_name = mapped["name"]
+    if not sido_code or not sido_name:
+        raise HTTPException(status_code=400, detail="Invalid sido")
+    items = []
+    for it in (data.get("sigungu", {}) or {}).get(str(sido_code), []) or []:
+        code = str(it.get("code") or "").strip()
+        name = str(it.get("name") or "").strip()
+        if code and name:
+            items.append(AdminRegionItem(code=code, name=name))
+    return AdminSigunguListResponse(sidoCode=str(sido_code), sidoName=sido_name, items=items)
+
+
+class AdminRegionStatsItem(BaseModel):
+    regionCode: Optional[str] = None
+    regionName: str
+    submissionCount: int = 0
+    fitCount: int = 0
+    totalAmount: int = 0
+
+
+class AdminRegionStatsResponse(BaseModel):
+    level: str = Field(..., description="SIDO | SIGUNGU | SINGLE")
+    scope: Dict[str, Any] = Field(default_factory=dict, description="요청 파라미터 요약")
+    items: List[AdminRegionStatsItem] = Field(default_factory=list)
+
+
+@app.get(
+    "/api/v1/admin/stats/by-region",
+    response_model=AdminRegionStatsResponse,
+    summary="행정구역별 통계",
+    description=(
+        "행정구역별 제출/적합/금액 집계.\n"
+        "- query에 아무것도 없으면 시도별 집계\n"
+        "- sido가 있으면 해당 시도의 시군구별 집계\n"
+        "- sigungu가 있으면 해당 시군구 단일 집계\n"
+        "집계 기준은 submission당 첫 장(seq_no=1)의 address/location을 사용."
+    ),
+    tags=["Admin - Stats"],
+)
+async def admin_stats_by_region(
+    sido: Optional[str] = Query(None, description="시도 코드 또는 이름"),
+    sigungu: Optional[str] = Query(None, description="시군구 코드 또는 이름"),
+    dateFrom: Optional[str] = Query(None, description="기간 시작(YYYY-MM-DD 등 파서 허용)"),
+    dateTo: Optional[str] = Query(None, description="기간 끝(YYYY-MM-DD 등 파서 허용)"),
+    projectType: Optional[str] = Query(None, description="STAY | TOUR"),
+    db: Session = Depends(get_db),
+    actor: str = Depends(require_admin),
+):
+    _ = actor
+    data = _load_regions_data()
+    alias_map = _build_sido_alias_map(data)
+    sigungu_name_map = _build_sigungu_name_map(data)
+
+    dt_from = None
+    dt_to = None
+    if dateFrom:
+        try:
+            dt_from = dateutil_parser.parse(dateFrom)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid dateFrom")
+    if dateTo:
+        try:
+            dt_to = dateutil_parser.parse(dateTo)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid dateTo")
+
+    # 파라미터 정규화
+    sido_code = None
+    sido_name = None
+    if sido:
+        sraw = sido.strip()
+        if re.fullmatch(r"\d+", sraw):
+            mapped_name = None
+            for it in data.get("sido", []) or []:
+                if str(it.get("code") or "").strip() == sraw:
+                    mapped_name = str(it.get("name") or "").strip()
+                    break
+            if not mapped_name:
+                raise HTTPException(status_code=400, detail="Invalid sido")
+            sido_code, sido_name = sraw, mapped_name
+        else:
+            mapped = _normalize_sido_from_raw(sraw, alias_map)
+            if not mapped:
+                raise HTTPException(status_code=400, detail="Invalid sido")
+            sido_code, sido_name = mapped["code"], mapped["name"]
+
+    sigungu_code = None
+    sigungu_name = None
+    if sigungu:
+        graw = sigungu.strip()
+        if re.fullmatch(r"\d+", graw):
+            # code -> name 찾기
+            found = None
+            for sc, items in (data.get("sigungu", {}) or {}).items():
+                for it in (items or []):
+                    if str(it.get("code") or "").strip() == graw:
+                        found = {"code": graw, "name": str(it.get("name") or "").strip(), "sidoCode": str(sc)}
+                        break
+                if found:
+                    break
+            if not found:
+                raise HTTPException(status_code=400, detail="Invalid sigungu")
+            sigungu_code, sigungu_name = found["code"], found["name"]
+            if not sido_code:
+                sido_code = found["sidoCode"]
+                # sidoName 보강
+                for it in data.get("sido", []) or []:
+                    if str(it.get("code") or "").strip() == str(sido_code):
+                        sido_name = str(it.get("name") or "").strip()
+                        break
+        else:
+            # name -> code (전체 맵에서)
+            found = sigungu_name_map.get(graw)
+            if not found:
+                raise HTTPException(status_code=400, detail="Invalid sigungu")
+            sigungu_code, sigungu_name = found["code"], found["name"]
+            if not sido_code:
+                sido_code = found.get("sidoCode")
+                for it in data.get("sido", []) or []:
+                    if str(it.get("code") or "").strip() == str(sido_code):
+                        sido_name = str(it.get("name") or "").strip()
+                        break
+
+    # 집계 레벨 결정
+    if sigungu_code:
+        level = "SINGLE"
+    elif sido_code:
+        level = "SIGUNGU"
+    else:
+        level = "SIDO"
+
+    # submission 당 대표 지역: 첫 장(seq_no=1)의 address/location
+    sido_expr = func.split_part(func.trim(ReceiptItem.address), " ", 1)
+    sigungu_expr = func.coalesce(
+        func.nullif(func.trim(ReceiptItem.location), ""),
+        func.split_part(func.trim(ReceiptItem.address), " ", 2),
+    )
+    group_expr = sido_expr if level == "SIDO" else sigungu_expr
+
+    q = (
+        db.query(
+            group_expr.label("region_raw"),
+            func.count(Submission.submission_id).label("submission_count"),
+            func.sum(case((Submission.status == "FIT", 1), else_=0)).label("fit_count"),
+            func.sum(func.coalesce(Submission.total_amount, 0)).label("total_amount"),
+        )
+        .join(
+            ReceiptItem,
+            (ReceiptItem.submission_id == Submission.submission_id) & (ReceiptItem.seq_no == 1),
+        )
+    )
+    if dt_from is not None:
+        q = q.filter(Submission.created_at >= dt_from)
+    if dt_to is not None:
+        q = q.filter(Submission.created_at <= dt_to)
+    if projectType:
+        q = q.filter(Submission.project_type == projectType.strip().upper())
+
+    if level == "SIGUNGU" and sido_name:
+        # address 첫 토큰이 alias에 존재하면 sido_name과 매칭되는 코드로 정규화 후 필터 (DB 값이 '강원'처럼 짧을 수 있어 python 후처리 필요)
+        # 우선 DB에서 1차 필터: address prefix로 좁힘 (과도한 오탐 방지 위해 exact name이거나 alias만)
+        allowed_aliases = []
+        for k, v in alias_map.items():
+            if v.get("code") == str(sido_code):
+                allowed_aliases.append(k)
+        if allowed_aliases:
+            q = q.filter(sido_expr.in_(allowed_aliases))
+
+    if level == "SINGLE" and sigungu_name:
+        q = q.filter(sigungu_expr == sigungu_name)
+
+    rows = q.group_by(group_expr).order_by(func.count(Submission.submission_id).desc()).all()
+
+    items: List[AdminRegionStatsItem] = []
+    for r in rows:
+        raw = (r[0] or "").strip()
+        if not raw:
+            continue
+        submission_count = int(r[1] or 0)
+        fit_count = int(r[2] or 0)
+        total_amount = int(r[3] or 0)
+
+        region_code = None
+        region_name = raw
+        if level == "SIDO":
+            mapped = _normalize_sido_from_raw(raw, alias_map)
+            if mapped:
+                region_code = mapped["code"]
+                region_name = mapped["name"]
+        else:
+            # SIGUNGU/SINGLE: name -> code (가능한 경우)
+            found = None
+            if sido_code:
+                for it in (data.get("sigungu", {}) or {}).get(str(sido_code), []) or []:
+                    if str(it.get("name") or "").strip() == raw:
+                        found = {"code": str(it.get("code") or "").strip(), "name": raw}
+                        break
+            if not found:
+                found = sigungu_name_map.get(raw)
+            if found and found.get("code"):
+                region_code = found["code"]
+                region_name = found.get("name") or raw
+
+        items.append(
+            AdminRegionStatsItem(
+                regionCode=region_code,
+                regionName=region_name,
+                submissionCount=submission_count,
+                fitCount=fit_count,
+                totalAmount=total_amount,
+            )
+        )
+
+    scope = {
+        "sido": sido_name or sido,
+        "sidoCode": sido_code,
+        "sigungu": sigungu_name or sigungu,
+        "sigunguCode": sigungu_code,
+        "dateFrom": dt_from.isoformat() if dt_from else None,
+        "dateTo": dt_to.isoformat() if dt_to else None,
+        "projectType": projectType.strip().upper() if projectType else None,
+    }
+    return AdminRegionStatsResponse(level=level, scope=scope, items=items)
 
 
 # 5-2. 신규 상점 후보군(Unregistered Stores) 관리 API

@@ -155,6 +155,50 @@
 
 ---
 
+### 3.9 행정구역(시도/시군구) 드롭다운
+
+관리자 페이지에서 **지자체 선택 풀다운(시도 → 시군구)** 을 제공하려면 아래 API를 사용합니다.
+
+#### 3.9.1 시도 목록
+
+| 항목 | 내용 |
+|------|------|
+| **Method** | `GET` |
+| **Path** | `/api/v1/admin/regions/sido` |
+| **Response** | `{ \"items\": [ { \"code\": \"42\", \"name\": \"강원특별자치도\" }, ... ] }` |
+| **데이터 소스** | `PROJECT/data/regions_kr.json` |
+
+#### 3.9.2 시군구 목록
+
+| 항목 | 내용 |
+|------|------|
+| **Method** | `GET` |
+| **Path** | `/api/v1/admin/regions/sigungu?sido={code 또는 name}` |
+| **Query** | `sido` = 코드(예: `42`) 또는 이름/별칭(예: `강원`, `강원특별자치도`) |
+| **Response** | `{ \"sidoCode\": \"42\", \"sidoName\": \"강원특별자치도\", \"items\": [ {\"code\":\"42170\",\"name\":\"동해시\"}, ... ] }` |
+
+---
+
+### 3.10 행정구역별 통계(집계)
+
+관리자 페이지에서 **행정구역별 제출/적합/금액 합계**를 보여주기 위한 API입니다.
+
+| 항목 | 내용 |
+|------|------|
+| **Method** | `GET` |
+| **Path** | `/api/v1/admin/stats/by-region` |
+| **Query** | `sido`(선택), `sigungu`(선택), `dateFrom`(선택), `dateTo`(선택), `projectType`(선택: STAY/TOUR) |
+| **Response** | `{ \"level\": \"SIDO|SIGUNGU|SINGLE\", \"scope\": { ... }, \"items\": [ { \"regionCode\", \"regionName\", \"submissionCount\", \"fitCount\", \"totalAmount\" } ] }` |
+| **집계 기준** | submission 당 **첫 장(seq_no=1)** 의 `address/location` 기반(대표 지역) |
+
+**동작 규칙**
+
+- 파라미터가 없으면: **시도별 집계** (`level=SIDO`)
+- `sido`만 주면: 해당 시도의 **시군구별 집계** (`level=SIGUNGU`)
+- `sigungu`를 주면: 해당 시군구 **단일 집계** (`level=SINGLE`)
+
+---
+
 ## 4. API 호출 순서 예시(상세 화면)
 
 1. `GET /api/v1/admin/submissions?receiptId={id}` 또는 목록에서 `receiptId` 확보  

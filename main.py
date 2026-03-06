@@ -2079,36 +2079,45 @@ async def admin_list_sigungu(
 
 # 행정지도 SVG: statgarten/maps (SGIS 통계청 API 기반) raw GitHub URL
 STATGARTEN_MAPS_BASE = "https://raw.githubusercontent.com/statgarten/maps/main/svg"
+STATGARTEN_MAPS_SIMPLE_BASE = "https://raw.githubusercontent.com/statgarten/maps/main/svg/simple"
 
 
-def _get_statgarten_svg_url(level: str, sido_code: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+def _get_statgarten_svg_url(
+    level: str, sido_code: Optional[str], use_simple: bool = False
+) -> Tuple[Optional[str], Optional[str]]:
     """
     level=sido → 전국 시도 경계 SVG URL
     level=sigungu, sido_code=42 → 해당 시도 시군구 경계 SVG URL
     반환: (url, sido_name). 없으면 (None, None).
     """
+    base = STATGARTEN_MAPS_SIMPLE_BASE if use_simple else STATGARTEN_MAPS_BASE
     data = _load_regions_data()
     statgarten = (data or {}).get("statgarten_svg") or {}
     if level == "sido":
         filename = statgarten.get("sido") or "전국_시도_경계.svg"
-        return (f"{STATGARTEN_MAPS_BASE}/{filename}", None)
+        return (f"{base}/{filename}", None)
     if level == "sigungu" and sido_code:
         filename = statgarten.get(str(sido_code).strip())
         if not filename:
             return (None, None)
         for it in (data.get("sido") or []):
             if str(it.get("code") or "").strip() == str(sido_code).strip():
-                return (f"{STATGARTEN_MAPS_BASE}/{filename}", str(it.get("name") or "").strip())
-        return (f"{STATGARTEN_MAPS_BASE}/{filename}", None)
+                return (f"{base}/{filename}", str(it.get("name") or "").strip())
+        return (f"{base}/{filename}", None)
     return (None, None)
 
 
 class AdminMapSvgUrlResponse(BaseModel):
-    url: str = Field(..., description="SVG 직접 로드 URL (img src 또는 object data)")
+    url: str = Field(..., description="SVG 직접 로드 URL (img src 또는 인라인 fetch용)")
     source: str = Field(default="statgarten/maps (SGIS)", description="출처")
     level: str = Field(..., description="sido | sigungu")
     sidoCode: Optional[str] = None
     sidoName: Optional[str] = None
+    variantUsed: Optional[str] = Field(None, description="simple 요청 시 'simple'(단순화 SVG)")
+    pathIdHint: str = Field(
+        default="각 path 요소의 id가 시도/시군구 이름입니다. SVG를 인라인 삽입한 뒤 path#id 또는 path { fill } 로 스타일하면 구역별 구분 표시가 가능합니다.",
+        description="행정구역별 구분 표시를 위한 FE 스타일 안내",
+    )
 
 
 @app.get(
@@ -2126,6 +2135,7 @@ class AdminMapSvgUrlResponse(BaseModel):
 async def admin_maps_svg_url(
     level: str = Query(..., description="sido(전국 시도) | sigungu(시군구)"),
     sido: Optional[str] = Query(None, description="시도 코드(예: 42). level=sigungu 일 때 필수"),
+    variant: Optional[str] = Query(None, description="simple 이면 단순화 SVG(svg/simple/) 사용, 용량 작음·동일 path id 구조"),
     db: Session = Depends(get_db),
     actor: str = Depends(require_admin),
 ):
@@ -2143,7 +2153,8 @@ async def admin_maps_svg_url(
         mapped = _normalize_sido_from_raw(sido_code, alias_map)
         if mapped:
             sido_code = mapped["code"]
-    url, sido_name = _get_statgarten_svg_url(level, sido_code)
+    use_simple = (variant or "").strip().lower() == "simple"
+    url, sido_name = _get_statgarten_svg_url(level, sido_code, use_simple=use_simple)
     if not url:
         raise HTTPException(status_code=404, detail="Map SVG not found for given level/sido")
     return AdminMapSvgUrlResponse(
@@ -2152,6 +2163,7 @@ async def admin_maps_svg_url(
         level=level,
         sidoCode=sido_code,
         sidoName=sido_name,
+        variantUsed="simple" if use_simple else None,
     )
 
 

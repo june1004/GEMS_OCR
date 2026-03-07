@@ -255,4 +255,4 @@
 - **화면 레이아웃·UI 요소**: `관리자_페이지_화면설계안.md`  
 - **추가 개발 반영 사항**: `관리자_페이지_추가_개발_지침.md`  
 - **status/error_code 정리**: `status_error_code_정책.md`  
-- **API 상세(Swagger)**: 서버 `/docs` (Admin - Submissions, Admin - Callback 태그)
+- **API 상세(Swagger)**: 서버 **`/admin-docs`** (관리자 전용. Admin - Submissions, Admin - Callback 등). FE용 문서는 `/docs`

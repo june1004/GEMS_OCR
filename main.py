@@ -25,6 +25,8 @@ from store_classifier import (
 )
 from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends, UploadFile, Header, Query, Body
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.openapi.docs import get_swagger_ui_html
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, model_validator, UUID4, ConfigDict
 from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Float, DateTime, JSON, Boolean, ARRAY, ForeignKey, update, case
 from sqlalchemy.ext.declarative import declarative_base
@@ -455,13 +457,49 @@ OPENAPI_TAGS = [
     {"name": "Ops", "description": "헬스 체크 등 운영용 엔드포인트"},
 ]
 
-# 5-1. FastAPI 앱
+# Swagger 문서 분리: FE(외부)·Admin(관리자) 구분으로 보안 강화 (관리자 API 외부 노출 방지)
+FE_DOC_TAGS = {"Ops"} | {t["name"] for t in OPENAPI_TAGS if (t["name"] or "").startswith("FE ")}
+ADMIN_DOC_TAGS = {"Ops"} | {t["name"] for t in OPENAPI_TAGS if (t["name"] or "").startswith("Admin ")}
+
+
+def _openapi_filter_by_tags(full_schema: dict, allowed_tags: set) -> dict:
+    """OpenAPI 스키마에서 허용된 태그만 가진 path/operation만 남긴 복사본 반환."""
+    import copy
+    out = copy.deepcopy(full_schema)
+    paths = out.get("paths") or {}
+    filtered_paths = {}
+    for path, methods in paths.items():
+        if not isinstance(methods, dict):
+            filtered_paths[path] = methods
+            continue
+        kept = {}
+        for method, op in methods.items():
+            if method.lower() not in ("get", "put", "post", "delete", "patch", "options", "head"):
+                kept[method] = op
+                continue
+            if not isinstance(op, dict):
+                kept[method] = op
+                continue
+            op_tags = set(op.get("tags") or [])
+            if op_tags & allowed_tags:
+                kept[method] = op
+        if kept:
+            filtered_paths[path] = kept
+    out["paths"] = filtered_paths
+    out["tags"] = [t for t in (out.get("tags") or []) if isinstance(t, dict) and (t.get("name") or "") in allowed_tags]
+    return out
+
+
+# 5-1. FastAPI 앱 (문서 분리: FE 전용 /docs, 관리자 전용 /admin-docs)
 app = FastAPI(
     title="GEMS OCR API",
     version="1.0.0",
     description="강원 여행 인센티브 영수증 인식 API",
     servers=[{"url": "https://api.nanum.online", "description": "Production"}],
     openapi_tags=OPENAPI_TAGS,
+    docs_url=None,  # 기본 Swagger 비활성화 → 아래에서 FE용 /docs 직접 서빙
+    redoc_url=None,
+    openapi_url=None,  # 기본 openapi.json 비활성화 → FE/Admin 스키마만 별도 URL로 노출
 )
 # CORS: FE/관리자 페이지 오리진 (관리자 페이지 169.254.240.5:8080 포함)
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").strip()
@@ -481,6 +519,40 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# Swagger 문서 분리: FE(외부)·Admin(관리자) 구분 노출로 보안 강화
+@app.get("/openapi.json", include_in_schema=False)
+def _openapi_fe_json():
+    """FE·외부용 OpenAPI 스키마만 노출 (Admin 태그 제외). /docs 에서 사용."""
+    return JSONResponse(_openapi_filter_by_tags(app.openapi(), FE_DOC_TAGS))
+
+
+@app.get("/openapi.admin.json", include_in_schema=False)
+def _openapi_admin_json():
+    """관리자·BE용 OpenAPI 스키마 (Admin + Ops). /admin-docs 에서만 사용."""
+    return JSONResponse(_openapi_filter_by_tags(app.openapi(), ADMIN_DOC_TAGS))
+
+
+@app.get("/docs", include_in_schema=False)
+def _fe_docs():
+    """FE·외부용 Swagger UI (Presigned, Complete, Status, Campaigns, Health 등만 표시)."""
+    return get_swagger_ui_html(
+        openapi_url="/openapi.json",
+        title="GEMS OCR - FE API (외부 연동용)",
+        swagger_favicon_url="https://fastapi.tiangolo.com/img/favicon.png",
+    )
+
+
+@app.get("/admin-docs", include_in_schema=False)
+def _admin_docs():
+    """관리자 API 전용 Swagger UI. 내부/관리자만 사용 권장."""
+    return get_swagger_ui_html(
+        openapi_url="/openapi.admin.json",
+        title="GEMS OCR - Admin API (관리자 전용)",
+        swagger_favicon_url="https://fastapi.tiangolo.com/img/favicon.png",
+    )
+
 
 def get_db():
     db = SessionLocal()

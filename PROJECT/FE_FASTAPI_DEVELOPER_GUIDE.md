@@ -5,6 +5,17 @@
 
 ---
 
+## API 문서 (Swagger) URL
+
+| URL | 대상 | 내용 |
+|-----|------|------|
+| **`/docs`** | FE·외부 연동 | Presigned URL, Complete, Status, Campaigns, Health 등 **FE 연동에 필요한 API만** 표시 (관리자 API 비노출) |
+| **`/admin-docs`** | 관리자·내부 | 판정 규칙, 신청/상점/콜백/감사로그 등 **관리자 전용 API** (내부·관리자만 사용 권장) |
+
+외부 노출 시 보안을 위해 FE용(`/docs`)과 Admin용(`/admin-docs`) 문서가 분리되어 있습니다.
+
+---
+
 ## 0) 핵심 개념: **신청(Submission) = receiptId 1개**
 
 - **receiptId = submission_id = 신청(Submission) 1건의 대표 ID**

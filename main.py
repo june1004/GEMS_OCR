@@ -1230,16 +1230,25 @@ def _cfg_expired_minutes(cfg: JudgmentRuleConfig) -> int:
     return (getattr(cfg, "expired_candidate_days", None) or 1) * 1440
 
 
-# 담당자 비밀번호 해시·검증 (bcrypt)
+# 담당자 비밀번호 해시·검증 (bcrypt). bcrypt 최대 72바이트 제한 대응.
 _pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+_BCRYPT_MAX_BYTES = 72
+
+
+def _truncate_for_bcrypt(plain: str) -> str:
+    """bcrypt는 72바이트 초과 시 오류 발생. UTF-8 기준으로 잘라 반환."""
+    b = plain.encode("utf-8")
+    if len(b) <= _BCRYPT_MAX_BYTES:
+        return plain
+    return b[:_BCRYPT_MAX_BYTES].decode("utf-8", errors="ignore")
 
 
 def _hash_password(plain: str) -> str:
-    return _pwd_ctx.hash(plain)
+    return _pwd_ctx.hash(_truncate_for_bcrypt(plain))
 
 
 def _verify_password(plain: str, hashed: str) -> bool:
-    return _pwd_ctx.verify(plain, hashed)
+    return _pwd_ctx.verify(_truncate_for_bcrypt(plain), hashed)
 
 
 def _validate_password(password: str) -> tuple[bool, Optional[str]]:

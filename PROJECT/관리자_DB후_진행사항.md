@@ -1,14 +1,15 @@
-# 관리자 기능 — DB 작업 후 진행 사항
+# 관리자 기능 — DB 작업 후 진행 사항 (맥 기준)
 
-> `organizations`, `admin_users`, `admin_campaign_access` 테이블 생성이 끝난 뒤 해야 할 일을 순서대로 정리했습니다.
+> `organizations`, `admin_users`, `admin_campaign_access` 테이블 생성이 끝난 뒤 해야 할 일을 순서대로 정리했습니다.  
+> 단축키·터미널은 **맥(macOS)** 기준입니다.
 
 ---
 
 ## ✅ 체크리스트
 
-| 순서 | 할 일 | 쿨리파이 | 로컬 |
-|------|--------|----------|------|
-| **1** | DB 마이그레이션 | ✅ DBeaver에서 완료 | ✅ DBeaver에서 완료 |
+| 순서 | 할 일 | 쿨리파이 | 로컬 (맥) |
+|------|--------|----------|-----------|
+| **1** | DB 마이그레이션 | ✅ DBeaver에서 완료 | ✅ DBeaver: **Cmd+A** → [SQL 편집기] → [스크립트 실행] |
 | **2** | 패키지 설치 | 저장소 반영 후 **재빌드·재배포** | 터미널: `pip install -r requirements.txt` |
 | **3** | JWT 환경변수 | 앱 환경변수에 **JWT_SECRET** 추가 후 재시작 | `.env`에 `JWT_SECRET=...` 추가 후 서버 재시작 |
 | **4** | 최초 슈퍼관리자 생성 | curl로 API 호출 (아래 예시) | curl 또는 스크립트 (아래 예시) |
@@ -51,9 +52,9 @@
    - `campaignIds`: 접근 허용 캠페인 ID 배열. 슈퍼는 `[]`, 캠페인 담당자는 `[1]` 등
 5. **Execute** 클릭 → 200이면 생성 완료. 이 이메일·비밀번호로 로그인 가능.
 
-### 방법 2: curl (쿨리파이/실서버)
+### 방법 2: curl (맥 터미널 / 쿨리파이·실서버)
 
-`X-Admin-Key`와 이메일·비밀번호만 바꿔서 실행.
+**맥**: Terminal.app 또는 iTerm에서 실행. `X-Admin-Key`와 이메일·비밀번호만 바꿔서 실행.
 
 ```bash
 curl -X POST "https://api.nanum.online/api/v1/admin/users" \
@@ -64,7 +65,9 @@ curl -X POST "https://api.nanum.online/api/v1/admin/users" \
 
 - 비밀번호에 `#` 등 특수문자가 있으면 터미널에서 깨질 수 있음 → **방법 1(Swagger)** 또는 아래 파일 방식 권장.
 
-### 방법 3: curl + JSON 파일 (특수문자 비밀번호 안전)
+### 방법 3: curl + JSON 파일 (맥, 특수문자 비밀번호 안전)
+
+맥에서 `/tmp` 사용 가능. JSON 파일로 보내면 따옴표·`#` 문제 없음.
 
 ```bash
 echo '{"email":"june@nanumlab.com","password":"Nanumlab1004@#","role":"SUPER_ADMIN","campaignIds":[]}' > /tmp/user.json
@@ -74,12 +77,13 @@ curl -X POST "https://api.nanum.online/api/v1/admin/users" \
   -d @/tmp/user.json
 ```
 
-### 로컬에서 할 때
+### 로컬(맥)에서 할 때
 
-- **Swagger**: 주소만 `http://localhost:8000/admin-docs` 로 하고, X-Admin-Key는 로컬 `.env`의 `ADMIN_API_KEY` 입력.
-- **curl**: 위에서 URL만 `http://localhost:8000` 으로 변경.
-- **스크립트**:  
-  `SUPER_ADMIN_EMAIL=admin@example.com SUPER_ADMIN_PASSWORD='Abc1!xyz' python PROJECT/scripts/create_super_admin.py`  
+- **Swagger**: Safari/Chrome에서 `http://localhost:8000/admin-docs`, X-Admin-Key는 로컬 `.env`의 `ADMIN_API_KEY` 입력.
+- **curl**: 위 예시에서 URL만 `http://localhost:8000` 으로 변경.
+- **스크립트** (맥 터미널, 프로젝트 루트에서):  
+  `cd /Users/june/Documents/GitHub/GEMS_OCR`  
+  `SUPER_ADMIN_EMAIL=admin@example.com SUPER_ADMIN_PASSWORD='Abc1!xyz' python3 PROJECT/scripts/create_super_admin.py`  
   (최초 1명, `admin_users`가 비어 있을 때만 동작)
 
 ---

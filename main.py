@@ -1230,35 +1230,27 @@ def _cfg_expired_minutes(cfg: JudgmentRuleConfig) -> int:
     return (getattr(cfg, "expired_candidate_days", None) or 1) * 1440
 
 
-# 담당자 비밀번호 해시·검증 (bcrypt). bcrypt 최대 72바이트 제한 대응.
+# 담당자 비밀번호 해시·검증 (bcrypt). bcrypt 최대 72바이트 제한. 71로 제한해 여유 둠.
 _pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-_BCRYPT_MAX_BYTES = 72
+_BCRYPT_MAX_BYTES = 71
 
 
 def _truncate_for_bcrypt(plain: str) -> str:
-    """bcrypt는 72바이트 초과 시 오류 발생. UTF-8 기준으로 잘라 반환."""
+    """bcrypt 입력을 UTF-8 기준 _BCRYPT_MAX_BYTES(71) 바이트로 자름."""
     if not plain:
         return plain
-    # 먼저 72자로 제한 (일부 환경에서 문자 수 제한이 있는 경우 대비)
-    if len(plain) > _BCRYPT_MAX_BYTES:
-        plain = plain[:_BCRYPT_MAX_BYTES]
-    b = plain.encode("utf-8")
+    s = str(plain)
+    b = s.encode("utf-8")
     if len(b) <= _BCRYPT_MAX_BYTES:
-        return plain
-    return b[:_BCRYPT_MAX_BYTES].decode("utf-8", errors="replace")
+        return s
+    return b[:_BCRYPT_MAX_BYTES].decode("utf-8", errors="replace") or "x"
 
 
 def _hash_password(plain: str) -> str:
-    """비밀번호 해시. 72바이트 초과 분은 자동으로 잘라서 처리."""
-    p = _truncate_for_bcrypt(plain)
-    try:
-        return _pwd_ctx.hash(p)
-    except Exception as e:
-        if "72 bytes" in str(e).lower():
-            # 일부 passlib 버전은 내부에서 길이 검사. 바이트로 확실히 자른 뒤 재시도
-            raw = plain.encode("utf-8")[:_BCRYPT_MAX_BYTES].decode("utf-8", errors="replace") or "x"
-            return _pwd_ctx.hash(raw)
-        raise
+    """비밀번호 해시. 71바이트 초과 분은 잘라서 처리."""
+    s = (plain if isinstance(plain, str) else str(plain or ""))
+    s = _truncate_for_bcrypt(s)
+    return _pwd_ctx.hash(s)
 
 
 def _verify_password(plain: str, hashed: str) -> bool:
@@ -1997,10 +1989,18 @@ async def admin_create_user(
     role = (body.role or "CAMPAIGN_ADMIN").strip().upper()
     if role not in ("SUPER_ADMIN", "ORG_ADMIN", "CAMPAIGN_ADMIN"):
         role = "CAMPAIGN_ADMIN"
+    # bcrypt 72바이트 제한: API 단에서 71바이트로 잘라서 전달
+    pw = body.password
+    if isinstance(pw, str):
+        enc = pw.encode("utf-8")
+        if len(enc) > _BCRYPT_MAX_BYTES:
+            pw = enc[:_BCRYPT_MAX_BYTES].decode("utf-8", errors="replace") or "x"
+    else:
+        pw = str(pw or "")[:71]
     try:
         user = AdminUser(
             email=email,
-            password_hash=_hash_password(body.password),
+            password_hash=_hash_password(pw),
             role=role,
             organization_id=body.organizationId,
             is_active=True,

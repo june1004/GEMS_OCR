@@ -11,4 +11,4 @@ python-dateutil
 rapidfuzz
 Pillow
 PyJWT
-passlib[bcrypt]
+bcrypt

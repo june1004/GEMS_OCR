@@ -27,7 +27,7 @@ from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import JSONResponse
-from passlib.context import CryptContext
+import bcrypt
 import jwt
 from pydantic import BaseModel, Field, model_validator, UUID4, ConfigDict
 from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Float, DateTime, JSON, Boolean, ARRAY, ForeignKey, update, case
@@ -1232,31 +1232,32 @@ def _cfg_expired_minutes(cfg: JudgmentRuleConfig) -> int:
     return (getattr(cfg, "expired_candidate_days", None) or 1) * 1440
 
 
-# 담당자 비밀번호 해시·검증 (bcrypt). bcrypt 최대 72바이트 제한. 71로 제한해 여유 둠.
-_pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
-_BCRYPT_MAX_BYTES = 71
+# 담당자 비밀번호 해시·검증. passlib 제거 후 bcrypt 직접 사용 (passlib·bcrypt 버전 충돌 회피).
+_BCRYPT_MAX_BYTES = 72
 
 
-def _truncate_for_bcrypt(plain: str) -> str:
-    """bcrypt 입력을 UTF-8 기준 _BCRYPT_MAX_BYTES(71) 바이트로 자름."""
-    if not plain:
-        return plain
-    s = str(plain)
+def _password_to_bytes(plain: str) -> bytes:
+    """bcrypt는 최대 72바이트. UTF-8로 인코딩 후 잘라서 전달."""
+    s = (plain if isinstance(plain, str) else str(plain or ""))
     b = s.encode("utf-8")
-    if len(b) <= _BCRYPT_MAX_BYTES:
-        return s
-    return b[:_BCRYPT_MAX_BYTES].decode("utf-8", errors="replace") or "x"
+    if len(b) > _BCRYPT_MAX_BYTES:
+        b = b[:_BCRYPT_MAX_BYTES]
+    return b
 
 
 def _hash_password(plain: str) -> str:
-    """비밀번호 해시. 71바이트 초과 분은 잘라서 처리."""
-    s = (plain if isinstance(plain, str) else str(plain or ""))
-    s = _truncate_for_bcrypt(s)
-    return _pwd_ctx.hash(s)
+    """비밀번호 해시 (bcrypt 직접 호출)."""
+    pw_bytes = _password_to_bytes(plain)
+    return bcrypt.hashpw(pw_bytes, bcrypt.gensalt()).decode("utf-8")
 
 
 def _verify_password(plain: str, hashed: str) -> bool:
-    return _pwd_ctx.verify(_truncate_for_bcrypt(plain), hashed)
+    """비밀번호 검증 (bcrypt 직접 호출)."""
+    try:
+        pw_bytes = _password_to_bytes(plain)
+        return bcrypt.checkpw(pw_bytes, hashed.encode("utf-8"))
+    except Exception:
+        return False
 
 
 def _validate_password(password: str) -> tuple[bool, Optional[str]]:

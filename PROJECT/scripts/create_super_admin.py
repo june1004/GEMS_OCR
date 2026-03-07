@@ -16,7 +16,7 @@ load_dotenv()
 
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker
-from passlib.context import CryptContext
+import bcrypt
 
 PASSWORD_PATTERN = re.compile(
     r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_\-+=[\]{}|;:'\",.<>?/\\`~])[A-Za-z\d!@#$%^&*()_\-+=[\]{}|;:'\",.<>?/\\`~]{8,}$"
@@ -45,7 +45,10 @@ def main():
         if r:
             print("Super admin already exists for", email)
             return
-        h = CryptContext(schemes=["bcrypt"], deprecated="auto").hash(password)
+        pw_bytes = password.encode("utf-8")
+        if len(pw_bytes) > 72:
+            pw_bytes = pw_bytes[:72]
+        h = bcrypt.hashpw(pw_bytes, bcrypt.gensalt()).decode("utf-8")
         db.execute(
             text(
                 "INSERT INTO admin_users (email, password_hash, role, is_active) VALUES (:e, :h, 'SUPER_ADMIN', true)"

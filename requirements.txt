@@ -10,3 +10,5 @@ python-dotenv
 python-dateutil
 rapidfuzz
 Pillow
+PyJWT
+passlib[bcrypt]

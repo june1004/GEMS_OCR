@@ -27,6 +27,8 @@ from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import JSONResponse
+from passlib.context import CryptContext
+import jwt
 from pydantic import BaseModel, Field, model_validator, UUID4, ConfigDict
 from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Float, DateTime, JSON, Boolean, ARRAY, ForeignKey, update, case
 from sqlalchemy.ext.declarative import declarative_base
@@ -74,6 +76,14 @@ OCR_CALLBACK_MAX_ERROR_MESSAGE_CHARS = int(os.getenv("OCR_CALLBACK_MAX_ERROR_MES
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # 관리자 API 보호(선택): 설정 시 /api/v1/admin/* 호출에 X-Admin-Key 필요
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip() or None
+# JWT·담당자 로그인 (이메일/비밀번호). 설정 시 로그인 API·Bearer 인증 사용
+JWT_SECRET = os.getenv("JWT_SECRET", "").strip() or None
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_MINUTES = int(os.getenv("JWT_EXPIRE_MINUTES", "480"))  # 8시간
+# 비밀번호 정책: 영문 대소문자 1개 이상, 숫자, 특수문자, 최소 8자
+PASSWORD_PATTERN = re.compile(
+    r"^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_\-+=[\]{}|;:'\",.<>?/\\`~])[A-Za-z\d!@#$%^&*()_\-+=[\]{}|;:'\",.<>?/\\`~]{8,}$"
+)
 
 # 캠페인 라우팅(확장 포인트)
 # - FE가 campaignId를 결정/관리하지 않도록, 서버가 캠페인을 선택해 submission.campaign_id에 고정한다.
@@ -182,6 +192,37 @@ class AdminAuditLog(Base):
     before_json = Column(JSONB)
     after_json = Column(JSONB)
     meta = Column(JSONB)
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class Organization(Base):
+    """지자체(행정 시도/시군구)별 기관."""
+    __tablename__ = "organizations"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    name = Column(String(255), nullable=False)
+    sido_code = Column(String(8), nullable=False)
+    sigungu_code = Column(String(16))
+    created_at = Column(DateTime, default=datetime.utcnow)
+
+
+class AdminUser(Base):
+    """관리자(담당자). 로그인 ID=이메일, 비밀번호 해시."""
+    __tablename__ = "admin_users"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String(255), nullable=False, unique=True)
+    password_hash = Column(String(255), nullable=False)
+    role = Column(String(32), nullable=False, default="CAMPAIGN_ADMIN")  # SUPER_ADMIN | ORG_ADMIN | CAMPAIGN_ADMIN
+    organization_id = Column(Integer, ForeignKey("organizations.id"))
+    is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class AdminCampaignAccess(Base):
+    """담당자별 접근 가능 캠페인. SUPER_ADMIN은 전체 접근."""
+    __tablename__ = "admin_campaign_access"
+    admin_user_id = Column(Integer, ForeignKey("admin_users.id", ondelete="CASCADE"), primary_key=True)
+    campaign_id = Column(Integer, primary_key=True)
     created_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -454,6 +495,9 @@ OPENAPI_TAGS = [
     {"name": "Admin - Regions", "description": "행정구역(시도/시군구) 목록·행정지도 SVG URL(관리자)"},
     {"name": "Admin - Stats", "description": "행정구역별 집계/통계(관리자)"},
     {"name": "Admin - Jobs", "description": "운영 잡(VERIFYING 타임아웃 처리 등, 관리자/배치)"},
+    {"name": "Admin - Auth", "description": "담당자 로그인(이메일/비밀번호)·현재 사용자 정보"},
+    {"name": "Admin - Organizations", "description": "지자체(시도/시군구)별 기관 생성·조회(슈퍼관리자)"},
+    {"name": "Admin - Users", "description": "담당자 회원가입·목록·캠페인 권한(슈퍼관리자)"},
     {"name": "Ops", "description": "헬스 체크 등 운영용 엔드포인트"},
 ]
 
@@ -1186,18 +1230,118 @@ def _cfg_expired_minutes(cfg: JudgmentRuleConfig) -> int:
     return (getattr(cfg, "expired_candidate_days", None) or 1) * 1440
 
 
-def require_admin(
+# 담당자 비밀번호 해시·검증 (bcrypt)
+_pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
+
+
+def _hash_password(plain: str) -> str:
+    return _pwd_ctx.hash(plain)
+
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    return _pwd_ctx.verify(plain, hashed)
+
+
+def _validate_password(password: str) -> tuple[bool, Optional[str]]:
+    """비밀번호 정책: 영문 대소문자 1개 이상, 숫자, 특수문자, 최소 8자. (유효, 오류메시지)."""
+    if len(password) < 8:
+        return False, "비밀번호는 최소 8자 이상이어야 합니다."
+    if not PASSWORD_PATTERN.match(password):
+        return False, "영문 대·소문자 각 1자 이상, 숫자, 특수문자를 포함하고 8자 이상이어야 합니다."
+    return True, None
+
+
+class AdminContext:
+    """관리자 인증 컨텍스트. 캠페인 스코프 필터링용."""
+    __slots__ = ("actor", "is_super", "campaign_ids", "admin_user_id", "email")
+
+    def __init__(self, actor: str, is_super: bool, campaign_ids: List[int], admin_user_id: Optional[int] = None, email: Optional[str] = None):
+        self.actor = actor
+        self.is_super = is_super
+        self.campaign_ids = campaign_ids or []
+        self.admin_user_id = admin_user_id
+        self.email = email or actor
+
+
+def _create_access_token(email: str, user_id: int, role: str) -> str:
+    if not JWT_SECRET:
+        raise ValueError("JWT_SECRET not configured")
+    expire = datetime.now(timezone.utc) + timedelta(minutes=JWT_EXPIRE_MINUTES)
+    return jwt.encode(
+        {"sub": email, "user_id": user_id, "role": role, "exp": expire},
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+
+
+def _decode_access_token(token: str) -> Optional[dict]:
+    if not JWT_SECRET:
+        return None
+    try:
+        return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    except Exception:
+        return None
+
+
+def get_admin_context(
+    authorization: Optional[str] = Header(None),
     x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
     x_admin_actor: Optional[str] = Header(None, alias="X-Admin-Actor"),
+    db: Session = Depends(get_db),
+) -> AdminContext:
+    """
+    관리자 API: X-Admin-Key(슈퍼) 또는 Authorization Bearer JWT(담당자).
+    담당자는 할당된 캠페인만 조회 가능. 영수증 등 개인정보는 캠페인 스코프로 제한.
+    """
+    # 1) 레거시 X-Admin-Key: 슈퍼관리자로 간주 (전체 캠페인)
+    if ADMIN_API_KEY and (x_admin_key or "").strip() == ADMIN_API_KEY:
+        return AdminContext((x_admin_actor or "admin").strip() or "admin", is_super=True, campaign_ids=[])
+    # 2) Bearer JWT
+    if authorization and authorization.strip().lower().startswith("bearer "):
+        token = authorization.strip()[7:].strip()
+        payload = _decode_access_token(token)
+        if not payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        email = (payload.get("sub") or "").strip()
+        user_id = payload.get("user_id")
+        role = (payload.get("role") or "").strip()
+        if not email or not user_id:
+            raise HTTPException(status_code=401, detail="Invalid token payload")
+        user = db.query(AdminUser).filter(AdminUser.id == int(user_id), AdminUser.email == email).first()
+        if not user or not user.is_active:
+            raise HTTPException(status_code=401, detail="User not found or inactive")
+        is_super = role == "SUPER_ADMIN"
+        campaign_ids: List[int] = []
+        if not is_super:
+            rows = db.query(AdminCampaignAccess.campaign_id).filter(AdminCampaignAccess.admin_user_id == user.id).all()
+            campaign_ids = [int(r[0]) for r in rows]
+        return AdminContext(user.email, is_super, campaign_ids, admin_user_id=user.id, email=user.email)
+    raise HTTPException(status_code=401, detail="Authorization required (X-Admin-Key or Bearer token)")
+
+
+def require_admin(
+    authorization: Optional[str] = Header(None),
+    x_admin_key: Optional[str] = Header(None, alias="X-Admin-Key"),
+    x_admin_actor: Optional[str] = Header(None, alias="X-Admin-Actor"),
+    db: Session = Depends(get_db),
 ) -> str:
     """
-    관리자 API 접근 가드(선택).
-    - ADMIN_API_KEY 환경변수가 설정된 경우에만 X-Admin-Key를 검증한다.
-    - actor는 감사로그용 식별자(없으면 'admin').
+    관리자 API 접근 가드. X-Admin-Key 또는 Bearer JWT 허용.
+    actor 문자열 반환(감사로그용). 캠페인 스코프는 get_admin_context 사용.
     """
-    if ADMIN_API_KEY and (x_admin_key or "").strip() != ADMIN_API_KEY:
-        raise HTTPException(status_code=401, detail="Unauthorized admin request")
-    return (x_admin_actor or "admin").strip() or "admin"
+    if ADMIN_API_KEY and (x_admin_key or "").strip() == ADMIN_API_KEY:
+        return (x_admin_actor or "admin").strip() or "admin"
+    if authorization and authorization.strip().lower().startswith("bearer "):
+        token = authorization.strip()[7:].strip()
+        payload = _decode_access_token(token)
+        if payload:
+            user_id = payload.get("user_id")
+            email = (payload.get("sub") or "").strip()
+            if user_id and email:
+                user = db.query(AdminUser).filter(AdminUser.id == int(user_id), AdminUser.email == email).first()
+                if user and user.is_active:
+                    return user.email
+    raise HTTPException(status_code=401, detail="Unauthorized admin request")
 
 
 def _dict_for_jsonb(d: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -1626,6 +1770,296 @@ async def get_status_proxy(receiptId: str, db: Session = Depends(get_db)):
     return await get_status(receiptId, db)
 
 
+# 4-2. 담당자 로그인·기관·권한 API (개인정보 보안: 캠페인 스코프)
+class LoginRequest(BaseModel):
+    email: str = Field(..., description="로그인 ID(이메일)")
+    password: str = Field(..., description="비밀번호")
+
+
+class LoginResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: Dict[str, Any] = Field(..., description="id, email, role, organizationId, campaignIds")
+
+
+class MeResponse(BaseModel):
+    id: int
+    email: str
+    role: str
+    organizationId: Optional[int] = None
+    organizationName: Optional[str] = None
+    campaignIds: List[int] = Field(default_factory=list)
+    isSuper: bool = False
+
+
+class OrganizationCreateRequest(BaseModel):
+    name: str = Field(..., min_length=1)
+    sidoCode: str = Field(..., description="행정 시도 코드(예: 42)")
+    sigunguCode: Optional[str] = Field(None, description="행정 시군구 코드(5자리)")
+
+
+class OrganizationItem(BaseModel):
+    id: int
+    name: str
+    sidoCode: str
+    sigunguCode: Optional[str] = None
+    createdAt: Optional[str] = None
+
+
+class AdminUserCreateRequest(BaseModel):
+    email: str = Field(..., description="로그인 ID(이메일)")
+    password: str = Field(..., description="영문 대소문자·숫자·특수문자 포함 8자 이상")
+    role: str = Field("CAMPAIGN_ADMIN", description="SUPER_ADMIN | ORG_ADMIN | CAMPAIGN_ADMIN")
+    organizationId: Optional[int] = None
+    campaignIds: List[int] = Field(default_factory=list, description="접근 허용 캠페인 ID 목록")
+
+
+class AdminUserItem(BaseModel):
+    id: int
+    email: str
+    role: str
+    organizationId: Optional[int] = None
+    isActive: bool = True
+    campaignIds: List[int] = Field(default_factory=list)
+    createdAt: Optional[str] = None
+
+
+class AdminUserCampaignsUpdateRequest(BaseModel):
+    campaignIds: List[int] = Field(..., description="접근 허용 캠페인 ID 목록")
+
+
+@app.post(
+    "/api/v1/auth/login",
+    response_model=LoginResponse,
+    summary="담당자 로그인",
+    description="이메일·비밀번호로 로그인 후 JWT 발급. 영수증 등 민감정보는 캠페인 스코프로만 조회 가능.",
+    tags=["Admin - Auth"],
+)
+async def auth_login(body: LoginRequest, db: Session = Depends(get_db)):
+    if not JWT_SECRET:
+        raise HTTPException(status_code=503, detail="Login not configured (JWT_SECRET)")
+    email = (body.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email required")
+    user = db.query(AdminUser).filter(func.lower(AdminUser.email) == email).first()
+    if not user or not _verify_password(body.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password")
+    if not user.is_active:
+        raise HTTPException(status_code=401, detail="Account inactive")
+    token = _create_access_token(user.email, user.id, user.role)
+    campaign_ids: List[int] = []
+    if user.role != "SUPER_ADMIN":
+        rows = db.query(AdminCampaignAccess.campaign_id).filter(AdminCampaignAccess.admin_user_id == user.id).all()
+        campaign_ids = [int(r[0]) for r in rows]
+    return LoginResponse(
+        access_token=token,
+        user={
+            "id": user.id,
+            "email": user.email,
+            "role": user.role,
+            "organizationId": user.organization_id,
+            "campaignIds": campaign_ids,
+        },
+    )
+
+
+@app.get(
+    "/api/v1/admin/me",
+    response_model=MeResponse,
+    summary="현재 로그인 담당자 정보",
+    tags=["Admin - Auth"],
+)
+async def admin_me(ctx: AdminContext = Depends(get_admin_context), db: Session = Depends(get_db)):
+    if ctx.is_super and ctx.admin_user_id is None:
+        return MeResponse(id=0, email=ctx.actor, role="SUPER_ADMIN", isSuper=True, campaignIds=[])
+    user = db.query(AdminUser).filter(AdminUser.id == ctx.admin_user_id).first()
+    if not user:
+        return MeResponse(id=0, email=ctx.actor, role="SUPER_ADMIN", isSuper=True, campaignIds=[])
+    org_name = None
+    if user.organization_id:
+        org = db.query(Organization).filter(Organization.id == user.organization_id).first()
+        org_name = org.name if org else None
+    return MeResponse(
+        id=user.id,
+        email=user.email,
+        role=user.role,
+        organizationId=user.organization_id,
+        organizationName=org_name,
+        campaignIds=ctx.campaign_ids,
+        isSuper=ctx.is_super,
+    )
+
+
+def _require_super(ctx: AdminContext) -> None:
+    if not ctx.is_super:
+        raise HTTPException(status_code=403, detail="Super admin only")
+
+
+@app.post(
+    "/api/v1/admin/organizations",
+    response_model=OrganizationItem,
+    summary="기관 생성(슈퍼관리자)",
+    tags=["Admin - Organizations"],
+)
+async def admin_create_organization(
+    body: OrganizationCreateRequest,
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    _require_super(ctx)
+    org = Organization(
+        name=body.name.strip(),
+        sido_code=body.sidoCode.strip(),
+        sigungu_code=(body.sigunguCode or "").strip() or None,
+    )
+    db.add(org)
+    db.commit()
+    db.refresh(org)
+    return OrganizationItem(
+        id=org.id,
+        name=org.name,
+        sidoCode=org.sido_code,
+        sigunguCode=org.sigungu_code,
+        createdAt=org.created_at.isoformat() if org.created_at else None,
+    )
+
+
+@app.get(
+    "/api/v1/admin/organizations",
+    response_model=List[OrganizationItem],
+    summary="기관 목록(슈퍼관리자)",
+    tags=["Admin - Organizations"],
+)
+async def admin_list_organizations(
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    _require_super(ctx)
+    rows = db.query(Organization).order_by(Organization.id).all()
+    return [
+        OrganizationItem(
+            id=o.id,
+            name=o.name,
+            sidoCode=o.sido_code,
+            sigunguCode=o.sigungu_code,
+            createdAt=o.created_at.isoformat() if o.created_at else None,
+        )
+        for o in rows
+    ]
+
+
+@app.post(
+    "/api/v1/admin/users",
+    response_model=AdminUserItem,
+    summary="담당자 회원가입(슈퍼관리자)",
+    description="비밀번호: 영문 대·소문자 각 1자 이상, 숫자, 특수문자 포함 8자 이상",
+    tags=["Admin - Users"],
+)
+async def admin_create_user(
+    body: AdminUserCreateRequest,
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    _require_super(ctx)
+    if not JWT_SECRET:
+        raise HTTPException(status_code=503, detail="JWT_SECRET required for user management")
+    ok, err = _validate_password(body.password)
+    if not ok:
+        raise HTTPException(status_code=400, detail=err)
+    email = (body.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email required")
+    if db.query(AdminUser).filter(func.lower(AdminUser.email) == email).first():
+        raise HTTPException(status_code=409, detail="Email already registered")
+    role = (body.role or "CAMPAIGN_ADMIN").strip().upper()
+    if role not in ("SUPER_ADMIN", "ORG_ADMIN", "CAMPAIGN_ADMIN"):
+        role = "CAMPAIGN_ADMIN"
+    user = AdminUser(
+        email=email,
+        password_hash=_hash_password(body.password),
+        role=role,
+        organization_id=body.organizationId,
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    for cid in body.campaignIds or []:
+        db.add(AdminCampaignAccess(admin_user_id=user.id, campaign_id=int(cid)))
+    db.commit()
+    rows = db.query(AdminCampaignAccess.campaign_id).filter(AdminCampaignAccess.admin_user_id == user.id).all()
+    campaign_ids = [int(r[0]) for r in rows]
+    return AdminUserItem(
+        id=user.id,
+        email=user.email,
+        role=user.role,
+        organizationId=user.organization_id,
+        campaignIds=campaign_ids,
+        createdAt=user.created_at.isoformat() if user.created_at else None,
+    )
+
+
+@app.get(
+    "/api/v1/admin/users",
+    response_model=List[AdminUserItem],
+    summary="담당자 목록(슈퍼관리자)",
+    tags=["Admin - Users"],
+)
+async def admin_list_users(
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    _require_super(ctx)
+    rows = db.query(AdminUser).order_by(AdminUser.id).all()
+    out: List[AdminUserItem] = []
+    for u in rows:
+        acc = db.query(AdminCampaignAccess.campaign_id).filter(AdminCampaignAccess.admin_user_id == u.id).all()
+        out.append(
+            AdminUserItem(
+                id=u.id,
+                email=u.email,
+                role=u.role,
+                organizationId=u.organization_id,
+                isActive=u.is_active,
+                campaignIds=[int(r[0]) for r in acc],
+                createdAt=u.created_at.isoformat() if u.created_at else None,
+            )
+        )
+    return out
+
+
+@app.put(
+    "/api/v1/admin/users/{user_id}/campaigns",
+    response_model=AdminUserItem,
+    summary="담당자 캠페인 권한 설정(슈퍼관리자)",
+    tags=["Admin - Users"],
+)
+async def admin_set_user_campaigns(
+    user_id: int,
+    body: AdminUserCampaignsUpdateRequest,
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    _require_super(ctx)
+    user = db.query(AdminUser).filter(AdminUser.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    db.query(AdminCampaignAccess).filter(AdminCampaignAccess.admin_user_id == user_id).delete(synchronize_session=False)
+    for cid in body.campaignIds or []:
+        db.add(AdminCampaignAccess(admin_user_id=user_id, campaign_id=int(cid)))
+    db.commit()
+    acc = db.query(AdminCampaignAccess.campaign_id).filter(AdminCampaignAccess.admin_user_id == user_id).all()
+    return AdminUserItem(
+        id=user.id,
+        email=user.email,
+        role=user.role,
+        organizationId=user.organization_id,
+        isActive=user.is_active,
+        campaignIds=[int(r[0]) for r in acc],
+        createdAt=user.created_at.isoformat() if user.created_at else None,
+    )
+
+
 # 5-0. 캠페인 관리/조회 API
 class AdminCampaignItem(BaseModel):
     campaignId: int
@@ -1686,10 +2120,15 @@ def _admin_fetch_campaign_rows(db: Session) -> List[Dict[str, Any]]:
     "/api/v1/admin/campaigns",
     response_model=AdminCampaignListResponse,
     summary="캠페인 목록 조회(관리자)",
+    description="담당자는 할당된 캠페인만 조회. 슈퍼관리자는 전체.",
     tags=["Admin - Campaigns"],
 )
-async def admin_list_campaigns(db: Session = Depends(get_db), actor: str = Depends(require_admin)):
+async def admin_list_campaigns(db: Session = Depends(get_db), ctx: AdminContext = Depends(get_admin_context)):
     rows = _admin_fetch_campaign_rows(db)
+    if not ctx.is_super and ctx.campaign_ids:
+        rows = [r for r in rows if int(r.get("campaign_id") or 0) in ctx.campaign_ids]
+    elif not ctx.is_super:
+        rows = []
     items: List[AdminCampaignItem] = []
     for r in rows:
         sd = _parse_date_any(r.get("start_date"))
@@ -2706,9 +3145,13 @@ async def admin_list_submissions(
     limit: int = Query(50, ge=1, le=200),
     offset: int = Query(0, ge=0),
     db: Session = Depends(get_db),
-    actor: str = Depends(require_admin),
+    ctx: AdminContext = Depends(get_admin_context),
 ):
     q = db.query(Submission)
+    if not ctx.is_super and ctx.campaign_ids:
+        q = q.filter(Submission.campaign_id.in_(ctx.campaign_ids))
+    elif not ctx.is_super:
+        q = q.filter(Submission.campaign_id == -1)
     if receiptId:
         q = q.filter(Submission.submission_id == receiptId.strip())
     if userUuid:
@@ -2773,10 +3216,12 @@ def _build_status_payload_admin(submission: Submission, item_rows: List[ReceiptI
     summary="신청 단건 상세(관리자)",
     tags=["Admin - Submissions"],
 )
-async def admin_get_submission(receiptId: str, db: Session = Depends(get_db), actor: str = Depends(require_admin)):
+async def admin_get_submission(receiptId: str, db: Session = Depends(get_db), ctx: AdminContext = Depends(get_admin_context)):
     rid = _sanitize_receipt_id(receiptId)
     submission = db.query(Submission).filter(Submission.submission_id == rid).first()
     if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    if not ctx.is_super and ctx.campaign_ids and (submission.campaign_id or 0) not in ctx.campaign_ids:
         raise HTTPException(status_code=404, detail="Submission not found")
     item_rows = (
         db.query(ReceiptItem)
@@ -2823,8 +3268,13 @@ class AdminReceiptImagesResponse(BaseModel):
     summary="신청 이미지 presigned GET(관리자)",
     tags=["Admin - Submissions"],
 )
-async def admin_get_receipt_images(receiptId: str, db: Session = Depends(get_db), actor: str = Depends(require_admin)):
+async def admin_get_receipt_images(receiptId: str, db: Session = Depends(get_db), ctx: AdminContext = Depends(get_admin_context)):
     rid = _sanitize_receipt_id(receiptId)
+    sub = db.query(Submission).filter(Submission.submission_id == rid).first()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    if not ctx.is_super and ctx.campaign_ids and (sub.campaign_id or 0) not in ctx.campaign_ids:
+        raise HTTPException(status_code=404, detail="Submission not found")
     item_rows = (
         db.query(ReceiptItem)
         .filter(ReceiptItem.submission_id == rid)
@@ -2882,11 +3332,13 @@ async def admin_override_submission(
     receiptId: str,
     body: AdminOverrideRequest,
     db: Session = Depends(get_db),
-    actor: str = Depends(require_admin),
+    ctx: AdminContext = Depends(get_admin_context),
 ):
     rid = _sanitize_receipt_id(receiptId)
     submission = db.query(Submission).filter(Submission.submission_id == rid).first()
     if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    if not ctx.is_super and ctx.campaign_ids and (submission.campaign_id or 0) not in ctx.campaign_ids:
         raise HTTPException(status_code=404, detail="Submission not found")
     before = {"status": submission.status, "fail_reason": submission.fail_reason, "total_amount": submission.total_amount or 0}
     prev_status = submission.status or ""
@@ -2906,7 +3358,7 @@ async def admin_override_submission(
     db.refresh(submission)
     _audit_log(
         db,
-        actor=actor,
+        actor=ctx.actor,
         action="SUBMISSION_OVERRIDE",
         target_type="submission",
         target_id=rid,
@@ -2923,10 +3375,10 @@ async def admin_override_submission(
             .all()
         )
         payload = _build_status_payload(submission, item_rows)
-        await _send_result_callback(rid, payload, purpose="resend", actor=actor)
+        await _send_result_callback(rid, payload, purpose="resend", actor=ctx.actor)
         _audit_log(
             db,
-            actor=actor,
+            actor=ctx.actor,
             action="CALLBACK_RESEND",
             target_type="submission",
             target_id=rid,

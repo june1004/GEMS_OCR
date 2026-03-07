@@ -872,6 +872,8 @@ async def health_check():
         "db": "ok",
         "ocr_callback_configured": ocr_callback_configured,
         "gemini_configured": gemini_configured,
+        # 운영 디버깅용: 배포가 최신인지 확인하기 위한 고정 신호
+        "password_hashing": {"bcrypt_max_bytes": _BCRYPT_MAX_BYTES},
     }
 
 
@@ -1981,6 +1983,13 @@ async def admin_create_user(
     ok, err = _validate_password(body.password)
     if not ok:
         raise HTTPException(status_code=400, detail=err)
+    # bcrypt 입력 제한(UTF-8 바이트 기준) 사전 체크: 500 대신 400으로 명확히 안내
+    pw_bytes = (body.password or "").encode("utf-8")
+    if len(pw_bytes) > _BCRYPT_MAX_BYTES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"비밀번호가 너무 깁니다: UTF-8 {len(pw_bytes)} bytes (최대 {_BCRYPT_MAX_BYTES} bytes).",
+        )
     email = (body.email or "").strip().lower()
     if not email:
         raise HTTPException(status_code=400, detail="Email required")

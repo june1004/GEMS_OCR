@@ -2007,12 +2007,14 @@ async def admin_create_user(
             pw = enc[:_BCRYPT_MAX_BYTES].decode("utf-8", errors="replace") or "x"
     else:
         pw = str(pw or "")[:71]
+    # organization_id: null/0이면 DB에 NULL로 저장 (FK 위반 방지)
+    org_id = body.organizationId if (body.organizationId is not None and body.organizationId != 0) else None
     try:
         user = AdminUser(
             email=email,
             password_hash=_hash_password(pw),
             role=role,
-            organization_id=body.organizationId,
+            organization_id=org_id,
             is_active=True,
         )
         db.add(user)

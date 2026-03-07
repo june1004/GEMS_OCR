@@ -462,8 +462,20 @@ FE_DOC_TAGS = {"Ops"} | {t["name"] for t in OPENAPI_TAGS if (t["name"] or "").st
 ADMIN_DOC_TAGS = {"Ops"} | {t["name"] for t in OPENAPI_TAGS if (t["name"] or "").startswith("Admin ")}
 
 
+def _collect_schema_refs(obj: Any, refs: set) -> None:
+    """OpenAPI 객체를 재귀 순회하며 #/components/schemas/XXX 참조만 수집."""
+    if isinstance(obj, dict):
+        if obj.get("$ref") and isinstance(obj["$ref"], str) and obj["$ref"].startswith("#/components/schemas/"):
+            refs.add(obj["$ref"].split("/")[-1])
+        for v in obj.values():
+            _collect_schema_refs(v, refs)
+    elif isinstance(obj, list):
+        for v in obj:
+            _collect_schema_refs(v, refs)
+
+
 def _openapi_filter_by_tags(full_schema: dict, allowed_tags: set) -> dict:
-    """OpenAPI 스키마에서 허용된 태그만 가진 path/operation만 남긴 복사본 반환."""
+    """OpenAPI 스키마에서 허용된 태그만 가진 path/operation만 남기고, 사용된 components/schemas만 유지 (보안: 미사용 스키마 비노출)."""
     import copy
     out = copy.deepcopy(full_schema)
     paths = out.get("paths") or {}
@@ -487,6 +499,20 @@ def _openapi_filter_by_tags(full_schema: dict, allowed_tags: set) -> dict:
             filtered_paths[path] = kept
     out["paths"] = filtered_paths
     out["tags"] = [t for t in (out.get("tags") or []) if isinstance(t, dict) and (t.get("name") or "") in allowed_tags]
+
+    # FE/Admin 분리 시 사용되지 않는 스키마 제거 (관리자 요청/응답 구조 외부 노출 방지)
+    used_refs: set = set()
+    _collect_schema_refs(out["paths"], used_refs)
+    components = out.get("components") or {}
+    schemas = components.get("schemas") or {}
+    # 스키마가 다른 스키마를 참조할 수 있으므로, 참조된 것만 남기며 확장
+    prev: set = set()
+    while prev != used_refs:
+        prev = set(used_refs)
+        for name in prev:
+            if name in schemas:
+                _collect_schema_refs(schemas[name], used_refs)
+    out["components"] = {**components, "schemas": {k: v for k, v in schemas.items() if k in used_refs}}
     return out
 
 

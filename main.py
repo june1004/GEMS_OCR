@@ -1237,14 +1237,28 @@ _BCRYPT_MAX_BYTES = 72
 
 def _truncate_for_bcrypt(plain: str) -> str:
     """bcrypt는 72바이트 초과 시 오류 발생. UTF-8 기준으로 잘라 반환."""
+    if not plain:
+        return plain
+    # 먼저 72자로 제한 (일부 환경에서 문자 수 제한이 있는 경우 대비)
+    if len(plain) > _BCRYPT_MAX_BYTES:
+        plain = plain[:_BCRYPT_MAX_BYTES]
     b = plain.encode("utf-8")
     if len(b) <= _BCRYPT_MAX_BYTES:
         return plain
-    return b[:_BCRYPT_MAX_BYTES].decode("utf-8", errors="ignore")
+    return b[:_BCRYPT_MAX_BYTES].decode("utf-8", errors="replace")
 
 
 def _hash_password(plain: str) -> str:
-    return _pwd_ctx.hash(_truncate_for_bcrypt(plain))
+    """비밀번호 해시. 72바이트 초과 분은 자동으로 잘라서 처리."""
+    p = _truncate_for_bcrypt(plain)
+    try:
+        return _pwd_ctx.hash(p)
+    except Exception as e:
+        if "72 bytes" in str(e).lower():
+            # 일부 passlib 버전은 내부에서 길이 검사. 바이트로 확실히 자른 뒤 재시도
+            raw = plain.encode("utf-8")[:_BCRYPT_MAX_BYTES].decode("utf-8", errors="replace") or "x"
+            return _pwd_ctx.hash(raw)
+        raise
 
 
 def _verify_password(plain: str, hashed: str) -> bool:

@@ -52,14 +52,23 @@ S3_ENDPOINT = os.getenv("S3_ENDPOINT")
 S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
 S3_BUCKET = os.getenv("S3_BUCKET", "gems-receipts")
+# 네이버 OCR: STAY(일반 모델·템플릿) / TOUR(영수증 특화) 분기. 미설정 시 기존 단일 설정으로 TOUR fallback.
 NAVER_OCR_URL = os.getenv("NAVER_OCR_INVOKE_URL")
+NAVER_OCR_SECRET = os.getenv("NAVER_OCR_SECRET")
+NAVER_OCR_STAY_URL = (os.getenv("NAVER_OCR_STAY_INVOKE_URL") or "").strip() or NAVER_OCR_URL
+NAVER_OCR_STAY_SECRET = (os.getenv("NAVER_OCR_STAY_SECRET") or "").strip() or NAVER_OCR_SECRET
+NAVER_OCR_TOUR_URL = (os.getenv("NAVER_OCR_TOUR_INVOKE_URL") or "").strip() or NAVER_OCR_URL
+NAVER_OCR_TOUR_SECRET = (os.getenv("NAVER_OCR_TOUR_SECRET") or "").strip() or NAVER_OCR_SECRET
+OCR_CONFIG = {
+    "STAY": {"url": NAVER_OCR_STAY_URL, "secret": NAVER_OCR_STAY_SECRET},
+    "TOUR": {"url": NAVER_OCR_TOUR_URL, "secret": NAVER_OCR_TOUR_SECRET},
+}
 # 분석 완료 시 FE 결과 수신 URL (운영: https://easy.gwd.go.kr/dg/coupon/api/ocr/result / 테스트: http://210.179.205.50/dg/coupon/api/ocr/result)
 OCR_RESULT_CALLBACK_URL = os.getenv("OCR_RESULT_CALLBACK_URL", "").strip() or None
 OCR_CALLBACK_TIMEOUT_SEC = 10
 OCR_CALLBACK_SCHEMA_VERSION = 2
 OCR_CALLBACK_MAX_AUDIT_TRAIL_CHARS = int(os.getenv("OCR_CALLBACK_MAX_AUDIT_TRAIL_CHARS", "2000"))
 OCR_CALLBACK_MAX_ERROR_MESSAGE_CHARS = int(os.getenv("OCR_CALLBACK_MAX_ERROR_MESSAGE_CHARS", "200"))
-NAVER_OCR_SECRET = os.getenv("NAVER_OCR_SECRET")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # 관리자 API 보호(선택): 설정 시 /api/v1/admin/* 호출에 X-Admin-Key 필요
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip() or None
@@ -275,6 +284,7 @@ class PresignedUrlResponse(BaseModel):
     uploadUrl: str
     receiptId: str
     objectKey: str
+    storagePrefix: Optional[str] = None  # STAY | TOUR, 분기 적용 시 응답에 포함(검증용)
 
 class CompleteResponse(BaseModel):
     status: ProcessStatus = ProcessStatus.PROCESSING
@@ -438,6 +448,7 @@ OPENAPI_TAGS = [
     {"name": "Admin - Submissions", "description": "신청 검색/상세/override/콜백 재전송(관리자)"},
     {"name": "Admin - Campaigns", "description": "캠페인 운영(관리자, 확장)"},
     {"name": "Admin - Callback", "description": "콜백 검증/재전송/로그(관리자)"},
+    {"name": "Admin - Audit", "description": "관리자 감사로그 조회(인식률·운영 분석용)"},
     {"name": "Admin - Regions", "description": "행정구역(시도/시군구) 목록·행정지도 SVG URL(관리자)"},
     {"name": "Admin - Stats", "description": "행정구역별 집계/통계(관리자)"},
     {"name": "Admin - Jobs", "description": "운영 잡(VERIFYING 타임아웃 처리 등, 관리자/배치)"},
@@ -711,7 +722,15 @@ async def health_check():
         raise HTTPException(status_code=503, detail=detail)
     # 콜백 URL 적용 여부만 노출 (URL 값은 보안상 반환하지 않음)
     ocr_callback_configured = bool(OCR_RESULT_CALLBACK_URL)
-    return {"status": "ok", "s3": "ok", "db": "ok", "ocr_callback_configured": ocr_callback_configured}
+    # Gemini 업종 분류: API 키 설정 시에만 실제 호출 가능 (관리자 설정 enable_gemini_classifier 별도)
+    gemini_configured = bool(GEMINI_API_KEY)
+    return {
+        "status": "ok",
+        "s3": "ok",
+        "db": "ok",
+        "ocr_callback_configured": ocr_callback_configured,
+        "gemini_configured": gemini_configured,
+    }
 
 
 @app.post(
@@ -723,17 +742,22 @@ async def get_presigned_url(
     fileName: str,
     contentType: str,
     userUuid: str,
-    type: ProjectType,
+    type: ProjectType = Query(ProjectType.TOUR, description="STAY | TOUR, MinIO 저장 경로 및 OCR 도메인 분기용"),
     receiptId: Optional[str] = None,
     db: Session = Depends(get_db),
 ):
     """
     1단계: 고객 영수증 업로드용 Presigned URL 발급 (10분 유효).
+    - type 미전달 시 TOUR로 처리. objectKey는 항상 {STAY|TOUR}/receipts/... 형태.
     - receiptId를 전달하면 동일 신청(합산형)으로 이미지를 계속 추가할 수 있음.
-    - receiptId 미전달 시 새 신청을 생성.
     """
     receipt_id = receiptId or str(uuid.uuid4())
-    object_key = f"receipts/{receipt_id}_{uuid.uuid4().hex[:8]}_{fileName}"
+    # MinIO STAY/TOUR 폴더 분기: type으로 저장 경로 결정 → OCR 시 경로 기반 모델 선택
+    raw = type.value if hasattr(type, "value") else str(type)
+    prefix = (raw or "TOUR").strip().upper()
+    if prefix not in ("STAY", "TOUR"):
+        prefix = "TOUR"
+    object_key = f"{prefix}/receipts/{receipt_id}_{uuid.uuid4().hex[:8]}_{fileName}"
 
     try:
         url = s3_client.generate_presigned_url(
@@ -786,7 +810,12 @@ async def get_presigned_url(
         db.rollback()
         raise HTTPException(status_code=500, detail=f"DB 오류: {str(e)}")
 
-    return {"uploadUrl": url, "receiptId": receipt_id, "objectKey": object_key}
+    return {
+        "uploadUrl": url,
+        "receiptId": receipt_id,
+        "objectKey": object_key,
+        "storagePrefix": prefix,
+    }
 
 
 @app.post("/api/proxy/presigned-url", response_model=PresignedUrlResponse, include_in_schema=False)
@@ -813,10 +842,13 @@ async def upload_receipt_via_api(
     type: ProjectType = Form(...),
     db: Session = Depends(get_db),
 ):
-    """1단계 대안: 파일을 API로 전송하면 서버가 S3에 업로드 (스토리지 CORS 미설정 시 사용)"""
+    """1단계 대안: 파일을 API로 전송하면 서버가 S3에 업로드 (스토리지 CORS 미설정 시 사용). STAY/TOUR 경로 분기 동일."""
     receipt_id = str(uuid.uuid4())
     name = file.filename or "image.jpg"
-    object_key = f"receipts/{receipt_id}_{name}"
+    prefix = (type.value if hasattr(type, "value") else str(type)).strip().upper()
+    if prefix not in ("STAY", "TOUR"):
+        prefix = "TOUR"
+    object_key = f"{prefix}/receipts/{receipt_id}_{name}"
     content_type = file.content_type or "image/jpeg"
     body = await file.read()
     try:
@@ -2491,7 +2523,13 @@ async def approve_candidate_stores(
             failed_ids.append(cid)
             continue
         try:
-            before = {"status": cand.status, "store_name": cand.store_name, "biz_num": cand.biz_num, "address": cand.address}
+            before = {
+                "status": cand.status,
+                "store_name": cand.store_name,
+                "biz_num": cand.biz_num,
+                "address": cand.address,
+                "predicted_category": cand.predicted_category,
+            }
             # master_stores에 삽입 (store_name, category_large, road_address → 트리거로 city_county 자동)
             db.execute(
                 sql_text(
@@ -2507,6 +2545,7 @@ async def approve_candidate_stores(
             )
             cand.status = "APPROVED"
             cand.updated_at = datetime.utcnow()
+            # meta에 predicted vs target 기록 → 인식률 분석·피드백 루프(Gemini/whitelist 보강) 활용
             _audit_log(
                 db,
                 actor=actor,
@@ -2515,7 +2554,12 @@ async def approve_candidate_stores(
                 target_id=cand.id,
                 before_json=before,
                 after_json={"status": cand.status, "target_category": body.target_category},
-                meta={"receiptId": cand.recent_receipt_id or cand.source_submission_id},
+                meta={
+                    "receiptId": cand.recent_receipt_id or cand.source_submission_id,
+                    "predicted_category": cand.predicted_category,
+                    "target_category": body.target_category,
+                    "corrected": cand.predicted_category != body.target_category if cand.predicted_category else None,
+                },
             )
             approved += 1
         except Exception as e:
@@ -2914,6 +2958,82 @@ async def admin_get_callback_logs(
     }
 
 
+class AdminAuditLogItem(BaseModel):
+    id: int
+    action: str
+    target_type: Optional[str] = None
+    target_id: Optional[str] = None
+    actor: Optional[str] = None
+    created_at: Optional[str] = None
+    meta: Optional[Dict[str, Any]] = None
+    before_json: Optional[Dict[str, Any]] = None
+    after_json: Optional[Dict[str, Any]] = None
+
+
+class AdminAuditLogListResponse(BaseModel):
+    total: int = 0
+    items: List[AdminAuditLogItem] = Field(default_factory=list)
+
+
+@app.get(
+    "/api/v1/admin/audit-log",
+    response_model=AdminAuditLogListResponse,
+    summary="감사로그 목록 조회",
+    description=(
+        "관리자 감사로그를 조건별로 조회. 인식률 분석(예: CANDIDATE_APPROVE의 corrected=true 건), "
+        "콜백 실패 추적, 규칙 변경 이력 등에 활용."
+    ),
+    tags=["Admin - Audit"],
+)
+async def admin_list_audit_log(
+    action: Optional[str] = Query(None, description="액션 필터 (예: CANDIDATE_APPROVE, CALLBACK_SEND, RULE_UPDATE)"),
+    target_type: Optional[str] = Query(None, description="대상 타입 (예: submission, unregistered_store)"),
+    from_: Optional[str] = Query(None, alias="from", description="시작일시 ISO8601 또는 YYYY-MM-DD"),
+    to: Optional[str] = Query(None, description="종료일시 ISO8601 또는 YYYY-MM-DD"),
+    include_json: bool = Query(False, description="True면 before_json, after_json 포함 (용량 큼)"),
+    limit: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+    actor: str = Depends(require_admin),
+):
+    _ = actor
+    q = db.query(AdminAuditLog)
+    if action:
+        q = q.filter(AdminAuditLog.action == action.strip())
+    if target_type:
+        q = q.filter(AdminAuditLog.target_type == target_type.strip())
+    if from_:
+        try:
+            dt_from = dateutil_parser.parse(from_)
+            q = q.filter(AdminAuditLog.created_at >= dt_from)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid from date")
+    if to:
+        try:
+            dt_to = dateutil_parser.parse(to)
+            q = q.filter(AdminAuditLog.created_at <= dt_to)
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid to date")
+    q = q.order_by(AdminAuditLog.created_at.desc())
+    total = q.count()
+    rows = q.limit(limit).all()
+    items = []
+    for r in rows:
+        items.append(
+            AdminAuditLogItem(
+                id=int(r.id),
+                action=r.action or "",
+                target_type=r.target_type,
+                target_id=r.target_id,
+                actor=r.actor,
+                created_at=r.created_at.isoformat() if r.created_at else None,
+                meta=r.meta,
+                before_json=_dict_for_jsonb(r.before_json) if include_json and r.before_json else None,
+                after_json=_dict_for_jsonb(r.after_json) if include_json and r.after_json else None,
+            )
+        )
+    return AdminAuditLogListResponse(total=total, items=items)
+
+
 # 6. Naver 영수증 OCR 연동 (CLOVA Document OCR > 영수증)
 # - 공식 권장: 장축 1960px 이하, JPEG 품질은 인식률 위해 90 권장 (PROJECT/네이버_CLOVA_OCR_레퍼런스_및_인식률_검토.md)
 MAX_OCR_DIMENSION = int(os.getenv("OCR_MAX_DIMENSION", "1960"))
@@ -3064,14 +3184,33 @@ def _validate_naver_ocr_response(ocr_data: Any, receipt_id: str) -> None:
             raise ValueError(f"Naver OCR inferResult not success: {infer_result}")
 
 
+def _resolve_ocr_domain(image_key: Optional[str], project_type: Optional[str]) -> str:
+    """
+    MinIO 저장 경로 또는 요청 project_type으로 STAY/TOUR 결정.
+    - image_key가 STAY/ 또는 TOUR/ 로 시작하면 해당 도메인
+    - 아니면 project_type (STAY|TOUR), 미있으면 TOUR
+    """
+    key = (image_key or "").strip()
+    if key.upper().startswith("STAY/"):
+        return "STAY"
+    if key.upper().startswith("TOUR/"):
+        return "TOUR"
+    pt = (project_type or "").strip().upper()
+    return "STAY" if pt == "STAY" else "TOUR"
+
+
 async def _call_naver_ocr_binary(
-    image_binary: bytes, receipt_id: str, image_format: str = "jpg"
+    image_binary: bytes, receipt_id: str, image_format: str = "jpg", domain_type: str = "TOUR"
 ) -> dict:
     """
-    CLOVA OCR 영수증 API — multipart/form-data(바이너리) 전송.
-    Base64 대비 용량·메모리 효율적이며 네이버 권장 방식.
-    응답 검증 후 반환; 형식 오류 시 ValueError로 호출부에서 ERROR_OCR 처리.
+    CLOVA OCR — multipart/form-data(바이너리) 전송.
+    domain_type: STAY(일반 모델·템플릿) | TOUR(영수증 특화). 경로 기반 분기 후 호출.
     """
+    config = OCR_CONFIG.get(domain_type) or OCR_CONFIG["TOUR"]
+    url = config.get("url")
+    secret = config.get("secret")
+    if not url or not secret:
+        raise ValueError(f"OCR config missing for domain={domain_type}")
     message = {
         "version": "V2",
         "requestId": receipt_id,
@@ -3083,9 +3222,9 @@ async def _call_naver_ocr_binary(
         "file": ("receipt.jpg" if image_format == "jpg" else "receipt.png", image_binary, mime),
         "message": (None, json.dumps(message), "application/json"),
     }
-    headers = {"X-OCR-SECRET": NAVER_OCR_SECRET}
+    headers = {"X-OCR-SECRET": secret}
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.post(NAVER_OCR_URL, headers=headers, files=files)
+        response = await client.post(url, headers=headers, files=files)
         response.raise_for_status()
         try:
             ocr_data = response.json()
@@ -3097,16 +3236,16 @@ async def _call_naver_ocr_binary(
 
 
 async def _call_naver_ocr_with_retry(
-    image_binary: bytes, receipt_id: str, image_format: str = "jpg", retries: int = 2
+    image_binary: bytes, receipt_id: str, image_format: str = "jpg", domain_type: str = "TOUR", retries: int = 2
 ) -> dict:
     """
     네이버 OCR 호출 재시도 래퍼.
-    - 네트워크/일시적 API 오류 시 최대 retries+1회 시도
+    - domain_type: STAY | TOUR (저장 경로 기반 분기 후 전달)
     """
     last_exc: Optional[Exception] = None
     for attempt in range(retries + 1):
         try:
-            return await _call_naver_ocr_binary(image_binary, receipt_id, image_format)
+            return await _call_naver_ocr_binary(image_binary, receipt_id, image_format, domain_type=domain_type)
         except Exception as e:
             last_exc = e
             logger.warning(
@@ -3855,15 +3994,23 @@ def _parse_ota_invoice_result(ocr_data: dict) -> Dict[str, Optional[Any]]:
     }
 
 
-async def _run_ocr_for_document(receipt_id: str, image_key: str, doc_type: str) -> Dict[str, Any]:
-    """단일 이미지 OCR 및 파싱."""
+async def _run_ocr_for_document(
+    receipt_id: str, image_key: str, doc_type: str, project_type: Optional[str] = None
+) -> Dict[str, Any]:
+    """
+    단일 이미지 OCR 및 파싱.
+    project_type: STAY|TOUR. image_key가 STAY/ 또는 TOUR/ 로 시작하면 경로로 도메인 결정, 아니면 project_type 사용(기본 TOUR).
+    """
     image_key = (image_key or "").strip()
     if not image_key:
         raise ValueError("BIZ_010")
+    domain_type = _resolve_ocr_domain(image_key, project_type)
     image_bytes, content_type = _get_image_bytes_from_s3(image_key)
     image_bytes, content_type = _resize_and_compress_for_ocr(image_bytes, content_type)
     image_format = _image_format_from_content_type(content_type)
-    ocr_data = await _call_naver_ocr_with_retry(image_bytes, receipt_id, image_format, retries=2)
+    ocr_data = await _call_naver_ocr_with_retry(
+        image_bytes, receipt_id, image_format, domain_type=domain_type, retries=2
+    )
 
     if doc_type == "RECEIPT":
         amount, pay_date, store_name, address, location = _parse_ocr_result(ocr_data)
@@ -3957,9 +4104,11 @@ async def analyze_receipt_task(req: CompleteRequest):
         submission.updated_at = datetime.utcnow()
         db.commit()
 
-        # 1) 병렬 OCR 수행
+        # 1) 병렬 OCR 수행 (STAY/TOUR 경로 또는 req.type 기반으로 도메인 분기)
         tasks = [
-            _run_ocr_for_document(req.receiptId, d.get("imageKey", ""), d.get("docType", "RECEIPT"))
+            _run_ocr_for_document(
+                req.receiptId, d.get("imageKey", ""), d.get("docType", "RECEIPT"), project_type=req.type
+            )
             for d in documents
         ]
         results = await asyncio.gather(*tasks, return_exceptions=True)

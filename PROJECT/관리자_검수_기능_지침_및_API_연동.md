@@ -213,6 +213,20 @@
 
 ---
 
+### 3.12 감사로그 목록 (인식률·운영 분석)
+
+관리자 행위(규칙 변경, 후보 승인, override, 콜백 전송 등) 이력을 조건별로 조회합니다. 인식률 분석(관리자 보정 건수)·콜백 실패 추적에 활용.
+
+| 항목 | 내용 |
+|------|------|
+| **Method** | `GET` |
+| **Path** | `/api/v1/admin/audit-log` |
+| **Query** | `action`, `target_type`, `from`, `to`, `include_json`(true 시 before/after 포함), `limit` |
+| **Response** | `{ "total", "items": [{ "id", "action", "target_type", "target_id", "actor", "created_at", "meta" }] }` |
+| **참고** | `admin_audit_log_보강_및_인식률_활용.md` 에 활용 방법 정리. |
+
+---
+
 ## 4. API 호출 순서 예시(상세 화면)
 
 1. `GET /api/v1/admin/submissions?receiptId={id}` 또는 목록에서 `receiptId` 확보  

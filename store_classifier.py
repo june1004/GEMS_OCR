@@ -2,6 +2,13 @@
 # Step 1: 룰 기반 blacklist/whitelist
 # Step 2: (선택) 시맨틱 유사도
 # Step 3: (선택) Gemini API 문맥 추론
+#
+# Gemini 작동 조건 (모두 만족 시에만 호출):
+#   1. 환경변수 GEMINI_API_KEY 가 비어 있지 않음
+#   2. JudgmentRuleConfig.enable_gemini_classifier == True (관리자 설정)
+#   3. classify_store(..., use_gemini=True) 로 호출됨
+#   4. 룰 기반 결과가 불명확: (category 없음 또는 confidence < 0.5)
+#   5. 입력 유효: store_name 또는 address 중 하나 이상 비어 있지 않음
 
 import os
 import re
@@ -10,6 +17,12 @@ import logging
 from typing import Tuple, Optional
 
 logger = logging.getLogger(__name__)
+
+# Gemini API 설정 (환경변수 우선)
+GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
+GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
+GEMINI_TIMEOUT_SEC = float(os.getenv("GEMINI_TIMEOUT_SEC", "12"))
+GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "32"))
 
 # Blacklist: 포함 시 즉시 UNFIT_CATEGORY (BIZ_008)
 FORBIDDEN_KEYWORDS = (
@@ -87,45 +100,68 @@ def classify_by_rules(
     return None, 0.0, "RULE"
 
 
+def is_gemini_available() -> Tuple[bool, str]:
+    """
+    Gemini API 호출 가능 여부. 헬스 체크·운영 확인용.
+    반환: (가능 여부, 사유 문자열)
+    """
+    if not GEMINI_API_KEY:
+        return False, "GEMINI_API_KEY not set"
+    return True, "ok"
+
+
 def classify_with_gemini(
     store_name: Optional[str], address: Optional[str]
 ) -> Tuple[Optional[str], float, str]:
     """
-    Gemini API로 업종 추론. 환경변수 GEMINI_API_KEY 설정 시에만 동작.
+    Gemini API로 업종 추론.
+    작동 조건: GEMINI_API_KEY 설정됨, store_name 또는 address 중 하나 이상 유효.
     반환: (category, confidence, "AI")
     """
-    api_key = os.getenv("GEMINI_API_KEY")
-    if not api_key:
+    if not GEMINI_API_KEY:
+        logger.debug("Gemini skip: GEMINI_API_KEY not set")
+        return None, 0.0, "RULE"
+    sn = (store_name or "").strip()
+    addr = (address or "").strip()
+    if not sn and not addr:
+        logger.debug("Gemini skip: no store_name or address")
         return None, 0.0, "RULE"
 
     try:
         import httpx
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key={api_key}"
+        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
         prompt = (
             "다음 상점 정보만 보고, 업종을 다음 중 정확히 하나로만 분류해줘. "
             "답변은 반드시 한 줄로, 분류명만 출력해줘. (이유 없이)\n"
             "선택지: TOUR_FOOD, TOUR_CAFE, TOUR_SIGHTSEEING, TOUR_EXPERIENCE, STAY, EXCLUDED\n"
-            f"상호명: {store_name or '(없음)'}\n"
-            f"주소: {address or '(없음)'}\n"
+            f"상호명: {sn or '(없음)'}\n"
+            f"주소: {addr or '(없음)'}\n"
         )
         payload = {
             "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {"temperature": 0.1, "maxOutputTokens": 32},
+            "generationConfig": {
+                "temperature": 0.1,
+                "maxOutputTokens": min(256, max(8, GEMINI_MAX_OUTPUT_TOKENS)),
+            },
         }
-        with httpx.Client(timeout=10.0) as client:
+        timeout = min(30.0, max(5.0, GEMINI_TIMEOUT_SEC))
+        with httpx.Client(timeout=timeout) as client:
             r = client.post(url, json=payload)
             r.raise_for_status()
         data = r.json()
         candidates = (data.get("candidates") or [{}])[0]
         parts = (candidates.get("content") or {}).get("parts") or []
         if not parts:
+            logger.debug("Gemini response: no content parts")
             return None, 0.0, "RULE"
         raw = (parts[0].get("text") or "").strip().upper()
         for cat in ("TOUR_FOOD", "TOUR_CAFE", "TOUR_SIGHTSEEING", "TOUR_EXPERIENCE", "STAY", "EXCLUDED"):
             if cat in raw or cat.replace("_", " ") in raw:
                 if "EXCLUDED" in raw:
                     return None, 0.85, "AI"
+                logger.debug("Gemini classified: %s -> %s", (sn or addr)[:30], cat)
                 return cat, 0.85, "AI"
+        logger.debug("Gemini response: no matching category in %s", raw[:80])
         return None, 0.0, "RULE"
     except Exception as e:
         logger.warning("Gemini classification failed: %s", e)

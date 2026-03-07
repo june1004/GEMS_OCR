@@ -32,14 +32,31 @@
 
 ---
 
-## 2. 현재 구현과의 비교
+## 2. STAY / TOUR 모델 분기 (인식률 향상)
 
-### 2.1 호출 방식
+FE 변경 없이 **저장 경로(Prefix)**로 OCR 도메인을 자동 분기합니다.
 
-- **URL**: `NAVER_OCR_INVOKE_URL` 환경 변수 (예: `https://xxx.apigw.ntruss.com/custom/v1/{domain}/{key}/document/receipt`)
+| 구분 | STAY | TOUR |
+|------|------|------|
+| **용도** | 숙박(일반 모델·인보이스/명세서) | 여행(영수증 특화 모델) |
+| **MinIO 경로** | `STAY/receipts/...` | `TOUR/receipts/...` |
+| **환경 변수** | `NAVER_OCR_STAY_INVOKE_URL`, `NAVER_OCR_STAY_SECRET` | `NAVER_OCR_TOUR_INVOKE_URL`, `NAVER_OCR_TOUR_SECRET` |
+| **Fallback** | 미설정 시 `NAVER_OCR_INVOKE_URL`/`NAVER_OCR_SECRET` 사용 | 동일 |
+
+- **Presigned URL**: 요청 시 이미 전달되는 `type`(STAY|TOUR)으로 object key를 `{type}/receipts/{receiptId}_{uuid}_{fileName}` 형태로 발급 → MinIO에 STAY/ 또는 TOUR/ 폴더로 저장.
+- **OCR 호출**: `image_key`가 `STAY/` 또는 `TOUR/`로 시작하면 해당 도메인 URL/Secret로 요청; 기존 경로(prefix 없음)는 `project_type`(Complete 요청의 type) 또는 기본 TOUR 사용.
+- **STAY 템플릿**: 네이버 클라우드 콘솔에서 STAY 도메인(일반 모델)에 **템플릿**을 등록하면 인식률 향상. 여러 템플릿 시 요청에 `templateIds` 추가 가능(확장).
+
+---
+
+## 3. 현재 구현과의 비교
+
+### 3.1 호출 방식
+
+- **URL**: 도메인별 `NAVER_OCR_*_INVOKE_URL` 또는 단일 `NAVER_OCR_INVOKE_URL` (TOUR/STAY fallback)
 - **multipart** 사용 → Base64 대비 전송량·메모리 효율적이며 네이버 권장 방식과 일치.
 
-### 2.2 이미지 전처리 (`_resize_and_compress_for_ocr`)
+### 3.2 이미지 전처리 (`_resize_and_compress_for_ocr`)
 
 | 항목 | 현재 값 | 공식 권장 | 비고 |
 |------|--------|----------|------|
@@ -55,7 +72,7 @@
 
 ---
 
-## 3. 응답 구조 (영수증 특화)
+## 4. 응답 구조 (영수증 특화)
 
 - **images[]**: `inferResult`(SUCCESS 등), `receipt.result` 하위에 영수증 필드
 - **result** 하위 예: `totalPrice.price.text`, `paymentInfo.date`, `storeInfo.name`, `storeInfo.address` / `addresses[]`, `storeInfo.bizNum`, `paymentInfo.cardInfo.number.text`, `subTotal` 등
@@ -64,7 +81,7 @@
 
 ---
 
-## 4. 개선 권장 사항
+## 5. 개선 권장 사항
 
 1. **장축 최대 길이**: 2000 → **1960**으로 변경하여 공식 권장과 동일하게 적용.
 2. **JPEG 품질**: 기본값 80 → **90**으로 상향 (인식률 우선 시 95도 검토).
@@ -77,7 +94,7 @@
 
 ---
 
-## 5. 적용한 코드/설정 변경
+## 6. 적용한 코드/설정 변경
 
 - **장축 최대**: 2000 → **1960** (환경 변수 `OCR_MAX_DIMENSION`, 기본 1960).
 - **JPEG 품질**: 80 → **90** (환경 변수 `OCR_JPEG_QUALITY`, 기본 90).
@@ -87,7 +104,7 @@
 
 ---
 
-## 6. 컨피던스·인식 불량 보정 정책
+## 7. 컨피던스·인식 불량 보정 정책
 
 - **OCR_CONFIDENCE_THRESHOLD** (기본 90): 이 값 이상이면 OCR 결과를 우선 신뢰하고, 미만이면 FE 사용자 입력(금액·결제일·지역)을 참조값으로 사용.
 - **OCR_LOW_CONFIDENCE_REVIEW_THRESHOLD** (기본 70): 컨피던스가 이 값 미만이거나 NULL이면 "저신뢰도"로 간주.
@@ -100,7 +117,7 @@
 
 ---
 
-## 7. BE에서 인식률 향상 방안 요약
+## 8. BE에서 인식률 향상 방안 요약
 
 | 구분 | 항목 | 환경 변수 / 설정 | 효과 |
 |------|------|------------------|------|
@@ -122,7 +139,7 @@
 
 ---
 
-## 8. 참고 링크
+## 9. 참고 링크
 
 - [CLOVA OCR 예제 (Text OCR 호출)](https://guide.ncloud-docs.com/docs/clovaocr-example01)
 - [Document OCR - Receipt](https://api.ncloud-docs.com/docs/ai-application-service-ocr-ocrdocumentocr-receipt)

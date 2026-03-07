@@ -443,7 +443,7 @@ OPENAPI_TAGS = [
         "name": "FE - Campaigns",
         "description": "(선택) 활성 캠페인 조회. 다중 캠페인 운영 확장 포인트",
     },
-    {"name": "Admin - Rules", "description": "판정 규칙 운영(관리자)"},
+    {"name": "Admin - Rules", "description": "판정 규칙(관리자). 신규 상점 기본=자동 등록(AUTO_REGISTER), 검수 대기(PENDING_NEW)는 선택 시에만 적용"},
     {"name": "Admin - Stores", "description": "신규 상점 후보군 관리/승인(관리자)"},
     {"name": "Admin - Submissions", "description": "신청 검색/상세/override/콜백 재전송(관리자)"},
     {"name": "Admin - Campaigns", "description": "캠페인 운영(관리자, 확장)"},
@@ -1038,9 +1038,18 @@ def _normalize_unknown_store_policy(raw: Optional[str]) -> str:
 
 
 def _get_judgment_rule_config(db: Session) -> JudgmentRuleConfig:
-    """판정 규칙 싱글톤 로드. 없으면 기본행(id=1) 생성."""
+    """판정 규칙 싱글톤 로드. 없으면 기본행(id=1) 생성. 신규 상점 정책은 기본 자동 등록(AUTO_REGISTER), 검수 대기(PENDING_NEW)는 관리자 선택 시에만."""
     cfg = db.query(JudgmentRuleConfig).filter(JudgmentRuleConfig.id == 1).first()
     if cfg:
+        # DB에 NULL/빈값/비정상 값이면 기본값 AUTO_REGISTER로 보정 후 저장(일관성). 신규 상점은 기본 자동 등록.
+        normalized = _normalize_unknown_store_policy(cfg.unknown_store_policy)
+        if (cfg.unknown_store_policy or "").strip() != normalized:
+            cfg.unknown_store_policy = normalized
+            try:
+                db.commit()
+                db.refresh(cfg)
+            except Exception:
+                db.rollback()
         return cfg
     cfg = JudgmentRuleConfig(
         id=1,
@@ -1780,7 +1789,7 @@ def _minutes_from_value_unit(value: int, unit: str) -> int:
 
 
 class JudgmentRuleConfigResponse(BaseModel):
-    unknown_store_policy: str = Field(..., description="AUTO_REGISTER(기본, 자동 상점추가·데이터 자산화) | PENDING_NEW(신규상점 검수 대기)")
+    unknown_store_policy: str = Field(..., description="기본: AUTO_REGISTER(자동 상점추가). 검수 대기 시에만: PENDING_NEW(신규상점 검수 대기)")
     auto_register_threshold: float = Field(..., description="0.0~1.0")
     enable_gemini_classifier: bool = Field(..., description="신규 상점 분류 시 Gemini 사용 여부")
     min_amount_stay: int = Field(..., description="STAY 최소 금액")
@@ -1795,7 +1804,7 @@ class JudgmentRuleConfigResponse(BaseModel):
 
 
 class JudgmentRuleConfigUpdateRequest(BaseModel):
-    unknown_store_policy: Optional[str] = Field(None, description="AUTO_REGISTER(기본) | PENDING_NEW")
+    unknown_store_policy: Optional[str] = Field(None, description="미설정 시 기본값 AUTO_REGISTER. 검수 대기 원할 때만 PENDING_NEW")
     auto_register_threshold: Optional[float] = Field(None, description="0.0~1.0")
     enable_gemini_classifier: Optional[bool] = None
     min_amount_stay: Optional[int] = None
@@ -3259,11 +3268,106 @@ async def _call_naver_ocr_with_retry(
     raise last_exc if last_exc else RuntimeError("Naver OCR failed")
 
 
+# 영수증 OCR에서 결제/합계 금액으로 쓸 수 있는 라벨(한글). 여러 필드 인식률 향상용.
+_AMOUNT_LABELS = (
+    "합계금액", "결제금액", "공급가액", "합계", "거래금액", "받은금액",
+    "총액", "결제액", "최종결제금액", "총결제금액", "합계액",
+)
+
+
+def _parse_int_from_text(raw: Any) -> Optional[int]:
+    """문자열 또는 숫자에서 정수 추출. 쉼표 등 제거."""
+    if raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw if raw >= 0 else None
+    s = re.sub(r"[^0-9]", "", str(raw).strip())
+    return int(s) if s else None
+
+
+def _collect_amount_candidates(obj: Any, depth: int, candidates: List[int], seen_keys: Optional[set] = None) -> None:
+    """
+    OCR result 내에서 금액 후보 수집. 재귀적으로 dict를 순회하며 text/value 또는
+    name·label이 합계/결제 관련인 경우 값을 수집. depth로 과도한 재귀 방지.
+    """
+    if depth > 8 or obj is None:
+        return
+    if seen_keys is None:
+        seen_keys = set()
+    if isinstance(obj, dict):
+        # 동일 객체 중복 방지 (참조 기반이 아니므로 id 사용 안 함)
+        text_val = obj.get("text") or obj.get("value")
+        num = _parse_int_from_text(text_val)
+        if num is not None and 1000 <= num <= 99999999:
+            name = (obj.get("name") or obj.get("label") or "").strip()
+            key_match = any(l in name for l in _AMOUNT_LABELS)
+            if key_match:
+                candidates.append(num)
+        for k, v in obj.items():
+            if k in seen_keys:
+                continue
+            _collect_amount_candidates(v, depth + 1, candidates, seen_keys)
+    elif isinstance(obj, list):
+        for item in obj:
+            _collect_amount_candidates(item, depth + 1, candidates, seen_keys)
+
+
+def _extract_amount_from_result(result: dict) -> Optional[int]:
+    """
+    result에서 결제/합계 금액 추출. 우선순위:
+    1) totalPrice.price.text
+    2) paymentInfo.totalAmount / totalPrice / amount 등
+    3) 합계금액·결제금액·공급가액·합계·거래금액·받은금액 라벨 매칭
+    4) subTotal 부가세로 추정
+    """
+    candidates: List[int] = []
+    # 1) totalPrice (기존)
+    price_text = (result.get("totalPrice") or {}).get("price") or {}
+    raw = (price_text.get("text") or price_text.get("value") or "0").strip()
+    n = _parse_int_from_text(raw)
+    if n is not None and n >= 1000:
+        return n
+    if n is not None:
+        candidates.append(n)
+    # 2) paymentInfo.totalAmount, totalAmount, supplyPrice 등
+    for key in ("totalAmount", "totalPrice", "paymentAmount", "supplyPrice", "amount", "합계", "결제금액"):
+        node = result.get(key)
+        if isinstance(node, dict):
+            t = node.get("text") or node.get("value")
+            nn = _parse_int_from_text(t)
+            if nn is not None and nn >= 1000:
+                candidates.append(nn)
+        elif isinstance(node, list) and node and isinstance(node[0], dict):
+            t = node[0].get("text") or node[0].get("value")
+            nn = _parse_int_from_text(t)
+            if nn is not None and nn >= 1000:
+                candidates.append(nn)
+    # 3) 재귀 수집 (라벨 매칭)
+    _collect_amount_candidates(result, 0, candidates)
+    if candidates:
+        # 합계/결제금액은 보통 가장 큰 금액
+        best = max(candidates)
+        if best >= 1000:
+            return best
+    # 4) subTotal 부가세 추정
+    sub_total = result.get("subTotal") or []
+    if isinstance(sub_total, list) and len(sub_total) > 0:
+        first = sub_total[0]
+        tax_prices = (first.get("taxPrice") or []) if isinstance(first, dict) else []
+        if tax_prices and isinstance(tax_prices[0], dict):
+            tax_text = (tax_prices[0].get("text") or "").strip()
+            tax_num = re.sub(r"[^0-9]", "", tax_text)
+            if tax_num:
+                tax_val = int(tax_num)
+                if tax_val >= 100:
+                    return tax_val * 10
+    return max(candidates) if candidates else None
+
+
 def _parse_ocr_result(ocr_data: dict) -> tuple[Optional[int], Optional[str], Optional[str], Optional[str], Optional[str]]:
     """
     Naver OCR JSON 파싱. 반환: (amount, pay_date, store_name, address, location_시군).
-    - 주소: storeInfo.address.text 없으면 storeInfo.addresses[0].text 사용 (CLOVA 응답 형식 대응).
-    - 금액: totalPrice가 비정상적으로 작거나 없으면 subTotal 부가세로 추정 (VAT 10% → 총액 ≈ 세액×10).
+    - 금액: totalPrice 우선, 없거나 작으면 합계금액/결제금액/공급가액/합계/거래금액/받은금액 등 여러 필드 후보 수집 후 최대값 사용, 마지막으로 subTotal 부가세 추정.
     """
     try:
         images = ocr_data.get("images") or []
@@ -3273,24 +3377,7 @@ def _parse_ocr_result(ocr_data: dict) -> tuple[Optional[int], Optional[str], Opt
         result = receipt.get("result")
         if not result:
             return (None, None, None, None, None)
-        # 결제 금액
-        price_text = (result.get("totalPrice") or {}).get("price") or {}
-        raw_price = (price_text.get("text") or "0").strip()
-        amount_str = re.sub(r"[^0-9]", "", raw_price)
-        amount = int(amount_str) if amount_str else None
-        # 금액이 없거나 비정상적으로 작을 때(< 1,000원) subTotal 부가세로 추정
-        if amount is None or amount < 1000:
-            sub_total = result.get("subTotal") or []
-            if isinstance(sub_total, list) and len(sub_total) > 0:
-                first = sub_total[0]
-                tax_prices = (first.get("taxPrice") or []) if isinstance(first, dict) else []
-                if tax_prices and isinstance(tax_prices[0], dict):
-                    tax_text = (tax_prices[0].get("text") or "").strip()
-                    tax_num = re.sub(r"[^0-9]", "", tax_text)
-                    if tax_num:
-                        tax_val = int(tax_num)
-                        if tax_val >= 100:
-                            amount = tax_val * 10  # 부가세 10% 기준 총액 추정
+        amount = _extract_amount_from_result(result)
         # 결제 날짜
         payment_info = result.get("paymentInfo") or {}
         date_obj = payment_info.get("date") or {}

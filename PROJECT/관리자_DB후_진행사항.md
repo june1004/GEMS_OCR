@@ -32,28 +32,55 @@
 
 ---
 
-## 4. 최초 슈퍼관리자 1명 만들기
+## 4. 담당자(슈퍼관리자) 계정 생성 방법
 
-**한 번만** 하면 됩니다.
+**한 번만** 하면 됩니다. 생성한 이메일·비밀번호로 이후 로그인(`POST /api/v1/auth/login`) 가능.
 
-### 쿨리파이 (실서버)
+### 방법 1: Swagger UI에서 생성 (가장 쉬움)
 
-터미널(로컬이어도 됨)에서 아래 한 번 실행. `X-Admin-Key`와 이메일·비밀번호만 바꾸면 됨.
+1. **/admin-docs** 접속 (예: `https://api.nanum.online/admin-docs`)
+2. **Admin - Users** → **POST /api/v1/admin/users** (담당자 회원가입) 열기
+3. **Parameters**에서 **X-Admin-Key** 입력:
+   - **값에 서버에 설정한 `ADMIN_API_KEY` 환경변수 값을 그대로 입력** (문자열 `X-Admin-Key`가 아님)
+   - 예: 쿨리파이/서버에 `ADMIN_API_KEY=mySecretKey123` 이면 → `mySecretKey123` 입력
+4. **Request body**에서 JSON 수정:
+   - `email`: 생성할 이메일 (예: `june@nanumlab.com`)
+   - `password`: 비밀번호 (영문 대·소문자 각 1자 이상, 숫자, 특수문자, 8자 이상. 예: `Nanumlab1004@#`)
+   - `role`: `SUPER_ADMIN` (전체 권한) 또는 `CAMPAIGN_ADMIN` (캠페인만)
+   - `organizationId`: 없으면 `null` 또는 생략
+   - `campaignIds`: 접근 허용 캠페인 ID 배열. 슈퍼는 `[]`, 캠페인 담당자는 `[1]` 등
+5. **Execute** 클릭 → 200이면 생성 완료. 이 이메일·비밀번호로 로그인 가능.
+
+### 방법 2: curl (쿨리파이/실서버)
+
+`X-Admin-Key`와 이메일·비밀번호만 바꿔서 실행.
 
 ```bash
 curl -X POST "https://api.nanum.online/api/v1/admin/users" \
   -H "Content-Type: application/json" \
-  -H "X-Admin-Key: 여기에_쿨리파이에_설정한_ADMIN_API_KEY" \
-  -d '{"email":"super@example.com","password":"Abc1!xyz","role":"SUPER_ADMIN","campaignIds":[]}'
+  -H "X-Admin-Key: 여기에_서버에_설정한_ADMIN_API_KEY_값" \
+  -d '{"email":"june@nanumlab.com","password":"Nanumlab1004@#","role":"SUPER_ADMIN","campaignIds":[]}'
 ```
 
-- 비밀번호: **영문 대·소문자 각 1자 이상 + 숫자 + 특수문자 + 8자 이상** (예: `Abc1!xyz`).
+- 비밀번호에 `#` 등 특수문자가 있으면 터미널에서 깨질 수 있음 → **방법 1(Swagger)** 또는 아래 파일 방식 권장.
 
-### 로컬
+### 방법 3: curl + JSON 파일 (특수문자 비밀번호 안전)
 
-- **방법 A** — 위 curl에서 주소만 `http://localhost:8000`으로 바꾸고, `X-Admin-Key`는 로컬 `.env`의 `ADMIN_API_KEY`로 호출.
-- **방법 B** — 스크립트:  
-  `SUPER_ADMIN_EMAIL=admin@example.com SUPER_ADMIN_PASSWORD='Abc1!xyz' python PROJECT/scripts/create_super_admin.py`
+```bash
+echo '{"email":"june@nanumlab.com","password":"Nanumlab1004@#","role":"SUPER_ADMIN","campaignIds":[]}' > /tmp/user.json
+curl -X POST "https://api.nanum.online/api/v1/admin/users" \
+  -H "Content-Type: application/json" \
+  -H "X-Admin-Key: 여기에_ADMIN_API_KEY_값" \
+  -d @/tmp/user.json
+```
+
+### 로컬에서 할 때
+
+- **Swagger**: 주소만 `http://localhost:8000/admin-docs` 로 하고, X-Admin-Key는 로컬 `.env`의 `ADMIN_API_KEY` 입력.
+- **curl**: 위에서 URL만 `http://localhost:8000` 으로 변경.
+- **스크립트**:  
+  `SUPER_ADMIN_EMAIL=admin@example.com SUPER_ADMIN_PASSWORD='Abc1!xyz' python PROJECT/scripts/create_super_admin.py`  
+  (최초 1명, `admin_users`가 비어 있을 때만 동작)
 
 ---
 

@@ -1974,29 +1974,42 @@ async def admin_create_user(
     role = (body.role or "CAMPAIGN_ADMIN").strip().upper()
     if role not in ("SUPER_ADMIN", "ORG_ADMIN", "CAMPAIGN_ADMIN"):
         role = "CAMPAIGN_ADMIN"
-    user = AdminUser(
-        email=email,
-        password_hash=_hash_password(body.password),
-        role=role,
-        organization_id=body.organizationId,
-        is_active=True,
-    )
-    db.add(user)
-    db.commit()
-    db.refresh(user)
-    for cid in body.campaignIds or []:
-        db.add(AdminCampaignAccess(admin_user_id=user.id, campaign_id=int(cid)))
-    db.commit()
-    rows = db.query(AdminCampaignAccess.campaign_id).filter(AdminCampaignAccess.admin_user_id == user.id).all()
-    campaign_ids = [int(r[0]) for r in rows]
-    return AdminUserItem(
-        id=user.id,
-        email=user.email,
-        role=user.role,
-        organizationId=user.organization_id,
-        campaignIds=campaign_ids,
-        createdAt=user.created_at.isoformat() if user.created_at else None,
-    )
+    try:
+        user = AdminUser(
+            email=email,
+            password_hash=_hash_password(body.password),
+            role=role,
+            organization_id=body.organizationId,
+            is_active=True,
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+        for cid in body.campaignIds or []:
+            db.add(AdminCampaignAccess(admin_user_id=user.id, campaign_id=int(cid)))
+        db.commit()
+        rows = db.query(AdminCampaignAccess.campaign_id).filter(AdminCampaignAccess.admin_user_id == user.id).all()
+        campaign_ids = [int(r[0]) for r in rows]
+        return AdminUserItem(
+            id=user.id,
+            email=user.email,
+            role=user.role,
+            organizationId=user.organization_id,
+            campaignIds=campaign_ids,
+            createdAt=user.created_at.isoformat() if user.created_at else None,
+        )
+    except Exception as e:
+        db.rollback()
+        logger.exception("admin_create_user failed: %s", e)
+        err_msg = str(e).strip() if e else ""
+        if len(err_msg) > 200:
+            err_msg = err_msg[:200] + "..."
+        detail = (
+            f"User creation failed: {err_msg}"
+            if err_msg
+            else "User creation failed. Check server logs (admin_create_user)."
+        )
+        raise HTTPException(status_code=500, detail=detail) from e
 
 
 @app.get(

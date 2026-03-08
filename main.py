@@ -213,7 +213,29 @@ class AdminUser(Base):
     password_hash = Column(String(255), nullable=False)
     role = Column(String(32), nullable=False, default="CAMPAIGN_ADMIN")  # SUPER_ADMIN | ORG_ADMIN | CAMPAIGN_ADMIN
     organization_id = Column(Integer, ForeignKey("organizations.id"))
+    name = Column(String(255))
+    org_name = Column(String(255))
     is_active = Column(Boolean, default=True, nullable=False)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+
+class PendingSignup(Base):
+    """회원가입 대기. 승인 시 admin_users로 이전."""
+    __tablename__ = "pending_signups"
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    email = Column(String(255), nullable=False)
+    password_hash = Column(String(255), nullable=False)
+    name = Column(String(255), nullable=False)
+    phone = Column(String(64))
+    org_type = Column(String(32), nullable=False)
+    sido_code = Column(String(8))
+    sido_name = Column(String(128))
+    sigungu_code = Column(String(16))
+    sigungu_name = Column(String(128))
+    org_name = Column(String(255))
+    department = Column(String(255))
+    status = Column(String(16), nullable=False, default="pending")  # pending | approved | rejected
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
@@ -1794,6 +1816,50 @@ class LoginRequest(BaseModel):
     password: str = Field(..., description="비밀번호")
 
 
+class SignupRequest(BaseModel):
+    """회원가입(대기). 승인 후 admin_users에 생성되어 로그인 가능."""
+    email: str = Field(..., description="가입·로그인 ID(이메일)")
+    password: str = Field(..., description="비밀번호(저장 시 해시)")
+    name: str = Field(..., description="이름")
+    phone: Optional[str] = Field(None, description="연락처")
+    orgType: Literal["지자체", "기관"] = Field(..., description="소속 유형")
+    sidoCode: Optional[str] = Field(None, description="시·도 코드")
+    sidoName: Optional[str] = Field(None, description="시·도명")
+    sigunguCode: Optional[str] = Field(None, description="시·군·구 코드")
+    sigunguName: Optional[str] = Field(None, description="시·군·구명")
+    orgName: Optional[str] = Field(None, description="기관·부서명")
+    department: Optional[str] = Field(None, description="부서")
+
+
+class SignupResponse(BaseModel):
+    ok: bool = True
+    message: str = Field("가입 신청이 접수되었습니다. 관리자 승인 후 로그인할 수 있습니다.", description="안내 메시지")
+
+
+class ApproveUserRequest(BaseModel):
+    """가입 대기 사용자를 승인하여 admin_users에 생성."""
+    email: str = Field(..., description="승인할 가입자 이메일")
+    role: str = Field(..., description="org_admin | auditor | SUPER_ADMIN")
+    campaignIds: List[int] = Field(default_factory=list, description="접근 허용 캠페인 ID 목록")
+    orgName: Optional[str] = Field(None, description="기관명")
+    name: Optional[str] = Field(None, description="이름")
+
+
+class ApproveUserResponse(BaseModel):
+    ok: bool = True
+    message: str = Field("승인되었습니다. 해당 이메일로 로그인할 수 있습니다.", description="안내 메시지")
+
+
+class PendingSignupItem(BaseModel):
+    """가입 대기 항목 (승인 API 목록용)."""
+    id: int
+    email: str
+    name: str
+    orgType: str
+    orgName: Optional[str] = None
+    createdAt: Optional[str] = None
+
+
 class LoginResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
@@ -1879,6 +1945,46 @@ async def auth_login(body: LoginRequest, db: Session = Depends(get_db)):
             "campaignIds": campaign_ids,
         },
     )
+
+
+@app.post(
+    "/api/v1/auth/signup",
+    response_model=SignupResponse,
+    summary="회원가입(대기)",
+    description="가입 신청을 pending_signups에 저장. 관리자 승인 후 admin_users에 생성되어 로그인 가능.",
+    tags=["Admin - Auth"],
+)
+async def auth_signup(body: SignupRequest, db: Session = Depends(get_db)):
+    email = (body.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email required")
+    if not body.name or not body.name.strip():
+        raise HTTPException(status_code=400, detail="Name required")
+    ok, err = _validate_password(body.password)
+    if not ok:
+        raise HTTPException(status_code=400, detail=err)
+    if db.query(AdminUser).filter(func.lower(AdminUser.email) == email).first():
+        raise HTTPException(status_code=409, detail="이미 가입된 이메일입니다.")
+    if db.query(PendingSignup).filter(func.lower(PendingSignup.email) == email, PendingSignup.status == "pending").first():
+        raise HTTPException(status_code=409, detail="동일 이메일로 이미 가입 신청 중입니다.")
+    pw_bytes = _password_to_bytes(body.password)
+    pending = PendingSignup(
+        email=email,
+        password_hash=bcrypt.hashpw(pw_bytes, bcrypt.gensalt()).decode("utf-8"),
+        name=(body.name or "").strip(),
+        phone=(body.phone or "").strip() or None,
+        org_type=body.orgType,
+        sido_code=(body.sidoCode or "").strip() or None,
+        sido_name=(body.sidoName or "").strip() or None,
+        sigungu_code=(body.sigunguCode or "").strip() or None,
+        sigungu_name=(body.sigunguName or "").strip() or None,
+        org_name=(body.orgName or "").strip() or None,
+        department=(body.department or "").strip() or None,
+        status="pending",
+    )
+    db.add(pending)
+    db.commit()
+    return SignupResponse(ok=True, message="가입 신청이 접수되었습니다. 관리자 승인 후 로그인할 수 있습니다.")
 
 
 @app.get(
@@ -2045,6 +2151,93 @@ async def admin_create_user(
             else "User creation failed. Check server logs (admin_create_user)."
         )
         raise HTTPException(status_code=500, detail=detail) from e
+
+
+def _normalize_approve_role(role: str) -> str:
+    """승인 API role: org_admin -> ORG_ADMIN, auditor -> CAMPAIGN_ADMIN, SUPER_ADMIN -> SUPER_ADMIN."""
+    r = (role or "").strip().lower()
+    if r == "super_admin":
+        return "SUPER_ADMIN"
+    if r == "org_admin":
+        return "ORG_ADMIN"
+    if r == "auditor":
+        return "CAMPAIGN_ADMIN"
+    return "CAMPAIGN_ADMIN"
+
+
+@app.get(
+    "/api/v1/admin/users/pending",
+    response_model=List[PendingSignupItem],
+    summary="가입 대기 목록",
+    description="승인 대기 중인 회원가입 신청 목록. 슈퍼관리자만 조회 가능.",
+    tags=["Admin - Users"],
+)
+async def admin_list_pending_signups(
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    _require_super(ctx)
+    rows = db.query(PendingSignup).filter(PendingSignup.status == "pending").order_by(PendingSignup.created_at.desc()).all()
+    return [
+        PendingSignupItem(
+            id=p.id,
+            email=p.email,
+            name=p.name,
+            orgType=p.org_type or "",
+            orgName=p.org_name,
+            createdAt=p.created_at.isoformat() if p.created_at else None,
+        )
+        for p in rows
+    ]
+
+
+@app.post(
+    "/api/v1/admin/users/approve",
+    response_model=ApproveUserResponse,
+    summary="가입 대기 사용자 승인",
+    description="pending_signups에서 조회 후 admin_users에 생성. 승인된 이메일·비밀번호로 로그인 가능.",
+    tags=["Admin - Users"],
+)
+async def admin_approve_user(
+    body: ApproveUserRequest,
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    _require_super(ctx)
+    if not JWT_SECRET:
+        raise HTTPException(status_code=503, detail="JWT_SECRET required for user management")
+    email = (body.email or "").strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="Email required")
+    pending = db.query(PendingSignup).filter(func.lower(PendingSignup.email) == email, PendingSignup.status == "pending").first()
+    if not pending:
+        raise HTTPException(status_code=404, detail="해당 이메일의 가입 신청이 없거나 이미 처리되었습니다.")
+    if db.query(AdminUser).filter(func.lower(AdminUser.email) == email).first():
+        pending.status = "approved"
+        pending.updated_at = datetime.utcnow()
+        db.commit()
+        raise HTTPException(status_code=409, detail="이미 해당 이메일로 등록된 사용자가 있습니다.")
+    role = _normalize_approve_role(body.role)
+    name = (body.name or "").strip() or pending.name
+    org_name = (body.orgName or "").strip() or pending.org_name or None
+    user = AdminUser(
+        email=email,
+        password_hash=pending.password_hash,
+        role=role,
+        organization_id=None,
+        name=name or None,
+        org_name=org_name,
+        is_active=True,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    for cid in body.campaignIds or []:
+        db.add(AdminCampaignAccess(admin_user_id=user.id, campaign_id=int(cid)))
+    pending.status = "approved"
+    pending.updated_at = datetime.utcnow()
+    db.commit()
+    return ApproveUserResponse(ok=True, message="승인되었습니다. 해당 이메일로 로그인할 수 있습니다.")
 
 
 @app.get(

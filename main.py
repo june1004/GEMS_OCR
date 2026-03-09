@@ -2564,6 +2564,8 @@ class AdminCampaignItem(BaseModel):
     budget: Optional[int] = None
     projectType: Optional[ProjectType] = None
     priority: int = 100
+    min_amount_stay: int = Field(60000, description="STAY 최소 금액(정책 기준). 검수 큐·우측 패널 안내용")
+    min_amount_tour: int = Field(50000, description="TOUR 최소 금액(정책 기준). 검수 큐·우측 패널 안내용")
     createdAt: Optional[str] = None
     updatedAt: Optional[str] = None
 
@@ -2581,6 +2583,15 @@ class AdminCampaignUpsertRequest(BaseModel):
     endDate: Optional[str] = None    # YYYY-MM-DD
     projectType: Optional[ProjectType] = None
     priority: int = 100
+
+
+def _admin_min_amounts_from_config(db: Session) -> tuple:
+    """JudgmentRuleConfig에서 min_amount_stay, min_amount_tour 반환. 없으면 60000, 50000."""
+    try:
+        cfg = _get_judgment_rule_config(db)
+        return (int(cfg.min_amount_stay or 60000), int(cfg.min_amount_tour or 50000))
+    except Exception:
+        return (60000, 50000)
 
 
 def _admin_fetch_campaign_rows(db: Session) -> List[Dict[str, Any]]:
@@ -2638,6 +2649,7 @@ async def admin_list_campaigns(db: Session = Depends(get_db), ctx: AdminContext 
         rows = [r for r in rows if int(r.get("campaign_id") or 0) in ctx.campaign_ids]
     elif not ctx.is_super:
         rows = []
+    min_stay, min_tour = _admin_min_amounts_from_config(db)
     items: List[AdminCampaignItem] = []
     for r in rows:
         sd = _parse_date_any(r.get("start_date"))
@@ -2653,6 +2665,8 @@ async def admin_list_campaigns(db: Session = Depends(get_db), ctx: AdminContext 
                 budget=int(r["budget"]) if r.get("budget") is not None else None,
                 projectType=ProjectType(r["project_type"]) if (r.get("project_type") in ("STAY", "TOUR")) else None,
                 priority=int(r.get("priority") or 100),
+                min_amount_stay=min_stay,
+                min_amount_tour=min_tour,
                 createdAt=(r.get("created_at").isoformat() if isinstance(r.get("created_at"), datetime) else None),
                 updatedAt=(r.get("updated_at").isoformat() if isinstance(r.get("updated_at"), datetime) else None),
             )
@@ -2682,6 +2696,7 @@ async def admin_get_campaign(
         raise HTTPException(status_code=404, detail="Campaign not found")
     sd = _parse_date_any(r.get("start_date"))
     ed = _parse_date_any(r.get("end_date"))
+    min_stay, min_tour = _admin_min_amounts_from_config(db)
     return AdminCampaignItem(
         campaignId=int(r.get("campaign_id")),
         name=r.get("campaign_name"),
@@ -2692,6 +2707,8 @@ async def admin_get_campaign(
         budget=int(r["budget"]) if r.get("budget") is not None else None,
         projectType=ProjectType(r["project_type"]) if (r.get("project_type") in ("STAY", "TOUR")) else None,
         priority=int(r.get("priority") or 100),
+        min_amount_stay=min_stay,
+        min_amount_tour=min_tour,
         createdAt=(r.get("created_at").isoformat() if isinstance(r.get("created_at"), datetime) else None),
         updatedAt=(r.get("updated_at").isoformat() if isinstance(r.get("updated_at"), datetime) else None),
     )
@@ -2752,6 +2769,7 @@ async def admin_create_campaign(
         },
     )
     db.commit()
+    min_stay, min_tour = _admin_min_amounts_from_config(db)
     return AdminCampaignItem(
         campaignId=cid,
         name=body.name,
@@ -2761,6 +2779,8 @@ async def admin_create_campaign(
         endDate=ed.isoformat() if ed else None,
         projectType=body.projectType,
         priority=pr,
+        min_amount_stay=min_stay,
+        min_amount_tour=min_tour,
     )
 
 
@@ -2844,7 +2864,7 @@ async def admin_update_campaign(
         },
     )
     db.commit()
-
+    min_stay, min_tour = _admin_min_amounts_from_config(db)
     return AdminCampaignItem(
         campaignId=int(campaignId),
         name=body.name,
@@ -2854,6 +2874,8 @@ async def admin_update_campaign(
         endDate=ed.isoformat() if ed else None,
         projectType=body.projectType,
         priority=pr,
+        min_amount_stay=min_stay,
+        min_amount_tour=min_tour,
     )
 
 

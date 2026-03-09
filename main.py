@@ -1856,7 +1856,7 @@ class PendingSignupItem(BaseModel):
     email: str
     name: str
     orgType: str
-    orgName: Optional[str] = None
+    org_name: Optional[str] = Field(None, description="기관·부서명 (DB 컬럼 그대로)")
     sidoName: Optional[str] = None
     sigunguName: Optional[str] = None
     phone: Optional[str] = None
@@ -1982,7 +1982,7 @@ async def auth_signup(body: SignupRequest, db: Session = Depends(get_db)):
         sido_name=(body.sidoName or "").strip() or None,
         sigungu_code=(body.sigunguCode or "").strip() or None,
         sigungu_name=(body.sigunguName or "").strip() or None,
-        org_name=(body.orgName or "").strip() or None,
+        org_name=(body.orgName if body.orgName is not None else "").strip() or None,  # 요청 orgName 반드시 저장
         department=(body.department or "").strip() or None,
         status="pending",
     )
@@ -2199,7 +2199,7 @@ async def admin_list_pending_signups(
             email=p.email,
             name=p.name,
             orgType=p.org_type or "",
-            orgName=p.org_name,
+            org_name=p.org_name,
             sidoName=p.sido_name,
             sigunguName=p.sigungu_name,
             phone=p.phone,

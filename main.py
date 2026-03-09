@@ -3690,6 +3690,9 @@ class AdminSubmissionListItem(BaseModel):
     status: Optional[str] = None
     total_amount: int = 0
     created_at: Optional[str] = None
+    thumbnail_url: Optional[str] = Field(None, description="목록·호버 썸네일 미리보기용 presigned URL(첫 장)")
+    confidence: Optional[int] = Field(None, description="신뢰도 0~100, 슬라이더 필터용(첫 장 또는 최소값)")
+    integrityCheck: Optional[bool] = Field(None, description="무결성 OK 표시용. FIT이고 반려사유 없으면 True")
 
 
 class AdminSubmissionListResponse(BaseModel):
@@ -3774,19 +3777,132 @@ async def admin_list_submissions(
         v = (raw or "").strip().upper()
         return "STAY" if v == "STAY" else "TOUR"
 
-    items = [
-        AdminSubmissionListItem(
-            receiptId=r.submission_id,
-            userUuid=r.user_uuid,
-            project_type=_normalize_project_type_for_response(r.project_type),
-            projectType=_normalize_project_type_for_response(r.project_type),
-            status=r.status,
-            total_amount=r.total_amount or 0,
-            created_at=r.created_at.isoformat() if r.created_at else None,
+    submission_ids = [r.submission_id for r in rows]
+    first_item_per_sub: Dict[str, ReceiptItem] = {}
+    min_confidence_per_sub: Dict[str, Optional[int]] = {}
+    if submission_ids:
+        receipt_items = (
+            db.query(ReceiptItem)
+            .filter(ReceiptItem.submission_id.in_(submission_ids))
+            .order_by(ReceiptItem.submission_id, ReceiptItem.seq_no.asc())
+            .all()
         )
-        for r in rows
-    ]
+        for it in receipt_items:
+            sid = it.submission_id
+            if sid not in first_item_per_sub:
+                first_item_per_sub[sid] = it
+            c = getattr(it, "confidence_score", None)
+            if c is not None and isinstance(c, (int, float)):
+                ci = int(c) if 0 <= c <= 100 else max(0, min(100, int(c)))
+                if sid not in min_confidence_per_sub or (min_confidence_per_sub[sid] is not None and ci < min_confidence_per_sub[sid]):
+                    min_confidence_per_sub[sid] = ci
+        for sid in submission_ids:
+            if sid not in min_confidence_per_sub and sid in first_item_per_sub:
+                fc = getattr(first_item_per_sub[sid], "confidence_score", None)
+                min_confidence_per_sub[sid] = max(0, min(100, int(fc))) if fc is not None else None
+
+    items = []
+    for r in rows:
+        first_item = first_item_per_sub.get(r.submission_id)
+        thumb_url = _presigned_get_url_for_key(first_item.image_key) if first_item and (first_item.image_key or "").strip() else None
+        conf = min_confidence_per_sub.get(r.submission_id)
+        integrity_ok = bool(r.status == "FIT" and not (r.fail_reason or r.global_fail_reason))
+        items.append(
+            AdminSubmissionListItem(
+                receiptId=r.submission_id,
+                userUuid=r.user_uuid,
+                project_type=_normalize_project_type_for_response(r.project_type),
+                projectType=_normalize_project_type_for_response(r.project_type),
+                status=r.status,
+                total_amount=r.total_amount or 0,
+                created_at=r.created_at.isoformat() if r.created_at else None,
+                thumbnail_url=thumb_url,
+                confidence=conf,
+                integrityCheck=integrity_ok,
+            )
+        )
     return AdminSubmissionListResponse(total=total, items=items)
+
+
+class AdminBulkRejectRequest(BaseModel):
+    receiptIds: List[str] = Field(..., min_length=1, description="반려할 제출 ID 목록")
+    reasonCode: Optional[str] = Field(None, description="프리셋 코드: image_unreadable, duplicate, out_of_scope, below_min_amount 등")
+    reasonMessage: Optional[str] = Field(None, description="시민 전달용 반려 사유 문구(알림톡 등)")
+    tagAsError: bool = Field(False, description="True 시 학습/부정수급 오류 데이터 분류용 태그")
+
+
+class AdminBulkRejectResponse(BaseModel):
+    processed: int = Field(..., description="실제 반려 처리된 건수")
+    skipped: List[str] = Field(default_factory=list, description="권한 없음/미존재 등으로 스킵된 receiptId")
+    failed: List[str] = Field(default_factory=list, description="처리 실패 receiptId")
+
+
+@app.post(
+    "/api/v1/admin/submissions/bulk-reject",
+    response_model=AdminBulkRejectResponse,
+    summary="일괄 반려",
+    description="선택 제출 건을 UNFIT 처리. reasonMessage를 fail_reason에 저장. Audit Log에 실행자·IP·건수·사유 기록.",
+    tags=["Admin - Submissions"],
+)
+async def admin_bulk_reject(
+    body: AdminBulkRejectRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    reason_msg = (body.reasonMessage or body.reasonCode or "일괄 반려").strip() or "일괄 반려"
+    reason_code = (body.reasonCode or "").strip() or None
+    client_ip = request.client.host if request.client else None
+    forwarded = request.headers.get("x-forwarded-for")
+    if forwarded:
+        client_ip = forwarded.split(",")[0].strip() or client_ip
+    processed: List[str] = []
+    skipped: List[str] = []
+    failed: List[str] = []
+    for rid in body.receiptIds:
+        rid = (rid or "").strip()
+        if not rid:
+            continue
+        sub = db.query(Submission).filter(Submission.submission_id == rid).first()
+        if not sub:
+            skipped.append(rid)
+            continue
+        if not ctx.is_super and ctx.campaign_ids and (sub.campaign_id or 0) not in ctx.campaign_ids:
+            skipped.append(rid)
+            continue
+        try:
+            sub.status = "UNFIT"
+            sub.fail_reason = reason_msg
+            sub.global_fail_reason = reason_msg
+            sub.updated_at = datetime.utcnow()
+            line = f"BULK_REJECT({datetime.utcnow().isoformat()}, actor={ctx.actor}, reasonCode={reason_code or '-'}, tagAsError={body.tagAsError}): {reason_msg}"
+            existing = sub.audit_trail or sub.audit_log or ""
+            sub.audit_trail = (existing + " | " + line).strip(" |") if existing else line
+            sub.audit_log = sub.audit_trail
+            processed.append(rid)
+        except Exception:
+            failed.append(rid)
+    if processed:
+        db.commit()
+    _audit_log(
+        db,
+        actor=ctx.actor,
+        action="BULK_REJECT",
+        target_type="submission",
+        target_id=",".join(processed[:10]) + ("..." if len(processed) > 10 else ""),
+        meta={
+            "receiptIds": body.receiptIds,
+            "processed_count": len(processed),
+            "skipped_count": len(skipped),
+            "failed_count": len(failed),
+            "reasonCode": reason_code,
+            "reasonMessage": reason_msg[:500] if reason_msg else None,
+            "tagAsError": body.tagAsError,
+            "client_ip": client_ip,
+        },
+    )
+    db.commit()
+    return AdminBulkRejectResponse(processed=len(processed), skipped=skipped, failed=failed)
 
 
 # 5-3-1. 대시보드 집계 API
@@ -3990,6 +4106,26 @@ async def admin_get_submission(receiptId: str, db: Session = Depends(get_db), ct
         },
         statusPayload=status_payload,
     )
+
+
+def _presigned_get_url_for_key(image_key: str, expires_sec: Optional[int] = None) -> Optional[str]:
+    """이미지 키에 대한 GET용 presigned URL 생성. 목록 썸네일 등에 사용."""
+    key = (image_key or "").strip()
+    if not key:
+        return None
+    try:
+        params = {"Bucket": S3_BUCKET, "Key": key}
+        if key.lower().endswith(".png"):
+            params["ResponseContentType"] = "image/png"
+        elif key.lower().endswith((".jpg", ".jpeg")):
+            params["ResponseContentType"] = "image/jpeg"
+        return s3_client.generate_presigned_url(
+            "get_object",
+            Params=params,
+            ExpiresIn=expires_sec or PRESIGNED_URL_EXPIRES_SEC,
+        )
+    except Exception:
+        return None
 
 
 class AdminReceiptImageItem(BaseModel):

@@ -80,6 +80,8 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip() or None
 # 크론 잡 전용 시크릿: 설정 시 X-Cron-Secret으로 /api/v1/admin/jobs/cron/* 호출 가능 (관리자 키 없이)
 CRON_SECRET = os.getenv("CRON_SECRET", "").strip() or None
+# Presigned URL 유효 시간(초). 기본 10분(600). 환경변수 PRESIGNED_URL_EXPIRES_SEC 로 변경 가능.
+PRESIGNED_URL_EXPIRES_SEC = max(60, min(3600, int(os.getenv("PRESIGNED_URL_EXPIRES_SEC", "600"))))
 # JWT·담당자 로그인 (이메일/비밀번호). 설정 시 로그인 API·Bearer 인증 사용
 JWT_SECRET = os.getenv("JWT_SECRET", "").strip() or None
 JWT_ALGORITHM = "HS256"
@@ -969,7 +971,7 @@ async def get_presigned_url(
     db: Session = Depends(get_db),
 ):
     """
-    1단계: 고객 영수증 업로드용 Presigned URL 발급 (10분 유효).
+    1단계: 고객 영수증 업로드용 Presigned URL 발급 (기본 10분 유효, PRESIGNED_URL_EXPIRES_SEC 설정 가능).
     - type 미전달 시 TOUR로 처리. objectKey는 항상 {STAY|TOUR}/receipts/... 형태.
     - receiptId를 전달하면 동일 신청(합산형)으로 이미지를 계속 추가할 수 있음.
     """
@@ -986,7 +988,7 @@ async def get_presigned_url(
         url = s3_client.generate_presigned_url(
             "put_object",
             Params={"Bucket": S3_BUCKET, "Key": object_key, "ContentType": contentType},
-            ExpiresIn=600,
+            ExpiresIn=PRESIGNED_URL_EXPIRES_SEC,
         )
     except ClientError as e:
         err = e.response.get("Error", {})
@@ -3675,7 +3677,7 @@ class AdminReceiptImageItem(BaseModel):
 
 class AdminReceiptImagesResponse(BaseModel):
     receiptId: str
-    expiresIn: int = 600
+    expiresIn: int = Field(default=600, description="Presigned URL 유효 시간(초). 서버 설정(PRESIGNED_URL_EXPIRES_SEC) 반영.")
     items: List[AdminReceiptImageItem] = Field(default_factory=list)
 
 
@@ -3712,7 +3714,7 @@ async def admin_get_receipt_images(receiptId: str, db: Session = Depends(get_db)
         url = s3_client.generate_presigned_url(
             "get_object",
             Params=params,
-            ExpiresIn=600,
+            ExpiresIn=PRESIGNED_URL_EXPIRES_SEC,
         )
         items.append(
             AdminReceiptImageItem(
@@ -3722,7 +3724,7 @@ async def admin_get_receipt_images(receiptId: str, db: Session = Depends(get_db)
                 image_url=url,
             )
         )
-    return AdminReceiptImagesResponse(receiptId=rid, items=items)
+    return AdminReceiptImagesResponse(receiptId=rid, expiresIn=PRESIGNED_URL_EXPIRES_SEC, items=items)
 
 
 class AdminOverrideRequest(BaseModel):

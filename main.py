@@ -4,6 +4,7 @@ import re
 import time
 import uuid
 import json
+from urllib.parse import unquote
 import asyncio
 import logging
 from enum import Enum
@@ -899,6 +900,25 @@ async def health_check():
     }
 
 
+def _normalize_user_uuid(raw: Optional[str]) -> str:
+    """
+    Presigned(쿼리)와 Complete(JSON body) 간 userUuid 인코딩 차이로 403 방지.
+    URL 디코딩을 반복 적용해 %253D%253D → == 등으로 통일, 공백 trim.
+    """
+    if raw is None:
+        return ""
+    s = (raw or "").strip()
+    for _ in range(5):
+        prev = s
+        try:
+            s = unquote(s)
+        except Exception:
+            break
+        if s == prev:
+            break
+    return (s or "").strip()
+
+
 @app.post(
     "/api/v1/receipts/presigned-url",
     response_model=PresignedUrlResponse,
@@ -917,6 +937,7 @@ async def get_presigned_url(
     - type 미전달 시 TOUR로 처리. objectKey는 항상 {STAY|TOUR}/receipts/... 형태.
     - receiptId를 전달하면 동일 신청(합산형)으로 이미지를 계속 추가할 수 있음.
     """
+    user_uuid = _normalize_user_uuid(userUuid)
     receipt_id = receiptId or str(uuid.uuid4())
     # MinIO STAY/TOUR 폴더 분기: type으로 저장 경로 결정 → OCR 시 경로 기반 모델 선택
     raw = type.value if hasattr(type, "value") else str(type)
@@ -950,18 +971,18 @@ async def get_presigned_url(
     try:
         existing = db.query(Submission).filter(Submission.submission_id == receipt_id).first()
         if existing:
-            if existing.user_uuid != userUuid:
+            if _normalize_user_uuid(existing.user_uuid) != user_uuid:
                 raise HTTPException(status_code=403, detail="receiptId owner mismatch")
             # receiptId 재사용은 "같은 신청(같은 type)"에 한해서만 허용 (STAY↔TOUR 엉킴 방지)
             if (existing.project_type or "").strip() and existing.project_type != type:
                 raise HTTPException(status_code=409, detail="receiptId type mismatch")
             # campaign_id는 presigned 최초 생성 시 서버가 고정. 기존 submission에서는 덮어쓰지 않는다.
         else:
-            campaign_id = _resolve_campaign_id_for_presigned(db, userUuid, type)
+            campaign_id = _resolve_campaign_id_for_presigned(db, user_uuid, type)
             db.add(
                 Submission(
                     submission_id=receipt_id,
-                    user_uuid=userUuid,
+                    user_uuid=user_uuid,
                     project_type=type,
                     campaign_id=campaign_id,
                     status="PENDING",
@@ -1035,7 +1056,7 @@ async def upload_receipt_via_api(
         db.add(
             Submission(
                 submission_id=receipt_id,
-                user_uuid=userUuid,
+                user_uuid=_normalize_user_uuid(userUuid),
                 project_type=type,
                 campaign_id=1,
                 status="PENDING",
@@ -1059,7 +1080,7 @@ async def _submit_receipt_common(req: CompleteRequest, background_tasks: Backgro
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
 
-    if submission.user_uuid != req.userUuid:
+    if _normalize_user_uuid(submission.user_uuid) != _normalize_user_uuid(req.userUuid):
         raise HTTPException(status_code=403, detail="receiptId owner mismatch")
 
     # receiptId는 생성 시 type이 고정됨. 다른 type으로 complete 호출 시 엉킴 방지.

@@ -91,6 +91,22 @@ PASSWORD_PATTERN = re.compile(
 # - 현재는 DEFAULT_CAMPAIGN_ID(기본 1) 중심으로 운영하되, campaigns 테이블 기반으로 확장 가능.
 DEFAULT_CAMPAIGN_ID = int(os.getenv("DEFAULT_CAMPAIGN_ID", "1"))
 
+# 영수증 데이터 기준 시각(UTC): 이 시각 이후 인입된 데이터만 중복 판정·집계 등에 사용. 이전 데이터와 섞이지 않게 함.
+# 예: 2026-03-09 09:00 KST = 2026-03-09T00:00:00 (UTC) → RECEIPT_DATA_CUTOFF_UTC=2026-03-09T00:00:00
+def _parse_receipt_data_cutoff() -> Optional[datetime]:
+    raw = (os.getenv("RECEIPT_DATA_CUTOFF_UTC") or "").strip()
+    if not raw:
+        return None
+    try:
+        return dateutil_parser.parse(raw)
+    except Exception:
+        return None
+
+
+RECEIPT_DATA_CUTOFF_UTC = _parse_receipt_data_cutoff()
+if RECEIPT_DATA_CUTOFF_UTC is not None:
+    logger.info("RECEIPT_DATA_CUTOFF_UTC 적용: %s (이 시각 이후 데이터만 중복 판정)", RECEIPT_DATA_CUTOFF_UTC.isoformat())
+
 # 2. DB 및 S3 클라이언트 초기화
 engine = create_engine(DATABASE_URL)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -1905,6 +1921,12 @@ class MeResponse(BaseModel):
     isSuper: bool = False
 
 
+class AdminContextUpdateRequest(BaseModel):
+    """PUT /api/v1/admin/context 요청. FE 선택 캠페인 등 컨텍스트 저장용."""
+    lastSelectedCampaignId: Optional[int] = None
+    lastSelectedProjectId: Optional[int] = None
+
+
 class OrganizationCreateRequest(BaseModel):
     name: str = Field(..., min_length=1)
     sidoCode: str = Field(..., description="행정 시도 코드(예: 42)")
@@ -2050,7 +2072,23 @@ async def admin_me(ctx: AdminContext = Depends(get_admin_context), db: Session =
     description="GET /api/v1/admin/me 와 동일. FE에서 context 로 호출하는 경우용.",
     tags=["Admin - Auth"],
 )
-async def admin_context(ctx: AdminContext = Depends(get_admin_context), db: Session = Depends(get_db)):
+async def admin_context_get(ctx: AdminContext = Depends(get_admin_context), db: Session = Depends(get_db)):
+    return await admin_me(ctx, db)
+
+
+@app.put(
+    "/api/v1/admin/context",
+    response_model=MeResponse,
+    summary="담당자 컨텍스트 저장 (FE 호환)",
+    description="FE 선택 캠페인 등 컨텍스트를 받고, 현재 담당자 정보(동일한 MeResponse)를 반환. 405 방지용.",
+    tags=["Admin - Auth"],
+)
+async def admin_context_put(
+    body: Optional[AdminContextUpdateRequest] = Body(None),
+    ctx: AdminContext = Depends(get_admin_context),
+    db: Session = Depends(get_db),
+):
+    # body는 추후 DB/세션 저장 시 사용. 현재는 GET과 동일 응답으로 FE 호환만 제공.
     return await admin_me(ctx, db)
 
 
@@ -4493,6 +4531,7 @@ def _check_duplicate_receipt_item(
     """
     item 단위 중복 체크:
     biz_num + pay_date + amount + card_num(0000 포함) 조합이 다른 FIT 신청에 존재하면 True.
+    RECEIPT_DATA_CUTOFF_UTC 설정 시, 해당 시각 이후 생성된 submission만 비교(이전 데이터와 중복 처리 방지).
     """
     if not biz_num:
         return False
@@ -4506,6 +4545,8 @@ def _check_duplicate_receipt_item(
         .filter(ReceiptItem.submission_id != submission_id)
         .filter(Submission.status == "FIT")
     )
+    if RECEIPT_DATA_CUTOFF_UTC is not None:
+        q = q.filter(Submission.created_at >= RECEIPT_DATA_CUTOFF_UTC)
     return q.first() is not None
 
 

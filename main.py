@@ -4143,6 +4143,17 @@ async def _call_naver_ocr_binary(
     headers = {"X-OCR-SECRET": secret}
     async with httpx.AsyncClient(timeout=30.0) as client:
         response = await client.post(url, headers=headers, files=files)
+        if response.status_code >= 400:
+            try:
+                body = response.text
+                if len(body) > 500:
+                    body = body[:500] + "..."
+                logger.warning(
+                    "Naver OCR %s (domain=%s): status=%s body=%s",
+                    receipt_id, domain_type, response.status_code, body,
+                )
+            except Exception:
+                pass
         response.raise_for_status()
         try:
             ocr_data = response.json()

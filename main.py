@@ -1851,12 +1851,16 @@ class ApproveUserResponse(BaseModel):
 
 
 class PendingSignupItem(BaseModel):
-    """가입 대기 항목 (승인 API 목록용)."""
+    """가입 대기 항목 (승인 API 목록용). 승인 시 판단용 상세 필드 포함."""
     id: int
     email: str
     name: str
     orgType: str
     orgName: Optional[str] = None
+    sidoName: Optional[str] = None
+    sigunguName: Optional[str] = None
+    phone: Optional[str] = None
+    department: Optional[str] = None
     createdAt: Optional[str] = None
 
 
@@ -2196,6 +2200,10 @@ async def admin_list_pending_signups(
             name=p.name,
             orgType=p.org_type or "",
             orgName=p.org_name,
+            sidoName=p.sido_name,
+            sigunguName=p.sigungu_name,
+            phone=p.phone,
+            department=p.department,
             createdAt=p.created_at.isoformat() if p.created_at else None,
         )
         for p in rows

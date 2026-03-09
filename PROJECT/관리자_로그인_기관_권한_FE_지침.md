@@ -38,14 +38,18 @@
 **POST /api/v1/auth/login**
 
 - Request body: `{ "email": "admin@example.com", "password": "Abc1!xyz" }`
-- Response: `{ "access_token": "...", "token_type": "bearer", "user": { "id", "email", "role", "organizationId", "campaignIds" } }`
+- Response: `{ "access_token": "...", "token_type": "bearer", "user": { "id", "email", "role", "name", "organizationId", "org_name", "campaignIds" } }`
+- `user.name`: 담당자 이름(없으면 FE에서 이메일 @ 앞부분 표시)
+- `user.org_name`: 소속명(기관명). FE에서 "소속(기관정보)" 표시 시 `org_type`과 조합 가능
+- `user.campaignIds`: 접근 가능 캠페인 ID 배열. 담당자는 이 ID만 캠페인 선택·검수 큐에서 사용
 - 401: 이메일/비밀번호 오류 또는 비활성 계정
 
 **GET /api/v1/admin/me**
 
 - Header: `Authorization: Bearer <token>` 또는 `X-Admin-Key`
-- Response: `{ "id", "email", "role", "organizationId", "organizationName", "campaignIds", "isSuper" }`
-- 담당자: `campaignIds`에 접근 가능한 캠페인 ID 목록. 슈퍼: `isSuper: true`, `campaignIds` 무시.
+- Response: `{ "id", "email", "role", "name", "organizationId", "organizationName", "org_name", "campaignIds", "isSuper" }`
+- 담당자: `campaignIds`에 접근 가능한 캠페인 ID 목록. FE는 `allowedCampaignIds`로 저장 후 캠페인/검수 큐 필터에 사용.
+- 슈퍼: `isSuper: true`, `campaignIds` 빈 배열.
 
 ---
 
@@ -74,6 +78,14 @@
 - Request: `{ "email", "password", "role": "CAMPAIGN_ADMIN", "organizationId": null, "campaignIds": [1, 2] }`
 - 비밀번호: 위 비밀번호 정책 만족해야 400 없음.
 - 409: 이메일 중복.
+
+**GET /api/v1/admin/users** (담당자 목록, 슈퍼관리자 전용)
+
+- Response: `AdminUserItem[]`. 각 항목: `id`, `email`, `role`, `organizationId`, `organization_name`, `name`, `org_name`, `org_type`, `isActive`, `campaignIds`, `createdAt`
+- `name`: 담당자 이름. 없으면 FE에서 이메일 @ 앞부분으로 표시(displayName)
+- `org_name` / `organization_name`: 소속(기관)명. FE에서 "소속(기관정보)" 컬럼에 `org_type`과 "지자체 · 강원특별자치도청" 형태로 표시(displayAffiliation)
+- `org_type`: 기관 유형(지자체 등). DB에 컬럼 없으면 null
+- `campaignIds`: 접근 캠페인 ID 배열. FE에서 배지로 표시, 매칭 없으면 "N건 (목록에 없음)"
 
 **PUT /api/v1/admin/users/{user_id}/campaigns**
 

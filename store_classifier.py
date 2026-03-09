@@ -20,8 +20,14 @@ logger = logging.getLogger(__name__)
 
 # Gemini API 설정 (환경변수 우선)
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
-# gemini-2.0-flash는 v1beta에서 404 가능. 1.5-flash는 안정 노출.
-GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-1.5-flash").strip()
+# v1beta에서 gemini-1.5-flash는 404(모델 단종). gemini-2.0-flash 사용. 단종 시 gemini-2.5-flash 등으로 변경.
+GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
+if "1.5-flash" in (GEMINI_MODEL or ""):
+    logger.warning(
+        "GEMINI_MODEL=%s is deprecated/retired (404). Using gemini-2.0-flash. Set GEMINI_MODEL=gemini-2.0-flash in env.",
+        GEMINI_MODEL,
+    )
+    GEMINI_MODEL = "gemini-2.0-flash"
 GEMINI_TIMEOUT_SEC = float(os.getenv("GEMINI_TIMEOUT_SEC", "12"))
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "32"))
 
@@ -165,7 +171,13 @@ def classify_with_gemini(
         logger.debug("Gemini response: no matching category in %s", raw[:80])
         return None, 0.0, "RULE"
     except Exception as e:
-        logger.warning("Gemini classification failed: %s", e)
+        if getattr(e, "response", None) and getattr(e.response, "status_code", None) == 404:
+            logger.warning(
+                "Gemini model not found (404). GEMINI_MODEL=%s. Try GEMINI_MODEL=gemini-2.0-flash or see https://ai.google.dev/gemini-api/docs/models",
+                GEMINI_MODEL,
+            )
+        else:
+            logger.warning("Gemini classification failed: %s", e)
         return None, 0.0, "RULE"
 
 

@@ -1956,8 +1956,10 @@ class MeResponse(BaseModel):
     id: int
     email: str
     role: str
+    name: Optional[str] = None
     organizationId: Optional[int] = None
     organizationName: Optional[str] = None
+    org_name: Optional[str] = None  # 소속명, FE 표시용
     campaignIds: List[int] = Field(default_factory=list)
     isSuper: bool = False
 
@@ -1995,6 +1997,10 @@ class AdminUserItem(BaseModel):
     email: str
     role: str
     organizationId: Optional[int] = None
+    organization_name: Optional[str] = None  # 소속(기관) 표시용, FE에서 org_name 대체 가능
+    name: Optional[str] = None
+    org_name: Optional[str] = None
+    org_type: Optional[str] = None  # 지자체 등, 소속 표시용
     isActive: bool = True
     campaignIds: List[int] = Field(default_factory=list)
     createdAt: Optional[str] = None
@@ -2027,13 +2033,19 @@ async def auth_login(body: LoginRequest, db: Session = Depends(get_db)):
     if user.role != "SUPER_ADMIN":
         rows = db.query(AdminCampaignAccess.campaign_id).filter(AdminCampaignAccess.admin_user_id == user.id).all()
         campaign_ids = [int(r[0]) for r in rows]
+    org_name = user.org_name
+    if org_name is None and user.organization_id:
+        org = db.query(Organization).filter(Organization.id == user.organization_id).first()
+        org_name = org.name if org else None
     return LoginResponse(
         access_token=token,
         user={
             "id": user.id,
             "email": user.email,
             "role": user.role,
+            "name": user.name,
             "organizationId": user.organization_id,
+            "org_name": org_name,
             "campaignIds": campaign_ids,
         },
     )
@@ -2091,16 +2103,18 @@ async def admin_me(ctx: AdminContext = Depends(get_admin_context), db: Session =
     user = db.query(AdminUser).filter(AdminUser.id == ctx.admin_user_id).first()
     if not user:
         return MeResponse(id=0, email=ctx.actor, role="SUPER_ADMIN", isSuper=True, campaignIds=[])
-    org_name = None
-    if user.organization_id:
+    org_name = user.org_name
+    if org_name is None and user.organization_id:
         org = db.query(Organization).filter(Organization.id == user.organization_id).first()
         org_name = org.name if org else None
     return MeResponse(
         id=user.id,
         email=user.email,
         role=user.role,
+        name=user.name,
         organizationId=user.organization_id,
         organizationName=org_name,
+        org_name=org_name,
         campaignIds=ctx.campaign_ids,
         isSuper=ctx.is_super,
     )
@@ -2250,11 +2264,20 @@ async def admin_create_user(
         db.commit()
         rows = db.query(AdminCampaignAccess.campaign_id).filter(AdminCampaignAccess.admin_user_id == user.id).all()
         campaign_ids = [int(r[0]) for r in rows]
+        org_name = user.org_name
+        if org_name is None and user.organization_id:
+            org = db.query(Organization).filter(Organization.id == user.organization_id).first()
+            org_name = org.name if org else None
         return AdminUserItem(
             id=user.id,
             email=user.email,
             role=user.role,
             organizationId=user.organization_id,
+            organization_name=org_name,
+            name=user.name,
+            org_name=org_name or user.org_name,
+            org_type=getattr(user, "org_type", None),
+            isActive=user.is_active,
             campaignIds=campaign_ids,
             createdAt=user.created_at.isoformat() if user.created_at else None,
         )
@@ -2378,12 +2401,20 @@ async def admin_list_users(
     out: List[AdminUserItem] = []
     for u in rows:
         acc = db.query(AdminCampaignAccess.campaign_id).filter(AdminCampaignAccess.admin_user_id == u.id).all()
+        org_name = u.org_name
+        if org_name is None and u.organization_id:
+            org = db.query(Organization).filter(Organization.id == u.organization_id).first()
+            org_name = org.name if org else None
         out.append(
             AdminUserItem(
                 id=u.id,
                 email=u.email,
                 role=u.role,
                 organizationId=u.organization_id,
+                organization_name=org_name,
+                name=u.name,
+                org_name=org_name,
+                org_type=getattr(u, "org_type", None),  # DB에 컬럼 있으면 사용
                 isActive=u.is_active,
                 campaignIds=[int(r[0]) for r in acc],
                 createdAt=u.created_at.isoformat() if u.created_at else None,
@@ -2413,11 +2444,19 @@ async def admin_set_user_campaigns(
         db.add(AdminCampaignAccess(admin_user_id=user_id, campaign_id=int(cid)))
     db.commit()
     acc = db.query(AdminCampaignAccess.campaign_id).filter(AdminCampaignAccess.admin_user_id == user_id).all()
+    org_name = user.org_name
+    if org_name is None and user.organization_id:
+        org = db.query(Organization).filter(Organization.id == user.organization_id).first()
+        org_name = org.name if org else None
     return AdminUserItem(
         id=user.id,
         email=user.email,
         role=user.role,
         organizationId=user.organization_id,
+        organization_name=org_name,
+        name=user.name,
+        org_name=org_name or user.org_name,
+        org_type=getattr(user, "org_type", None),
         isActive=user.is_active,
         campaignIds=[int(r[0]) for r in acc],
         createdAt=user.created_at.isoformat() if user.created_at else None,
@@ -4256,6 +4295,21 @@ async def _call_naver_ocr_with_retry(
     raise last_exc if last_exc else RuntimeError("Naver OCR failed")
 
 
+# Naver OCR: 도메인당 동시 1건 제한(rate limit "1 API calls per domain at the same time" 대응)
+_ocr_domain_locks: Dict[str, asyncio.Lock] = {}
+
+
+def _get_ocr_domain_lock(domain: str) -> asyncio.Lock:
+    if domain not in _ocr_domain_locks:
+        _ocr_domain_locks[domain] = asyncio.Lock()
+    return _ocr_domain_locks[domain]
+
+
+# PostgreSQL INTEGER 상한. 금액이 타임스탬프(ms) 등으로 오인되어 저장되는 것 방지.
+MAX_AMOUNT_DB = 2147483647
+# 영수증 금액으로 허용할 상한(원). 그 이상은 타임스탬프/오인식으로 간주.
+MAX_AMOUNT_SANE = 999_999_999
+
 # 영수증 OCR에서 결제/합계 금액으로 쓸 수 있는 라벨(한글). 여러 필드 인식률 향상용.
 _AMOUNT_LABELS = (
     "합계금액", "결제금액", "공급가액", "합계", "거래금액", "받은금액",
@@ -4300,6 +4354,15 @@ def _collect_amount_candidates(obj: Any, depth: int, candidates: List[int], seen
             _collect_amount_candidates(item, depth + 1, candidates, seen_keys)
 
 
+def _clamp_amount_for_db(value: Optional[int]) -> Optional[int]:
+    """DB 저장 가능 범위(0 ~ MAX_AMOUNT_DB)로 제한. 초과 시 None(타임스탬프 등 오인식 방지)."""
+    if value is None or value < 0:
+        return None
+    if value > MAX_AMOUNT_DB:
+        return None
+    return value
+
+
 def _extract_amount_from_result(result: dict) -> Optional[int]:
     """
     result에서 결제/합계 금액 추출. 우선순위:
@@ -4307,36 +4370,36 @@ def _extract_amount_from_result(result: dict) -> Optional[int]:
     2) paymentInfo.totalAmount / totalPrice / amount 등
     3) 합계금액·결제금액·공급가액·합계·거래금액·받은금액 라벨 매칭
     4) subTotal 부가세로 추정
+    - 반환값은 MAX_AMOUNT_DB 이하로 제한(타임스탬프 등 오인식 방지).
     """
     candidates: List[int] = []
     # 1) totalPrice (기존)
     price_text = (result.get("totalPrice") or {}).get("price") or {}
     raw = (price_text.get("text") or price_text.get("value") or "0").strip()
     n = _parse_int_from_text(raw)
-    if n is not None and n >= 1000:
-        return n
-    if n is not None:
+    if n is not None and 1000 <= n <= MAX_AMOUNT_SANE:
+        return _clamp_amount_for_db(n)
+    if n is not None and n <= MAX_AMOUNT_SANE:
         candidates.append(n)
-    # 2) paymentInfo.totalAmount, totalAmount, supplyPrice 등
+    # 2) paymentInfo.totalAmount, totalAmount, supplyPrice 등 (금액 상한 적용)
     for key in ("totalAmount", "totalPrice", "paymentAmount", "supplyPrice", "amount", "합계", "결제금액"):
         node = result.get(key)
         if isinstance(node, dict):
             t = node.get("text") or node.get("value")
             nn = _parse_int_from_text(t)
-            if nn is not None and nn >= 1000:
+            if nn is not None and 1000 <= nn <= MAX_AMOUNT_SANE:
                 candidates.append(nn)
         elif isinstance(node, list) and node and isinstance(node[0], dict):
             t = node[0].get("text") or node[0].get("value")
             nn = _parse_int_from_text(t)
-            if nn is not None and nn >= 1000:
+            if nn is not None and 1000 <= nn <= MAX_AMOUNT_SANE:
                 candidates.append(nn)
     # 3) 재귀 수집 (라벨 매칭)
     _collect_amount_candidates(result, 0, candidates)
     if candidates:
-        # 합계/결제금액은 보통 가장 큰 금액
         best = max(candidates)
         if best >= 1000:
-            return best
+            return _clamp_amount_for_db(best)
     # 4) subTotal 부가세 추정
     sub_total = result.get("subTotal") or []
     if isinstance(sub_total, list) and len(sub_total) > 0:
@@ -4347,9 +4410,9 @@ def _extract_amount_from_result(result: dict) -> Optional[int]:
             tax_num = re.sub(r"[^0-9]", "", tax_text)
             if tax_num:
                 tax_val = int(tax_num)
-                if tax_val >= 100:
-                    return tax_val * 10
-    return max(candidates) if candidates else None
+                if 100 <= tax_val <= (MAX_AMOUNT_SANE // 10):
+                    return _clamp_amount_for_db(tax_val * 10)
+    return _clamp_amount_for_db(max(candidates)) if candidates else None
 
 
 def _parse_ocr_result(ocr_data: dict) -> tuple[Optional[int], Optional[str], Optional[str], Optional[str], Optional[str]]:
@@ -4500,18 +4563,18 @@ def _normalize_location(raw: Optional[str]) -> Optional[str]:
 
 
 def _normalize_amount(raw: Optional[Any]) -> Optional[int]:
-    """금액 정규화: 정수만 저장. str이면 쉼표 제거 후 파싱, 음수/비정상 → None."""
+    """금액 정규화: 정수만 저장. str이면 쉼표 제거 후 파싱. 음수/DB 상한 초과(타임스탬프 등) → None."""
     if raw is None:
         return None
     if isinstance(raw, int):
-        return raw if raw >= 0 else None
+        return _clamp_amount_for_db(raw)
     s = (raw if isinstance(raw, str) else str(raw)).strip().replace(",", "")
     digits = re.sub(r"[^0-9]", "", s)
     if not digits:
         return None
     try:
         n = int(digits)
-        return n if n >= 0 else None
+        return _clamp_amount_for_db(n)
     except (ValueError, TypeError):
         return None
 
@@ -5038,7 +5101,7 @@ def _build_documents_from_request(req: CompleteRequest) -> List[Dict[str, str]]:
 def _parse_ota_invoice_result(ocr_data: dict) -> Dict[str, Optional[Any]]:
     """
     OTA 명세서(일반 OCR 결과 포함)에서 핵심 값 추출.
-    - amount: 총액/결제금액 패턴 우선, 없으면 큰 숫자 후보
+    - amount: 총액/결제금액 패턴 우선, 없으면 큰 숫자 후보(타임스탬프 제외: MAX_AMOUNT_SANE 이하만)
     - stayStart/stayEnd: 날짜 1~2개
     - guestName: 예약자/투숙객 키워드 기반 추출
     """
@@ -5050,11 +5113,13 @@ def _parse_ota_invoice_result(ocr_data: dict) -> Dict[str, Optional[Any]]:
         re.IGNORECASE,
     )
     if m:
-        amount = int(re.sub(r"[^0-9]", "", m.group(2)))
+        raw = int(re.sub(r"[^0-9]", "", m.group(2)))
+        amount = _clamp_amount_for_db(raw) if raw <= MAX_AMOUNT_SANE else None
     else:
         nums = [int(n.replace(",", "")) for n in re.findall(r"[0-9][0-9,]{4,}", text_blob)]
-        if nums:
-            amount = max(nums)
+        sane = [n for n in nums if n <= MAX_AMOUNT_SANE]
+        if sane:
+            amount = _clamp_amount_for_db(max(sane))
 
     dates = re.findall(r"20[0-9]{2}[./-][0-9]{1,2}[./-][0-9]{1,2}", text_blob)
     stay_start = dates[0] if len(dates) >= 1 else None
@@ -5086,9 +5151,11 @@ async def _run_ocr_for_document(
     image_bytes, content_type = _get_image_bytes_from_s3(image_key)
     image_bytes, content_type = _resize_and_compress_for_ocr(image_bytes, content_type)
     image_format = _image_format_from_content_type(content_type)
-    ocr_data = await _call_naver_ocr_with_retry(
-        image_bytes, receipt_id, image_format, domain_type=domain_type, retries=2
-    )
+    # 도메인당 동시 1건만 허용(네이버 rate limit 대응)
+    async with _get_ocr_domain_lock(domain_type):
+        ocr_data = await _call_naver_ocr_with_retry(
+            image_bytes, receipt_id, image_format, domain_type=domain_type, retries=2
+        )
 
     if doc_type == "RECEIPT":
         amount, pay_date, store_name, address, location = _parse_ocr_result(ocr_data)
@@ -5285,7 +5352,7 @@ async def analyze_receipt_task(req: CompleteRequest):
                     rp["amount"] = amount
                     rp["payDate"] = pay_date
                     rp["location"] = location
-                    item_rows[ri].amount = _normalize_amount(amount) if _normalize_amount(amount) is not None else amount
+                    item_rows[ri].amount = _normalize_amount(amount) if _normalize_amount(amount) is not None else 0
                     item_rows[ri].pay_date = _normalize_pay_date_for_storage(pay_date) or _normalize_pay_date_canonical(pay_date) or pay_date
                     item_rows[ri].location = _normalize_location(location)
 
@@ -5563,6 +5630,10 @@ async def analyze_receipt_task(req: CompleteRequest):
 
     except Exception as e:
         logger.error("analyze_receipt_task failed: %s", e, exc_info=True)
+        try:
+            db.rollback()
+        except Exception:
+            pass
         submission.status = "ERROR"
         submission.updated_at = datetime.utcnow()
         submission.total_amount = 0

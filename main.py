@@ -1981,6 +1981,7 @@ class MeResponse(BaseModel):
     role: str
     name: Optional[str] = None
     organizationId: Optional[int] = None
+    organization_id: Optional[int] = None  # snake_case, 계정정보 조직 표시용
     organizationName: Optional[str] = None
     org_name: Optional[str] = None  # 소속명, FE 표시용
     campaignIds: List[int] = Field(default_factory=list)
@@ -2060,6 +2061,8 @@ async def auth_login(body: LoginRequest, db: Session = Depends(get_db)):
     if org_name is None and user.organization_id:
         org = db.query(Organization).filter(Organization.id == user.organization_id).first()
         org_name = org.name if org else None
+    # organizationId / organization_id 둘 다 포함 (계정정보 조직 표시, "미반환" 방지)
+    org_id = user.organization_id
     return LoginResponse(
         access_token=token,
         user={
@@ -2067,7 +2070,8 @@ async def auth_login(body: LoginRequest, db: Session = Depends(get_db)):
             "email": user.email,
             "role": user.role,
             "name": user.name,
-            "organizationId": user.organization_id,
+            "organizationId": org_id,
+            "organization_id": org_id,
             "org_name": org_name,
             "campaignIds": campaign_ids,
         },
@@ -2136,6 +2140,7 @@ async def admin_me(ctx: AdminContext = Depends(get_admin_context), db: Session =
         role=user.role,
         name=user.name,
         organizationId=user.organization_id,
+        organization_id=user.organization_id,
         organizationName=org_name,
         org_name=org_name,
         campaignIds=ctx.campaign_ids,

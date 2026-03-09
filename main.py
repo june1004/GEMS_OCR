@@ -2014,6 +2014,17 @@ async def admin_me(ctx: AdminContext = Depends(get_admin_context), db: Session =
     )
 
 
+@app.get(
+    "/api/v1/admin/context",
+    response_model=MeResponse,
+    summary="현재 담당자 컨텍스트 (FE 호환)",
+    description="GET /api/v1/admin/me 와 동일. FE에서 context 로 호출하는 경우용.",
+    tags=["Admin - Auth"],
+)
+async def admin_context(ctx: AdminContext = Depends(get_admin_context), db: Session = Depends(get_db)):
+    return await admin_me(ctx, db)
+
+
 def _require_super(ctx: AdminContext) -> None:
     if not ctx.is_super:
         raise HTTPException(status_code=403, detail="Super admin only")

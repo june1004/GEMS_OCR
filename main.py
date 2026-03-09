@@ -1634,6 +1634,11 @@ def _build_status_payload(submission: Submission, item_rows: List[Any]) -> Dict[
         "errorMessageTruncatedCount": error_message_truncated_count,
         "generatedAt": datetime.utcnow().isoformat(),
     }
+    # 수신측 세션/사용자 매칭용 (receiptId mismatching 400 완화)
+    user_uuid_val = (submission.user_uuid or "").strip() or None
+    if user_uuid_val is not None:
+        payload["userUuid"] = user_uuid_val
+        payload["user_uuid"] = user_uuid_val
     return payload
 
 

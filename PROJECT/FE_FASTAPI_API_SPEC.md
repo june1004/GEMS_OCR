@@ -232,6 +232,7 @@
   - `GET /api/v1/receipts/{receiptId}/status` 응답과 거의 동일
   - 콜백에서는 전송량 최적화를 위해 **`items[].ocr_raw`는 제외**
   - 추가 필드 `receiptId`(camelCase), `receipt_id`(snake_case) 포함 — 동일 UUID 값
+  - 추가 필드 `userUuid`, `user_uuid` 포함(해당 신청의 사용자 UUID, 수신측 세션 매칭용)
   - 추가 필드 `schemaVersion` 포함
   - 추가 필드 `payloadMeta` 포함 (audit_trail / error_message 트렁케이트 여부 등)
 - 인증:

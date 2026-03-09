@@ -71,7 +71,8 @@ OCR_CONFIG = {
 }
 # 분석 완료 시 FE 결과 수신 URL (운영: https://easy.gwd.go.kr/dg/coupon/api/ocr/result / 테스트: http://210.179.205.50/dg/coupon/api/ocr/result)
 OCR_RESULT_CALLBACK_URL = os.getenv("OCR_RESULT_CALLBACK_URL", "").strip() or None
-OCR_CALLBACK_TIMEOUT_SEC = 10
+OCR_CALLBACK_TIMEOUT_SEC = max(5, min(60, int(os.getenv("OCR_CALLBACK_TIMEOUT_SEC", "15"))))
+OCR_CALLBACK_RETRIES = max(0, min(3, int(os.getenv("OCR_CALLBACK_RETRIES", "2"))))  # 0=재시도 없음, 2=최대 3회 시도
 OCR_CALLBACK_SCHEMA_VERSION = 2
 OCR_CALLBACK_MAX_AUDIT_TRAIL_CHARS = int(os.getenv("OCR_CALLBACK_MAX_AUDIT_TRAIL_CHARS", "2000"))
 OCR_CALLBACK_MAX_ERROR_MESSAGE_CHARS = int(os.getenv("OCR_CALLBACK_MAX_ERROR_MESSAGE_CHARS", "200"))
@@ -1642,6 +1643,15 @@ def _build_status_payload(submission: Submission, item_rows: List[Any]) -> Dict[
     return payload
 
 
+def _is_callback_retryable_error(e: Exception) -> bool:
+    """타임아웃·연결 실패 등 일시적 오류만 재시도. 4xx 응답은 재시도하지 않음(이 함수는 예외용)."""
+    name = type(e).__name__
+    if "Timeout" in name or "Connect" in name or "Connection" in name or "Network" in name:
+        return True
+    err_str = (getattr(e, "message", None) or str(e) or "").lower()
+    return "timeout" in err_str or "connection" in err_str or "refused" in err_str
+
+
 async def _send_result_callback(
     receipt_id: str,
     payload: Dict[str, Any],
@@ -1650,7 +1660,7 @@ async def _send_result_callback(
     purpose: str = "auto",  # auto | resend
     actor: str = "system",
 ) -> Dict[str, Any]:
-    """분석 완료 시 FE 지정 URL로 결과 POST. 재시도 없음. 성공/실패를 로그 + AdminAuditLog에 기록."""
+    """분석 완료 시 FE 지정 URL로 결과 POST. 연결/타임아웃 시 OCR_CALLBACK_RETRIES 만큼 재시도. 성공/실패를 로그 + AdminAuditLog에 기록."""
     url = (target_url or "").strip() if target_url else None
     url = url or OCR_RESULT_CALLBACK_URL
     if not url:
@@ -1662,37 +1672,40 @@ async def _send_result_callback(
         "receipt_id": receipt_id,
         **payload,
     }
-    try:
-        started = time.time()
-        async with httpx.AsyncClient(timeout=OCR_CALLBACK_TIMEOUT_SEC) as client:
-            r = await client.post(
-                url,
-                json=payload_with_id,
-                headers={"Content-Type": "application/json"},
-            )
+    last_exception: Optional[Exception] = None
+    max_attempts = 1 + OCR_CALLBACK_RETRIES
+    for attempt in range(1, max_attempts + 1):
+        try:
+            started = time.time()
+            async with httpx.AsyncClient(timeout=OCR_CALLBACK_TIMEOUT_SEC) as client:
+                r = await client.post(
+                    url,
+                    json=payload_with_id,
+                    headers={"Content-Type": "application/json"},
+                )
             elapsed_ms = int(round((time.time() - started) * 1000.0))
             ok = r.status_code < 400
             if ok:
                 logger.info(
-                    "OCR result callback sent: receiptId=%s purpose=%s url=%s status=%s elapsedMs=%s",
+                    "OCR result callback sent: receiptId=%s purpose=%s url=%s status=%s elapsedMs=%s attempt=%s",
                     receipt_id,
                     purpose,
                     url,
                     r.status_code,
                     elapsed_ms,
+                    attempt,
                 )
             else:
                 logger.warning(
-                    "OCR result callback failed: receiptId=%s purpose=%s url=%s status=%s elapsedMs=%s body=%s",
+                    "OCR result callback failed: receiptId=%s purpose=%s url=%s status=%s elapsedMs=%s body=%s attempt=%s",
                     receipt_id,
                     purpose,
                     url,
                     r.status_code,
                     elapsed_ms,
                     (r.text or "")[:200],
+                    attempt,
                 )
-
-            # 콜백 송출 결과를 DB에 남겨, Coolify/관리자 화면에서 추적 가능하게 한다.
             try:
                 db2 = SessionLocal()
                 _audit_log(
@@ -1707,6 +1720,7 @@ async def _send_result_callback(
                         "status": int(r.status_code),
                         "ok": bool(ok),
                         "elapsed_ms": elapsed_ms,
+                        "attempt": attempt,
                         "response_body": (None if ok else (r.text or "")[:200]),
                     },
                 )
@@ -1726,33 +1740,57 @@ async def _send_result_callback(
                 "status": int(r.status_code),
                 "elapsed_ms": elapsed_ms,
             }
-    except Exception as e:
-        logger.warning(
-            "OCR result callback error (no retry): receiptId=%s purpose=%s url=%s err=%s",
-            receipt_id,
-            purpose,
-            url,
-            e,
-        )
-        try:
-            db2 = SessionLocal()
-            _audit_log(
-                db2,
-                actor=actor,
-                action="CALLBACK_SEND",
-                target_type="submission",
-                target_id=receipt_id,
-                meta={"purpose": purpose, "url": url, "ok": False, "error": str(e)[:200]},
+        except Exception as e:
+            last_exception = e
+            err_msg = getattr(e, "message", str(e)) or type(e).__name__
+            if attempt < max_attempts and _is_callback_retryable_error(e):
+                await asyncio.sleep(min(attempt, 3))
+                logger.warning(
+                    "OCR result callback retry: receiptId=%s purpose=%s attempt=%s/%s err=%s",
+                    receipt_id,
+                    purpose,
+                    attempt,
+                    max_attempts,
+                    err_msg,
+                )
+                continue
+            logger.warning(
+                "OCR result callback error (no retry): receiptId=%s purpose=%s url=%s err=%s attempt=%s",
+                receipt_id,
+                purpose,
+                url,
+                err_msg,
+                attempt,
             )
-            db2.commit()
-        except Exception:
-            pass
-        finally:
             try:
-                db2.close()  # type: ignore[name-defined]
+                db2 = SessionLocal()
+                _audit_log(
+                    db2,
+                    actor=actor,
+                    action="CALLBACK_SEND",
+                    target_type="submission",
+                    target_id=receipt_id,
+                    meta={
+                        "purpose": purpose,
+                        "url": url,
+                        "ok": False,
+                        "error": err_msg[:200],
+                        "attempt": attempt,
+                    },
+                )
+                db2.commit()
             except Exception:
                 pass
-        return {"receiptId": receipt_id, "url": url, "purpose": purpose, "ok": False, "error": str(e)[:200]}
+            finally:
+                try:
+                    db2.close()  # type: ignore[name-defined]
+                except Exception:
+                    pass
+            return {"receiptId": receipt_id, "url": url, "purpose": purpose, "ok": False, "error": err_msg[:200]}
+    if last_exception is not None:
+        err_msg = getattr(last_exception, "message", str(last_exception)) or type(last_exception).__name__
+        return {"receiptId": receipt_id, "url": url, "purpose": purpose, "ok": False, "error": err_msg[:200]}
+    return {"receiptId": receipt_id, "url": url, "purpose": purpose, "ok": False, "error": "unknown"}
 
 
 async def _process_verifying_timeout_run(db: Session, actor: str = "system") -> Tuple[int, List[str]]:
@@ -3730,13 +3768,18 @@ async def admin_list_submissions(
         .limit(limit_val)
         .all()
     )
-    pt_val = lambda r: (r.project_type or "").strip() or None
+
+    def _normalize_project_type_for_response(raw: Optional[str]) -> str:
+        """STAY/TOUR만 반환. null·빈값·소문자 시 TOUR로 통일해 FE 업종/필터가 동작하도록."""
+        v = (raw or "").strip().upper()
+        return "STAY" if v == "STAY" else "TOUR"
+
     items = [
         AdminSubmissionListItem(
             receiptId=r.submission_id,
             userUuid=r.user_uuid,
-            project_type=pt_val(r),
-            projectType=pt_val(r),
+            project_type=_normalize_project_type_for_response(r.project_type),
+            projectType=_normalize_project_type_for_response(r.project_type),
             status=r.status,
             total_amount=r.total_amount or 0,
             created_at=r.created_at.isoformat() if r.created_at else None,

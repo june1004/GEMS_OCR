@@ -4091,19 +4091,46 @@ def _build_status_payload_admin(submission: Submission, item_rows: List[ReceiptI
     return base
 
 
+def _admin_client_ip(request: Request) -> Optional[str]:
+    """관리자 API 요청의 클라이언트 IP (감사 로그용). x-forwarded-for 반영."""
+    if getattr(request, "client", None) and request.client:
+        ip = request.client.host
+    else:
+        ip = None
+    forwarded = (request.headers.get("x-forwarded-for") or "").strip()
+    if forwarded:
+        ip = forwarded.split(",")[0].strip() or ip
+    return ip
+
+
 @app.get(
     "/api/v1/admin/submissions/{receiptId}",
     response_model=AdminSubmissionDetailResponse,
     summary="신청 단건 상세(관리자)",
+    description="영수증 상태 조회·증거 보기 시 열람 이력을 감사 로그에 기록.",
     tags=["Admin - Submissions"],
 )
-async def admin_get_submission(receiptId: str, db: Session = Depends(get_db), ctx: AdminContext = Depends(get_admin_context)):
+async def admin_get_submission(
+    receiptId: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
     rid = _sanitize_receipt_id(receiptId)
     submission = db.query(Submission).filter(Submission.submission_id == rid).first()
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
     if not ctx.is_super and ctx.campaign_ids and (submission.campaign_id or 0) not in ctx.campaign_ids:
         raise HTTPException(status_code=404, detail="Submission not found")
+    _audit_log(
+        db,
+        actor=ctx.actor,
+        action="SUBMISSION_DETAIL_VIEW",
+        target_type="submission",
+        target_id=rid,
+        meta={"client_ip": _admin_client_ip(request), "receiptId": rid},
+    )
+    db.commit()
     item_rows = (
         db.query(ReceiptItem)
         .filter(ReceiptItem.submission_id == rid)
@@ -4167,15 +4194,30 @@ class AdminReceiptImagesResponse(BaseModel):
     "/api/v1/admin/receipts/{receiptId}/images",
     response_model=AdminReceiptImagesResponse,
     summary="신청 이미지 presigned GET(관리자)",
+    description="증거 보기(모달) 시 호출. 열람 이력(관리자 ID, 시각, IP, receiptId)을 감사 로그에 기록.",
     tags=["Admin - Submissions"],
 )
-async def admin_get_receipt_images(receiptId: str, db: Session = Depends(get_db), ctx: AdminContext = Depends(get_admin_context)):
+async def admin_get_receipt_images(
+    receiptId: str,
+    request: Request,
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
     rid = _sanitize_receipt_id(receiptId)
     sub = db.query(Submission).filter(Submission.submission_id == rid).first()
     if not sub:
         raise HTTPException(status_code=404, detail="Submission not found")
     if not ctx.is_super and ctx.campaign_ids and (sub.campaign_id or 0) not in ctx.campaign_ids:
         raise HTTPException(status_code=404, detail="Submission not found")
+    _audit_log(
+        db,
+        actor=ctx.actor,
+        action="EVIDENCE_VIEW",
+        target_type="submission",
+        target_id=rid,
+        meta={"client_ip": _admin_client_ip(request), "receiptId": rid},
+    )
+    db.commit()
     item_rows = (
         db.query(ReceiptItem)
         .filter(ReceiptItem.submission_id == rid)
@@ -4207,6 +4249,64 @@ async def admin_get_receipt_images(receiptId: str, db: Session = Depends(get_db)
             )
         )
     return AdminReceiptImagesResponse(receiptId=rid, expiresIn=PRESIGNED_URL_EXPIRES_SEC, items=items)
+
+
+class AdminReceiptTagRequest(BaseModel):
+    tag: str = Field(..., description="excellent_sample(AI 학습용 우수 사례) | suspected_fraud(부정수급 의심 사례) 등")
+
+
+class AdminReceiptTagResponse(BaseModel):
+    receiptId: str
+    tag: str
+    updated_at: Optional[str] = None
+
+
+@app.post(
+    "/api/v1/admin/receipts/{receiptId}/tag",
+    response_model=AdminReceiptTagResponse,
+    summary="영수증 데이터 자산화 태깅",
+    description="상태 조회 화면에서 우수 사례/부정수급 의심 등 태그 저장. audit_trail 및 감사 로그에 기록.",
+    tags=["Admin - Submissions"],
+)
+async def admin_receipt_tag(
+    receiptId: str,
+    body: AdminReceiptTagRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    rid = _sanitize_receipt_id(receiptId)
+    sub = db.query(Submission).filter(Submission.submission_id == rid).first()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    if not ctx.is_super and ctx.campaign_ids and (sub.campaign_id or 0) not in ctx.campaign_ids:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    tag_val = (body.tag or "").strip()
+    if not tag_val:
+        raise HTTPException(status_code=400, detail="tag required")
+    line = f"TAG({tag_val} by {ctx.actor} at {datetime.utcnow().isoformat()})"
+    existing = sub.audit_trail or sub.audit_log or ""
+    sub.audit_trail = (existing + " | " + line).strip(" |") if existing else line
+    sub.audit_log = sub.audit_trail
+    sub.updated_at = datetime.utcnow()
+    if hasattr(sub, "asset_tag"):
+        setattr(sub, "asset_tag", tag_val)
+    db.commit()
+    db.refresh(sub)
+    _audit_log(
+        db,
+        actor=ctx.actor,
+        action="RECEIPT_TAG",
+        target_type="submission",
+        target_id=rid,
+        meta={"tag": tag_val, "client_ip": _admin_client_ip(request), "receiptId": rid},
+    )
+    db.commit()
+    return AdminReceiptTagResponse(
+        receiptId=rid,
+        tag=tag_val,
+        updated_at=sub.updated_at.isoformat() if sub.updated_at else None,
+    )
 
 
 class AdminOverrideRequest(BaseModel):

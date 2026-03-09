@@ -24,7 +24,7 @@ from store_classifier import (
     is_forbidden as _classifier_is_forbidden,
     AUTO_REGISTER_THRESHOLD as CLASSIFIER_AUTO_THRESHOLD,
 )
-from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends, UploadFile, Header, Query, Body
+from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends, UploadFile, Header, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
 from fastapi.responses import JSONResponse
@@ -2523,6 +2523,7 @@ class AdminCampaignItem(BaseModel):
     targetCityCounty: Optional[str] = None
     startDate: Optional[str] = None
     endDate: Optional[str] = None
+    budget: Optional[int] = None
     projectType: Optional[ProjectType] = None
     priority: int = 100
     createdAt: Optional[str] = None
@@ -2549,11 +2550,25 @@ def _admin_fetch_campaign_rows(db: Session) -> List[Dict[str, Any]]:
         rows = db.execute(
             sql_text(
                 "SELECT campaign_id, campaign_name, is_active, target_city_county, start_date, end_date, created_at, "
-                "COALESCE(priority, 100) AS priority, project_type, updated_at "
+                "COALESCE(priority, 100) AS priority, project_type, updated_at, budget "
                 "FROM campaigns ORDER BY COALESCE(priority, 100) ASC, campaign_id ASC"
             )
         ).mappings().all()
         return [dict(r) for r in rows]
+    except Exception:
+        pass
+    try:
+        rows = db.execute(
+            sql_text(
+                "SELECT campaign_id, campaign_name, is_active, target_city_county, start_date, end_date, created_at, "
+                "COALESCE(priority, 100) AS priority, project_type, updated_at "
+                "FROM campaigns ORDER BY COALESCE(priority, 100) ASC, campaign_id ASC"
+            )
+        ).mappings().all()
+        items = [dict(r) for r in rows]
+        for d in items:
+            d.setdefault("budget", None)
+        return items
     except Exception:
         rows = db.execute(
             sql_text(
@@ -2567,6 +2582,7 @@ def _admin_fetch_campaign_rows(db: Session) -> List[Dict[str, Any]]:
             d["priority"] = 100
             d["project_type"] = None
             d["updated_at"] = None
+            d["budget"] = None
             items.append(d)
         return items
 
@@ -2596,6 +2612,7 @@ async def admin_list_campaigns(db: Session = Depends(get_db), ctx: AdminContext 
                 targetCityCounty=(r.get("target_city_county") or None),
                 startDate=sd.isoformat() if sd else None,
                 endDate=ed.isoformat() if ed else None,
+                budget=int(r["budget"]) if r.get("budget") is not None else None,
                 projectType=ProjectType(r["project_type"]) if (r.get("project_type") in ("STAY", "TOUR")) else None,
                 priority=int(r.get("priority") or 100),
                 createdAt=(r.get("created_at").isoformat() if isinstance(r.get("created_at"), datetime) else None),
@@ -2634,6 +2651,7 @@ async def admin_get_campaign(
         targetCityCounty=(r.get("target_city_county") or None),
         startDate=sd.isoformat() if sd else None,
         endDate=ed.isoformat() if ed else None,
+        budget=int(r["budget"]) if r.get("budget") is not None else None,
         projectType=ProjectType(r["project_type"]) if (r.get("project_type") in ("STAY", "TOUR")) else None,
         priority=int(r.get("priority") or 100),
         createdAt=(r.get("created_at").isoformat() if isinstance(r.get("created_at"), datetime) else None),
@@ -3630,6 +3648,7 @@ class AdminSubmissionListItem(BaseModel):
     receiptId: str
     userUuid: str
     project_type: Optional[str] = None
+    projectType: Optional[str] = None  # FE 대시보드 유형별 비중 차트용 (project_type과 동일)
     status: Optional[str] = None
     total_amount: int = 0
     created_at: Optional[str] = None
@@ -3644,19 +3663,35 @@ class AdminSubmissionListResponse(BaseModel):
     "/api/v1/admin/submissions",
     response_model=AdminSubmissionListResponse,
     summary="신청 목록 검색(관리자)",
+    description="대시보드·검수용. from/to(또는 dateFrom/dateTo), campaignId, status, limit(최대 10000), offset 지원.",
     tags=["Admin - Submissions"],
 )
 async def admin_list_submissions(
-    status: Optional[str] = None,
+    request: Request,
+    status: Optional[str] = Query(None, description="MANUAL_REVIEW, FIT, UNFIT 등. FE: APPROVED 시 FIT로 매핑 가능"),
     userUuid: Optional[str] = None,
     receiptId: Optional[str] = None,
-    dateFrom: Optional[str] = None,
-    dateTo: Optional[str] = None,
-    limit: int = Query(50, ge=1, le=200),
-    offset: int = Query(0, ge=0),
+    dateFrom: Optional[str] = Query(None, description="기간 시작 YYYY-MM-DD (from 과 동일)"),
+    dateTo: Optional[str] = Query(None, description="기간 끝 YYYY-MM-DD (to 와 동일)"),
+    campaignId: Optional[str] = Query(None, description="캠페인 ID로 필터. 기관·검수자: 자신의 캠페인만"),
+    limit: Optional[int] = Query(None, description="페이지 크기(기본 50, 최대 10000). 대시보드 집계 시 1000 등"),
+    offset: Optional[int] = Query(None, description="건너뛸 개수(기본 0)"),
     db: Session = Depends(get_db),
     ctx: AdminContext = Depends(get_admin_context),
 ):
+    # from/to 는 예약어·alias 422 방지를 위해 쿼리에서만 읽음 (FE: ?from= &to= 사용)
+    qp = getattr(request, "query_params", None)
+    from_val = (qp.get("from") if qp else None) or dateFrom
+    to_val = (qp.get("to") if qp else None) or dateTo
+    cid: Optional[int] = None
+    if campaignId not in (None, ""):
+        try:
+            cid = int(str(campaignId).strip())
+        except ValueError:
+            raise HTTPException(status_code=400, detail="Invalid campaignId")
+    limit_val = 50 if limit is None else max(1, min(limit, 10000))
+    offset_val = 0 if offset is None else max(0, offset)
+
     q = db.query(Submission)
     if not ctx.is_super and ctx.campaign_ids:
         q = q.filter(Submission.campaign_id.in_(ctx.campaign_ids))
@@ -3667,32 +3702,41 @@ async def admin_list_submissions(
     if userUuid:
         q = q.filter(Submission.user_uuid == userUuid.strip())
     if status:
-        q = q.filter(Submission.status == status.strip())
-    if dateFrom:
+        s = status.strip()
+        if s.upper() == "APPROVED":
+            s = "FIT"
+        q = q.filter(Submission.status == s)
+    if cid is not None:
+        q = q.filter(Submission.campaign_id == cid)
+    start_raw = from_val
+    end_raw = to_val
+    if start_raw:
         try:
-            dt = dateutil_parser.parse(dateFrom)
+            dt = dateutil_parser.parse(start_raw)
             q = q.filter(Submission.created_at >= dt)
         except Exception:
-            raise HTTPException(status_code=400, detail="Invalid dateFrom")
-    if dateTo:
+            raise HTTPException(status_code=400, detail="Invalid from/dateFrom")
+    if end_raw:
         try:
-            dt = dateutil_parser.parse(dateTo)
+            dt = dateutil_parser.parse(end_raw)
             q = q.filter(Submission.created_at <= dt)
         except Exception:
-            raise HTTPException(status_code=400, detail="Invalid dateTo")
+            raise HTTPException(status_code=400, detail="Invalid to/dateTo")
 
     total = q.count()
     rows = (
         q.order_by(Submission.created_at.desc())
-        .offset(offset)
-        .limit(limit)
+        .offset(offset_val)
+        .limit(limit_val)
         .all()
     )
+    pt_val = lambda r: (r.project_type or "").strip() or None
     items = [
         AdminSubmissionListItem(
             receiptId=r.submission_id,
             userUuid=r.user_uuid,
-            project_type=r.project_type,
+            project_type=pt_val(r),
+            projectType=pt_val(r),
             status=r.status,
             total_amount=r.total_amount or 0,
             created_at=r.created_at.isoformat() if r.created_at else None,
@@ -3700,6 +3744,152 @@ async def admin_list_submissions(
         for r in rows
     ]
     return AdminSubmissionListResponse(total=total, items=items)
+
+
+# 5-3-1. 대시보드 집계 API
+class AdminDashboardStatsResponse(BaseModel):
+    todayCount: int = 0
+    yesterdayCount: int = 0
+    pendingCount: int = 0
+    approvedAmountSum: int = 0
+    byCategory: Dict[str, int] = Field(default_factory=dict, description="STAY, TOUR 등 유형별 건수")
+    dailyCounts: List[Dict[str, Any]] = Field(default_factory=list, description="[{ date, count }] 일자별 제출 건수")
+
+
+@app.get(
+    "/api/v1/admin/dashboard/stats",
+    response_model=AdminDashboardStatsResponse,
+    summary="대시보드 집계 수치",
+    description="campaignId, from, to 기준 금일/전일 건수, MANUAL_REVIEW 건수, 승인 금액 합계, 유형별·일자별 건수.",
+    tags=["Admin - Submissions"],
+)
+async def admin_dashboard_stats(
+    campaignId: Optional[int] = Query(None),
+    from_: Optional[str] = Query(None, alias="from", description="YYYY-MM-DD"),
+    to: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    q = db.query(Submission)
+    if not ctx.is_super and ctx.campaign_ids:
+        q = q.filter(Submission.campaign_id.in_(ctx.campaign_ids))
+    elif not ctx.is_super:
+        q = q.filter(Submission.campaign_id == -1)
+    if campaignId is not None:
+        q = q.filter(Submission.campaign_id == campaignId)
+    if from_:
+        try:
+            q = q.filter(Submission.created_at >= dateutil_parser.parse(from_))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid from")
+    if to:
+        try:
+            q = q.filter(Submission.created_at <= dateutil_parser.parse(to))
+        except Exception:
+            raise HTTPException(status_code=400, detail="Invalid to")
+
+    base_q = q
+    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    yesterday_start = today_start - timedelta(days=1)
+    today_count = base_q.filter(Submission.created_at >= today_start).count()
+    yesterday_count = base_q.filter(
+        Submission.created_at >= yesterday_start,
+        Submission.created_at < today_start,
+    ).count()
+    pending_count = base_q.filter(Submission.status == "MANUAL_REVIEW").count()
+    try:
+        approved_sum = (
+            base_q.filter(Submission.status == "FIT")
+            .with_entities(func.coalesce(func.sum(Submission.total_amount), 0))
+            .scalar()
+        ) or 0
+    except Exception:
+        approved_sum = 0
+    by_category: Dict[str, int] = {}
+    for row in (
+        base_q.with_entities(Submission.project_type, func.count(Submission.submission_id))
+        .group_by(Submission.project_type)
+        .all()
+    ):
+        key = (row[0] or "UNKNOWN").strip() or "UNKNOWN"
+        by_category[key] = row[1]
+    daily: List[Dict[str, Any]] = []
+    try:
+        date_expr = func.date(Submission.created_at)
+        for row in (
+            base_q.with_entities(date_expr.label("d"), func.count(Submission.submission_id))
+            .group_by(date_expr)
+            .order_by(date_expr.asc())
+            .all()
+        ):
+            d = row[0]
+            daily.append({"date": d.isoformat() if hasattr(d, "isoformat") else str(d), "count": row[1]})
+    except Exception:
+        pass
+    return AdminDashboardStatsResponse(
+        todayCount=today_count,
+        yesterdayCount=yesterday_count,
+        pendingCount=pending_count,
+        approvedAmountSum=int(approved_sum),
+        byCategory=by_category,
+        dailyCounts=daily,
+    )
+
+
+class AdminRejectReasonItem(BaseModel):
+    reason: str = Field(..., description="반려 사유( fail_reason 등)")
+    count: int = Field(..., description="건수")
+
+
+@app.get(
+    "/api/v1/admin/dashboard/reject-reasons",
+    response_model=List[AdminRejectReasonItem],
+    summary="반려 사유별 건수(대시보드 Top N용)",
+    description="fail_reason/global_fail_reason 기준 집계. campaignId, from, to 필터 적용.",
+    tags=["Admin - Submissions"],
+)
+@app.get(
+    "/api/v1/admin/receipts/reject-reasons",
+    response_model=List[AdminRejectReasonItem],
+    summary="반려 사유별 건수(영수증·FE 문서 경로)",
+    tags=["Admin - Submissions"],
+)
+async def admin_dashboard_reject_reasons(
+    campaignId: Optional[int] = Query(None),
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = Query(None),
+    limit: int = Query(10, ge=1, le=50),
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    q = db.query(Submission).filter(
+        ~Submission.status.in_(["PENDING", "PROCESSING", "VERIFYING", "FIT"]),
+    )
+    if not ctx.is_super and ctx.campaign_ids:
+        q = q.filter(Submission.campaign_id.in_(ctx.campaign_ids))
+    elif not ctx.is_super:
+        q = q.filter(Submission.campaign_id == -1)
+    if campaignId is not None:
+        q = q.filter(Submission.campaign_id == campaignId)
+    if from_:
+        try:
+            q = q.filter(Submission.created_at >= dateutil_parser.parse(from_))
+        except Exception:
+            pass
+    if to:
+        try:
+            q = q.filter(Submission.created_at <= dateutil_parser.parse(to))
+        except Exception:
+            pass
+    reason_col = func.coalesce(Submission.fail_reason, Submission.global_fail_reason, "(기타)")
+    rows = (
+        q.with_entities(reason_col.label("reason"), func.count(Submission.submission_id))
+        .group_by(reason_col)
+        .order_by(func.count(Submission.submission_id).desc())
+        .limit(limit)
+        .all()
+    )
+    return [AdminRejectReasonItem(reason=(r[0] or "(기타)").strip(), count=r[1]) for r in rows]
 
 
 class AdminSubmissionDetailResponse(BaseModel):

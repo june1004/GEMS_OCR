@@ -2410,6 +2410,42 @@ async def admin_list_campaigns(db: Session = Depends(get_db), ctx: AdminContext 
     return AdminCampaignListResponse(total=len(items), items=items)
 
 
+@app.get(
+    "/api/v1/admin/campaigns/{campaignId}",
+    response_model=AdminCampaignItem,
+    summary="캠페인 단건 조회(관리자)",
+    description="campaignId로 단건 조회. 담당자는 할당된 캠페인만 조회 가능.",
+    tags=["Admin - Campaigns"],
+)
+async def admin_get_campaign(
+    campaignId: int,
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    rows = _admin_fetch_campaign_rows(db)
+    if not ctx.is_super and ctx.campaign_ids and int(campaignId) not in ctx.campaign_ids:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    if not ctx.is_super and not ctx.campaign_ids:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    r = next((x for x in rows if int(x.get("campaign_id")) == int(campaignId)), None)
+    if not r:
+        raise HTTPException(status_code=404, detail="Campaign not found")
+    sd = _parse_date_any(r.get("start_date"))
+    ed = _parse_date_any(r.get("end_date"))
+    return AdminCampaignItem(
+        campaignId=int(r.get("campaign_id")),
+        name=r.get("campaign_name"),
+        active=bool(r.get("is_active", True)),
+        targetCityCounty=(r.get("target_city_county") or None),
+        startDate=sd.isoformat() if sd else None,
+        endDate=ed.isoformat() if ed else None,
+        projectType=ProjectType(r["project_type"]) if (r.get("project_type") in ("STAY", "TOUR")) else None,
+        priority=int(r.get("priority") or 100),
+        createdAt=(r.get("created_at").isoformat() if isinstance(r.get("created_at"), datetime) else None),
+        updatedAt=(r.get("updated_at").isoformat() if isinstance(r.get("updated_at"), datetime) else None),
+    )
+
+
 @app.post(
     "/api/v1/admin/campaigns",
     response_model=AdminCampaignItem,

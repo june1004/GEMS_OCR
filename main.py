@@ -903,7 +903,8 @@ async def health_check():
 def _normalize_user_uuid(raw: Optional[str]) -> str:
     """
     Presigned(쿼리)와 Complete(JSON body) 간 userUuid 인코딩 차이로 403 방지.
-    URL 디코딩을 반복 적용해 %253D%253D → == 등으로 통일, 공백 trim.
+    - URL 디코딩 반복 적용 (%253D%253D → ==).
+    - 쿼리 스트링에서 + 가 공백으로 디코딩되는 경우 통일: 공백 → + (base64 호환).
     """
     if raw is None:
         return ""
@@ -916,7 +917,10 @@ def _normalize_user_uuid(raw: Optional[str]) -> str:
             break
         if s == prev:
             break
-    return (s or "").strip()
+    s = (s or "").strip()
+    # 쿼리에서 + 가 공백으로 넘어온 경우 JSON body의 + 와 맞추기
+    s = s.replace(" ", "+")
+    return s
 
 
 @app.post(

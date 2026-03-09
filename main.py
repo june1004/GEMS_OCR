@@ -1010,8 +1010,18 @@ async def get_presigned_url(
     try:
         existing = db.query(Submission).filter(Submission.submission_id == receipt_id).first()
         if existing:
-            if _normalize_user_uuid(existing.user_uuid) != user_uuid:
-                raise HTTPException(status_code=403, detail="receiptId owner mismatch")
+            stored_norm = _normalize_user_uuid(existing.user_uuid)
+            if stored_norm != user_uuid:
+                logger.warning(
+                    "presigned 403 receiptId owner mismatch receiptId=%s len(stored)=%s len(incoming)=%s",
+                    receipt_id,
+                    len(stored_norm),
+                    len(user_uuid),
+                )
+                raise HTTPException(
+                    status_code=403,
+                    detail="receiptId owner mismatch (userUuid must match the one used for this receiptId)",
+                )
             # receiptId 재사용은 "같은 신청(같은 type)"에 한해서만 허용 (STAY↔TOUR 엉킴 방지)
             if (existing.project_type or "").strip() and existing.project_type != type_str:
                 raise HTTPException(status_code=409, detail="receiptId type mismatch")
@@ -1130,8 +1140,19 @@ async def _submit_receipt_common(req: CompleteRequest, background_tasks: Backgro
     if not submission:
         raise HTTPException(status_code=404, detail="Submission not found")
 
-    if _normalize_user_uuid(submission.user_uuid) != _normalize_user_uuid(req.userUuid):
-        raise HTTPException(status_code=403, detail="receiptId owner mismatch")
+    stored_norm = _normalize_user_uuid(submission.user_uuid)
+    incoming_norm = _normalize_user_uuid(req.userUuid)
+    if stored_norm != incoming_norm:
+        logger.warning(
+            "complete 403 receiptId owner mismatch receiptId=%s len(stored)=%s len(incoming)=%s",
+            req.receiptId,
+            len(stored_norm),
+            len(incoming_norm),
+        )
+        raise HTTPException(
+            status_code=403,
+            detail="receiptId owner mismatch (userUuid must match the one used for presigned-url)",
+        )
 
     # receiptId는 생성 시 type이 고정됨. 다른 type으로 complete 호출 시 엉킴 방지.
     if (submission.project_type or "").strip() and submission.project_type != req.type:
@@ -1629,9 +1650,11 @@ async def _send_result_callback(
     url = url or OCR_RESULT_CALLBACK_URL
     if not url:
         return {"skipped": True, "reason": "OCR_RESULT_CALLBACK_URL is not set"}
+    # receiptId + receipt_id 둘 다 포함 (수신측이 snake_case로 검증하는 경우 대응)
     payload_with_id = {
         "schemaVersion": OCR_CALLBACK_SCHEMA_VERSION,
         "receiptId": receipt_id,
+        "receipt_id": receipt_id,
         **payload,
     }
     try:

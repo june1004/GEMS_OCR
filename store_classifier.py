@@ -20,15 +20,25 @@ logger = logging.getLogger(__name__)
 
 # Gemini API 설정 (환경변수 우선)
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
-# v1beta에서 gemini-1.5-flash는 404(모델 단종). gemini-2.0-flash 사용. 단종 시 gemini-2.5-flash 등으로 변경.
-GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
+# v1beta: gemini-1.5-flash 단종(404). gemini-2.0-flash도 일부 환경에서 404 → gemini-2.5-flash 기본 권장.
+GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-2.5-flash").strip()
 if "1.5-flash" in (GEMINI_MODEL or ""):
     logger.warning(
-        "GEMINI_MODEL=%s is deprecated/retired (404). Using gemini-2.0-flash. Set GEMINI_MODEL=gemini-2.0-flash in env.",
+        "GEMINI_MODEL=%s is deprecated/retired (404). Using gemini-2.5-flash.",
         GEMINI_MODEL,
     )
-    GEMINI_MODEL = "gemini-2.0-flash"
+    GEMINI_MODEL = "gemini-2.5-flash"
+# 404 시 시도할 폴백 모델 순서. env가 2.0-flash여도 2.5-flash를 먼저 시도하도록 구성.
+GEMINI_FALLBACK_MODELS = ("gemini-2.5-flash", "gemini-2.0-flash")
 GEMINI_TIMEOUT_SEC = float(os.getenv("GEMINI_TIMEOUT_SEC", "12"))
+
+
+def _gemini_models_to_try() -> list:
+    """실제 시도할 모델 순서. 2.0-flash가 설정돼 있으면 2.5-flash를 먼저 시도해 404 감소."""
+    current = (GEMINI_MODEL or "").strip()
+    if current == "gemini-2.0-flash":
+        return ["gemini-2.5-flash", "gemini-2.0-flash"]
+    return [current] + [m for m in GEMINI_FALLBACK_MODELS if m != current]
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "32"))
 
 # Blacklist: 포함 시 즉시 UNFIT_CATEGORY (BIZ_008)
@@ -117,12 +127,32 @@ def is_gemini_available() -> Tuple[bool, str]:
     return True, "ok"
 
 
+def _call_gemini_generate_content(model: str, prompt: str, timeout: float) -> Optional[dict]:
+    """단일 모델로 generateContent 호출. 성공 시 응답 dict, 실패 시 None."""
+    import httpx
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "temperature": 0.1,
+            "maxOutputTokens": min(256, max(8, GEMINI_MAX_OUTPUT_TOKENS)),
+        },
+    }
+    with httpx.Client(timeout=timeout) as client:
+        r = client.post(url, json=payload)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+    return r.json()
+
+
 def classify_with_gemini(
     store_name: Optional[str], address: Optional[str]
 ) -> Tuple[Optional[str], float, str]:
     """
     Gemini API로 업종 추론.
     작동 조건: GEMINI_API_KEY 설정됨, store_name 또는 address 중 하나 이상 유효.
+    404 시 GEMINI_FALLBACK_MODELS 순으로 재시도.
     반환: (category, confidence, "AI")
     """
     if not GEMINI_API_KEY:
@@ -134,51 +164,46 @@ def classify_with_gemini(
         logger.debug("Gemini skip: no store_name or address")
         return None, 0.0, "RULE"
 
-    try:
-        import httpx
-        url = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent?key={GEMINI_API_KEY}"
-        prompt = (
-            "다음 상점 정보만 보고, 업종을 다음 중 정확히 하나로만 분류해줘. "
-            "답변은 반드시 한 줄로, 분류명만 출력해줘. (이유 없이)\n"
-            "선택지: TOUR_FOOD, TOUR_CAFE, TOUR_SIGHTSEEING, TOUR_EXPERIENCE, STAY, EXCLUDED\n"
-            f"상호명: {sn or '(없음)'}\n"
-            f"주소: {addr or '(없음)'}\n"
-        )
-        payload = {
-            "contents": [{"parts": [{"text": prompt}]}],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": min(256, max(8, GEMINI_MAX_OUTPUT_TOKENS)),
-            },
-        }
-        timeout = min(30.0, max(5.0, GEMINI_TIMEOUT_SEC))
-        with httpx.Client(timeout=timeout) as client:
-            r = client.post(url, json=payload)
-            r.raise_for_status()
-        data = r.json()
-        candidates = (data.get("candidates") or [{}])[0]
-        parts = (candidates.get("content") or {}).get("parts") or []
-        if not parts:
-            logger.debug("Gemini response: no content parts")
+    prompt = (
+        "다음 상점 정보만 보고, 업종을 다음 중 정확히 하나로만 분류해줘. "
+        "답변은 반드시 한 줄로, 분류명만 출력해줘. (이유 없이)\n"
+        "선택지: TOUR_FOOD, TOUR_CAFE, TOUR_SIGHTSEEING, TOUR_EXPERIENCE, STAY, EXCLUDED\n"
+        f"상호명: {sn or '(없음)'}\n"
+        f"주소: {addr or '(없음)'}\n"
+    )
+    timeout = min(30.0, max(5.0, GEMINI_TIMEOUT_SEC))
+    models_to_try = _gemini_models_to_try()
+    last_err: Optional[Exception] = None
+    for model in models_to_try:
+        try:
+            data = _call_gemini_generate_content(model, prompt, timeout)
+            if data is None:
+                logger.warning("Gemini model not found (404): %s, trying fallback", model)
+                continue
+            candidates = (data.get("candidates") or [{}])[0]
+            parts = (candidates.get("content") or {}).get("parts") or []
+            if not parts:
+                logger.debug("Gemini response: no content parts")
+                return None, 0.0, "RULE"
+            raw = (parts[0].get("text") or "").strip().upper()
+            for cat in ("TOUR_FOOD", "TOUR_CAFE", "TOUR_SIGHTSEEING", "TOUR_EXPERIENCE", "STAY", "EXCLUDED"):
+                if cat in raw or cat.replace("_", " ") in raw:
+                    if "EXCLUDED" in raw:
+                        return None, 0.85, "AI"
+                    logger.debug("Gemini classified: %s -> %s (model=%s)", (sn or addr)[:30], cat, model)
+                    return cat, 0.85, "AI"
+            logger.debug("Gemini response: no matching category in %s", raw[:80])
             return None, 0.0, "RULE"
-        raw = (parts[0].get("text") or "").strip().upper()
-        for cat in ("TOUR_FOOD", "TOUR_CAFE", "TOUR_SIGHTSEEING", "TOUR_EXPERIENCE", "STAY", "EXCLUDED"):
-            if cat in raw or cat.replace("_", " ") in raw:
-                if "EXCLUDED" in raw:
-                    return None, 0.85, "AI"
-                logger.debug("Gemini classified: %s -> %s", (sn or addr)[:30], cat)
-                return cat, 0.85, "AI"
-        logger.debug("Gemini response: no matching category in %s", raw[:80])
-        return None, 0.0, "RULE"
-    except Exception as e:
-        if getattr(e, "response", None) and getattr(e.response, "status_code", None) == 404:
-            logger.warning(
-                "Gemini model not found (404). GEMINI_MODEL=%s. Try GEMINI_MODEL=gemini-2.0-flash or see https://ai.google.dev/gemini-api/docs/models",
-                GEMINI_MODEL,
-            )
-        else:
-            logger.warning("Gemini classification failed: %s", e)
-        return None, 0.0, "RULE"
+        except Exception as e:
+            last_err = e
+            if getattr(e, "response", None) and getattr(e.response, "status_code", None) == 404:
+                logger.warning("Gemini model not found (404): %s, trying fallback", model)
+                continue
+            logger.warning("Gemini classification failed (model=%s): %s", model, e)
+            break
+    if last_err:
+        logger.warning("Gemini classification failed after fallbacks: %s", last_err)
+    return None, 0.0, "RULE"
 
 
 def classify_store(

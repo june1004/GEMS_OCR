@@ -231,12 +231,13 @@
 - Body 규격:
   - `GET /api/v1/receipts/{receiptId}/status` 응답과 거의 동일
   - 콜백에서는 전송량 최적화를 위해 **`items[].ocr_raw`는 제외**
-  - 추가 필드 `receiptId` 포함
+  - 추가 필드 `receiptId`(camelCase), `receipt_id`(snake_case) 포함 — 동일 UUID 값
   - 추가 필드 `schemaVersion` 포함
   - 추가 필드 `payloadMeta` 포함 (audit_trail / error_message 트렁케이트 여부 등)
 - 인증:
   - 별도 인증 헤더 없음(운영 정책 기준)
-  - 수신 측에서 `receiptId` 존재 및 DB 유효성 확인 후 처리
+  - 수신 측에서 `receiptId` 또는 `receipt_id` 존재 및 세션/DB와 일치하는지 검증 후 처리
+- **"receiptId mismatching" 400 대응**: 수신 서버가 기대하는 ID는 presigned-url/complete 시 사용한 `receiptId`(UUID)와 동일해야 합니다. FE는 complete 요청 시 반드시 presigned에서 받은 `receiptId`를 그대로 사용하세요.
 
 ---
 

@@ -20,7 +20,8 @@ logger = logging.getLogger(__name__)
 
 # Gemini API 설정 (환경변수 우선)
 GEMINI_API_KEY = (os.getenv("GEMINI_API_KEY") or "").strip()
-GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-2.0-flash").strip()
+# gemini-2.0-flash는 v1beta에서 404 가능. 1.5-flash는 안정 노출.
+GEMINI_MODEL = (os.getenv("GEMINI_MODEL") or "gemini-1.5-flash").strip()
 GEMINI_TIMEOUT_SEC = float(os.getenv("GEMINI_TIMEOUT_SEC", "12"))
 GEMINI_MAX_OUTPUT_TOKENS = int(os.getenv("GEMINI_MAX_OUTPUT_TOKENS", "32"))
 

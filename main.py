@@ -58,12 +58,13 @@ S3_ACCESS_KEY = os.getenv("S3_ACCESS_KEY")
 S3_SECRET_KEY = os.getenv("S3_SECRET_KEY")
 S3_BUCKET = os.getenv("S3_BUCKET", "gems-receipts")
 # 네이버 OCR: STAY(일반 모델·템플릿) / TOUR(영수증 특화) 분기. 미설정 시 기존 단일 설정으로 TOUR fallback.
+# STAY 전용 미설정 시: 공통(NAVER_OCR_*) → TOUR 순으로 fallback (TOUR만 설정해도 STAY가 TOUR 도메인 사용)
 NAVER_OCR_URL = os.getenv("NAVER_OCR_INVOKE_URL")
 NAVER_OCR_SECRET = os.getenv("NAVER_OCR_SECRET")
-NAVER_OCR_STAY_URL = (os.getenv("NAVER_OCR_STAY_INVOKE_URL") or "").strip() or NAVER_OCR_URL
-NAVER_OCR_STAY_SECRET = (os.getenv("NAVER_OCR_STAY_SECRET") or "").strip() or NAVER_OCR_SECRET
 NAVER_OCR_TOUR_URL = (os.getenv("NAVER_OCR_TOUR_INVOKE_URL") or "").strip() or NAVER_OCR_URL
 NAVER_OCR_TOUR_SECRET = (os.getenv("NAVER_OCR_TOUR_SECRET") or "").strip() or NAVER_OCR_SECRET
+NAVER_OCR_STAY_URL = (os.getenv("NAVER_OCR_STAY_INVOKE_URL") or "").strip() or NAVER_OCR_URL or NAVER_OCR_TOUR_URL
+NAVER_OCR_STAY_SECRET = (os.getenv("NAVER_OCR_STAY_SECRET") or "").strip() or NAVER_OCR_SECRET or NAVER_OCR_TOUR_SECRET
 OCR_CONFIG = {
     "STAY": {"url": NAVER_OCR_STAY_URL, "secret": NAVER_OCR_STAY_SECRET},
     "TOUR": {"url": NAVER_OCR_TOUR_URL, "secret": NAVER_OCR_TOUR_SECRET},
@@ -77,6 +78,8 @@ OCR_CALLBACK_MAX_ERROR_MESSAGE_CHARS = int(os.getenv("OCR_CALLBACK_MAX_ERROR_MES
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # 관리자 API 보호(선택): 설정 시 /api/v1/admin/* 호출에 X-Admin-Key 필요
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip() or None
+# 크론 잡 전용 시크릿: 설정 시 X-Cron-Secret으로 /api/v1/admin/jobs/cron/* 호출 가능 (관리자 키 없이)
+CRON_SECRET = os.getenv("CRON_SECRET", "").strip() or None
 # JWT·담당자 로그인 (이메일/비밀번호). 설정 시 로그인 API·Bearer 인증 사용
 JWT_SECRET = os.getenv("JWT_SECRET", "").strip() or None
 JWT_ALGORITHM = "HS256"
@@ -132,6 +135,8 @@ class Submission(Base):
     fail_reason = Column(String)
     audit_log = Column(String)
     user_input_snapshot = Column(JSONB, nullable=True)  # Complete 시 FE가 보낸 data (방식2: items[])
+    # Presigned 발급 횟수: TOUR 3매·STAY 2매 제한 적용용 (migration: presigned_issued_count.sql)
+    presigned_issued_count = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)  # VERIFYING 타임아웃 등 판단용
     items = relationship("ReceiptItem", back_populates="submission", cascade="all, delete-orphan")
@@ -358,6 +363,13 @@ class DataWithItems(BaseModel):
     items: List[PerDocumentFormData]
 
 
+# 타입별 문서 건수 제한: TOUR 영수증 최대 3매, STAY 영수증 1매 + 인보이스 1매
+TOUR_MAX_RECEIPTS = 3
+STAY_RECEIPT_COUNT = 1
+STAY_OTA_INVOICE_MAX = 1
+STAY_MAX_DOCUMENTS = STAY_RECEIPT_COUNT + STAY_OTA_INVOICE_MAX  # 2
+
+
 class ReceiptMetadata(BaseModel):
     imageKey: str
     docType: Literal["RECEIPT", "OTA_INVOICE"]
@@ -419,15 +431,17 @@ class CompleteRequest(BaseModel):
             if t == "STAY":
                 receipt_cnt = len([d for d in normalized_docs if d.docType == "RECEIPT"])
                 ota_cnt = len([d for d in normalized_docs if d.docType == "OTA_INVOICE"])
-                if receipt_cnt < 1:
-                    raise ValueError("STAY requires at least one RECEIPT document")
-                if receipt_cnt > 1 or ota_cnt > 1:
-                    raise ValueError("STAY supports RECEIPT(1) + OTA_INVOICE(0~1)")
+                if receipt_cnt < STAY_RECEIPT_COUNT:
+                    raise ValueError("STAY는 영수증 1매 필수")
+                if receipt_cnt > STAY_RECEIPT_COUNT or ota_cnt > STAY_OTA_INVOICE_MAX:
+                    raise ValueError("STAY는 영수증 1매 + 인보이스 1매만 가능")
+                if len(normalized_docs) > STAY_MAX_DOCUMENTS:
+                    raise ValueError("STAY는 최대 2매(영수증 1 + 인보이스 1)")
             else:
-                if len(normalized_docs) < 1 or len(normalized_docs) > 3:
-                    raise ValueError("TOUR supports 1 to 3 documents")
+                if len(normalized_docs) < 1 or len(normalized_docs) > TOUR_MAX_RECEIPTS:
+                    raise ValueError(f"TOUR는 영수증 1~{TOUR_MAX_RECEIPTS}매만 가능")
                 if any(d.docType != "RECEIPT" for d in normalized_docs):
-                    raise ValueError("TOUR supports RECEIPT documents only")
+                    raise ValueError("TOUR는 영수증(RECEIPT)만 가능")
 
         if data is not None and isinstance(data, dict):
             if "items" in data and isinstance(data.get("items"), list):
@@ -491,15 +505,17 @@ class CompleteRequestV2(BaseModel):
         if t == "STAY":
             receipt_cnt = len([d for d in normalized_docs if d.docType == "RECEIPT"])
             ota_cnt = len([d for d in normalized_docs if d.docType == "OTA_INVOICE"])
-            if receipt_cnt < 1:
-                raise ValueError("STAY requires at least one RECEIPT document")
-            if receipt_cnt > 1 or ota_cnt > 1:
-                raise ValueError("STAY supports RECEIPT(1) + OTA_INVOICE(0~1)")
+            if receipt_cnt < STAY_RECEIPT_COUNT:
+                raise ValueError("STAY는 영수증 1매 필수")
+            if receipt_cnt > STAY_RECEIPT_COUNT or ota_cnt > STAY_OTA_INVOICE_MAX:
+                raise ValueError("STAY는 영수증 1매 + 인보이스 1매만 가능")
+            if len(normalized_docs) > STAY_MAX_DOCUMENTS:
+                raise ValueError("STAY는 최대 2매(영수증 1 + 인보이스 1)")
         else:
-            if len(normalized_docs) < 1 or len(normalized_docs) > 3:
-                raise ValueError("TOUR supports 1 to 3 documents")
+            if len(normalized_docs) < 1 or len(normalized_docs) > TOUR_MAX_RECEIPTS:
+                raise ValueError(f"TOUR는 영수증 1~{TOUR_MAX_RECEIPTS}매만 가능")
             if any(d.docType != "RECEIPT" for d in normalized_docs):
-                raise ValueError("TOUR supports RECEIPT documents only")
+                raise ValueError("TOUR는 영수증(RECEIPT)만 가능")
 
         return v
 
@@ -988,14 +1004,24 @@ async def get_presigned_url(
             detail=f"Presigned URL 생성 실패: {str(e)}",
         )
 
+    type_str = type.value if hasattr(type, "value") else str(type)
     try:
         existing = db.query(Submission).filter(Submission.submission_id == receipt_id).first()
         if existing:
             if _normalize_user_uuid(existing.user_uuid) != user_uuid:
                 raise HTTPException(status_code=403, detail="receiptId owner mismatch")
             # receiptId 재사용은 "같은 신청(같은 type)"에 한해서만 허용 (STAY↔TOUR 엉킴 방지)
-            if (existing.project_type or "").strip() and existing.project_type != type:
+            if (existing.project_type or "").strip() and existing.project_type != type_str:
                 raise HTTPException(status_code=409, detail="receiptId type mismatch")
+            # TOUR 영수증 3매까지, STAY 영수증 1매 + 인보이스 1매(최대 2매)
+            cnt = getattr(existing, "presigned_issued_count", 0) or 0
+            max_allowed = TOUR_MAX_RECEIPTS if type_str == "TOUR" else STAY_MAX_DOCUMENTS
+            if cnt >= max_allowed:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"해당 신청은 최대 {max_allowed}매까지 가능합니다. (TOUR: 영수증 최대 3매, STAY: 영수증 1매+인보이스 1매)",
+                )
+            existing.presigned_issued_count = cnt + 1
             # campaign_id는 presigned 최초 생성 시 서버가 고정. 기존 submission에서는 덮어쓰지 않는다.
         else:
             campaign_id = _resolve_campaign_id_for_presigned(db, user_uuid, type)
@@ -1007,6 +1033,7 @@ async def get_presigned_url(
                     campaign_id=campaign_id,
                     status="PENDING",
                     total_amount=0,
+                    presigned_issued_count=1,
                 )
             )
         db.commit()
@@ -1081,6 +1108,7 @@ async def upload_receipt_via_api(
                 campaign_id=1,
                 status="PENDING",
                 total_amount=0,
+                presigned_issued_count=1,
             )
         )
         db.commit()
@@ -1398,6 +1426,17 @@ def get_admin_context(
             campaign_ids = [int(r[0]) for r in rows]
         return AdminContext(user.email, is_super, campaign_ids, admin_user_id=user.id, email=user.email)
     raise HTTPException(status_code=401, detail="Authorization required (X-Admin-Key or Bearer token)")
+
+
+def require_cron_secret(
+    x_cron_secret: Optional[str] = Header(None, alias="X-Cron-Secret"),
+) -> str:
+    """크론 잡 전용: X-Cron-Secret이 CRON_SECRET과 일치하면 actor 'cron' 반환."""
+    if not CRON_SECRET:
+        raise HTTPException(status_code=503, detail="CRON_SECRET not configured")
+    if (x_cron_secret or "").strip() != CRON_SECRET:
+        raise HTTPException(status_code=401, detail="Invalid X-Cron-Secret")
+    return "cron"
 
 
 def require_admin(
@@ -2587,7 +2626,7 @@ async def admin_update_campaign(
     campaignId: int,
     body: AdminCampaignUpsertRequest = Body(
         ...,
-        example={
+        examples=[{"value": {
             "name": "캠페인명",
             "active": True,
             "targetCityCounty": None,
@@ -2595,7 +2634,7 @@ async def admin_update_campaign(
             "endDate": None,
             "projectType": "STAY",
             "priority": 100,
-        },
+        }}],
     ),
     db: Session = Depends(get_db),
     actor: str = Depends(require_admin),
@@ -2854,6 +2893,25 @@ class ProcessVerifyingTimeoutResponse(BaseModel):
 async def admin_process_verifying_timeout(
     db: Session = Depends(get_db),
     actor: str = Depends(require_admin),
+):
+    cfg = _get_judgment_rule_config(db)
+    timeout_min = int(getattr(cfg, "verifying_timeout_minutes", None) or 0)
+    if timeout_min <= 0:
+        return ProcessVerifyingTimeoutResponse(processed=0, submission_ids=[], reason="verifying_timeout_minutes 비활성(0)")
+    processed, ids = await _process_verifying_timeout_run(db, actor=actor)
+    return ProcessVerifyingTimeoutResponse(processed=processed, submission_ids=ids)
+
+
+@app.post(
+    "/api/v1/admin/jobs/cron/verifying-timeout",
+    response_model=ProcessVerifyingTimeoutResponse,
+    summary="[크론] VERIFYING 타임아웃 처리",
+    description="X-Cron-Secret으로 호출. verifying_timeout_minutes 초과 건 UNFIT/ERROR 처리 후 콜백. crontab에서 주기 호출.",
+    tags=["Admin - Jobs"],
+)
+async def cron_process_verifying_timeout(
+    db: Session = Depends(get_db),
+    actor: str = Depends(require_cron_secret),
 ):
     cfg = _get_judgment_rule_config(db)
     timeout_min = int(getattr(cfg, "verifying_timeout_minutes", None) or 0)
@@ -4080,11 +4138,15 @@ def _normalize_pay_date_canonical(raw: Optional[str]) -> Optional[str]:
         return raw if raw.strip() else None
 
 
+class NaverOCRInferError(ValueError):
+    """Naver OCR 200 OK이지만 inferResult가 SUCCESS가 아님(예: ERROR). 재시도해도 동일하므로 재시도 생략."""
+
+
 def _validate_naver_ocr_response(ocr_data: Any, receipt_id: str) -> None:
     """
     네이버 OCR 응답 검증. 형식 오류 시 ValueError 발생 → 호출부에서 ERROR_OCR 처리.
     - 200 OK이지만 body에 error 또는 images 누락/비정상 시 분석 불가로 간주.
-    - 영수증 API는 images[].receipt.result 구조; inferResult는 있는 경우만 검사.
+    - inferResult가 ERROR 등이면 NaverOCRInferError (재시도 없이 즉시 실패 처리).
     """
     if not isinstance(ocr_data, dict):
         raise ValueError(f"Naver OCR response is not a dict: type={type(ocr_data).__name__}")
@@ -4099,7 +4161,7 @@ def _validate_naver_ocr_response(ocr_data: Any, receipt_id: str) -> None:
     infer_result = first.get("inferResult") or first.get("message")
     if infer_result is not None and isinstance(infer_result, str):
         if infer_result.upper() not in ("SUCCESS", "SUCCESS_OK"):
-            raise ValueError(f"Naver OCR inferResult not success: {infer_result}")
+            raise NaverOCRInferError(f"Naver OCR inferResult not success: {infer_result}")
 
 
 def _resolve_ocr_domain(image_key: Optional[str], project_type: Optional[str]) -> str:
@@ -4170,11 +4232,15 @@ async def _call_naver_ocr_with_retry(
     """
     네이버 OCR 호출 재시도 래퍼.
     - domain_type: STAY | TOUR (저장 경로 기반 분기 후 전달)
+    - inferResult ERROR 등 NaverOCRInferError는 재시도하지 않음 (동일 이미지 재전송 무의미).
     """
     last_exc: Optional[Exception] = None
     for attempt in range(retries + 1):
         try:
             return await _call_naver_ocr_binary(image_binary, receipt_id, image_format, domain_type=domain_type)
+        except NaverOCRInferError as e:
+            logger.warning("Naver OCR inferResult 실패(재시도 없음): %s", e)
+            raise
         except Exception as e:
             last_exc = e
             logger.warning(

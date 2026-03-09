@@ -38,9 +38,11 @@
 **POST /api/v1/auth/login**
 
 - Request body: `{ "email": "admin@example.com", "password": "Abc1!xyz" }`
-- Response: `{ "access_token": "...", "token_type": "bearer", "user": { "id", "email", "role", "name", "organizationId", "org_name", "campaignIds" } }`
+- Response: `{ "access_token": "...", "token_type": "bearer", "user": { "id", "email", "role", "name", "organizationId", "organization_id", "org_name", "orgName", "org_type", "orgType", "campaignIds" } }`
 - `user.name`: 담당자 이름(없으면 FE에서 이메일 @ 앞부분 표시)
-- `user.org_name`: 소속명(기관명). FE에서 "소속(기관정보)" 표시 시 `org_type`과 조합 가능
+- `user.organizationId` / `user.organization_id`: 조직 ID. 미반환 시 FE "api (미반환)" 표시 방지를 위해 DB 조회 후 포함.
+- `user.org_name` / `user.orgName`: 조직명(소속명). 있으면 환경설정 계정정보 등에 표시.
+- `user.org_type` / `user.orgType`: 조직 유형(선택). 예: PROVINCE, CITY_COUNTY, FOUNDATION. DB에 컬럼 있으면 반환, 없으면 null.
 - `user.campaignIds`: 접근 가능 캠페인 ID 배열. 담당자는 이 ID만 캠페인 선택·검수 큐에서 사용
 - 401: 이메일/비밀번호 오류 또는 비활성 계정
 

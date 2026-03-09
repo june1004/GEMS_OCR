@@ -1989,6 +1989,9 @@ class MeResponse(BaseModel):
     organization_id: Optional[int] = None  # snake_case, 계정정보 조직 표시용
     organizationName: Optional[str] = None
     org_name: Optional[str] = None  # 소속명, FE 표시용
+    orgName: Optional[str] = None
+    org_type: Optional[str] = None  # PROVINCE, CITY_COUNTY, FOUNDATION 등
+    orgType: Optional[str] = None
     campaignIds: List[int] = Field(default_factory=list)
     isSuper: bool = False
 
@@ -2063,10 +2066,15 @@ async def auth_login(body: LoginRequest, db: Session = Depends(get_db)):
         rows = db.query(AdminCampaignAccess.campaign_id).filter(AdminCampaignAccess.admin_user_id == user.id).all()
         campaign_ids = [int(r[0]) for r in rows]
     org_name = user.org_name
-    if org_name is None and user.organization_id:
+    org_type = getattr(user, "org_type", None)
+    org = None
+    if user.organization_id:
         org = db.query(Organization).filter(Organization.id == user.organization_id).first()
-        org_name = org.name if org else None
-    # organizationId / organization_id 둘 다 포함 (계정정보 조직 표시, "미반환" 방지)
+        if org_name is None and org:
+            org_name = org.name
+        if org_type is None and org:
+            org_type = getattr(org, "org_type", None)
+    # 환경설정 계정정보용: organizationId, org_name, org_type (snake_case + camelCase)
     org_id = user.organization_id
     return LoginResponse(
         access_token=token,
@@ -2078,6 +2086,9 @@ async def auth_login(body: LoginRequest, db: Session = Depends(get_db)):
             "organizationId": org_id,
             "organization_id": org_id,
             "org_name": org_name,
+            "orgName": org_name,
+            "org_type": org_type,
+            "orgType": org_type,
             "campaignIds": campaign_ids,
         },
     )
@@ -2136,9 +2147,14 @@ async def admin_me(ctx: AdminContext = Depends(get_admin_context), db: Session =
     if not user:
         return MeResponse(id=0, email=ctx.actor, role="SUPER_ADMIN", isSuper=True, campaignIds=[])
     org_name = user.org_name
-    if org_name is None and user.organization_id:
+    org_type = getattr(user, "org_type", None)
+    org = None
+    if user.organization_id:
         org = db.query(Organization).filter(Organization.id == user.organization_id).first()
-        org_name = org.name if org else None
+        if org_name is None and org:
+            org_name = org.name
+        if org_type is None and org:
+            org_type = getattr(org, "org_type", None)
     return MeResponse(
         id=user.id,
         email=user.email,
@@ -2148,6 +2164,9 @@ async def admin_me(ctx: AdminContext = Depends(get_admin_context), db: Session =
         organization_id=user.organization_id,
         organizationName=org_name,
         org_name=org_name,
+        orgName=org_name,
+        org_type=org_type,
+        orgType=org_type,
         campaignIds=ctx.campaign_ids,
         isSuper=ctx.is_super,
     )

@@ -138,6 +138,7 @@ class Submission(Base):
     fail_reason = Column(String)
     audit_log = Column(String)
     user_input_snapshot = Column(JSONB, nullable=True)  # Complete 시 FE가 보낸 data (방식2: items[])
+    # submission_sidecar(JSONB): §10 교정 이력. migration 적용 시 존재 (submission_sidecar_correction.sql)
     # Presigned 발급 횟수: TOUR 3매·STAY 2매 제한 적용용 (migration: presigned_issued_count.sql)
     presigned_issued_count = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -4306,6 +4307,172 @@ async def admin_receipt_tag(
         receiptId=rid,
         tag=tag_val,
         updated_at=sub.updated_at.isoformat() if sub.updated_at else None,
+    )
+
+
+# GEMS 표준 수정·반려 사유 (GEMS_표준_수정_반려_사유_분류.md) → asset_tag 매핑
+CORRECTION_REASON_TO_ASSET_TAG = {
+    "ERR_OCR_AMOUNT": "RE_TRAINING_REQUIRED",
+    "ERR_UNIT_DECIMAL": "RE_TRAINING_REQUIRED",
+    "USER_AMOUNT_MISTAKE": "USER_ERROR_LABEL",
+    "AMOUNT_SUM_MISMATCH": "RE_TRAINING_REQUIRED",
+    "ERR_REGION_OCR": "RE_TRAINING_REQUIRED",
+    "CATEGORY_RECLASSIFY": "RE_TRAINING_REQUIRED",
+    "STORE_NAME_MISSING": "RE_TRAINING_REQUIRED",
+    "IMAGE_BLUR": "LOW_QUALITY_SAMPLE",
+    "IMAGE_CROP": "LOW_QUALITY_SAMPLE",
+    "DUPLICATE_SUSPECT": "FRAUD_CHECK",
+    "OTHER": None,
+}
+
+
+class AdminCorrectionRequest(BaseModel):
+    total_amount: Optional[int] = Field(None, description="교정할 총 금액")
+    address: Optional[str] = Field(None, description="교정할 주소(첫 장 receipt_item)")
+    correction_reason_code: str = Field(
+        ...,
+        description="GEMS 표준: ERR_OCR_AMOUNT|ERR_UNIT_DECIMAL|USER_AMOUNT_MISTAKE|AMOUNT_SUM_MISMATCH|ERR_REGION_OCR|CATEGORY_RECLASSIFY|STORE_NAME_MISSING|IMAGE_BLUR|IMAGE_CROP|DUPLICATE_SUSPECT|OTHER",
+    )
+    correction_reason_detail: Optional[str] = Field(None, description="수정 사유 상세(reason_desc)")
+    asset_tag: Optional[str] = Field(None, description="RE_TRAINING_REQUIRED|USER_ERROR_LABEL|LOW_QUALITY_SAMPLE|FRAUD_CHECK, 미지정 시 reason_code로 매핑")
+    audit: Optional[Dict[str, Any]] = Field(None, description="FE 전달용, 서버에서 actor·시각으로 덮어씀")
+
+
+class AdminCorrectionResponse(BaseModel):
+    receiptId: str
+    total_amount: Optional[int] = None
+    address: Optional[str] = None
+    correction_audit: Optional[Dict[str, Any]] = Field(None, description="이번 교정 이력(Sidecar용)")
+    human_correction: Optional[Dict[str, Any]] = Field(None, description="GEMS 표준 human_correction 구조")
+    asset_tag: Optional[str] = Field(None, description="RE_TRAINING_REQUIRED|USER_ERROR_LABEL|LOW_QUALITY_SAMPLE|FRAUD_CHECK")
+
+
+@app.patch(
+    "/api/v1/admin/submissions/{receiptId}/correction",
+    response_model=AdminCorrectionResponse,
+    summary="증거(영수증) 데이터 교정",
+    description="검수 화면에서 금액·주소 등 교정. audit_trail 및 Sidecar(교정 이력)에 기록해 AI 재학습·정답지 활용.",
+    tags=["Admin - Submissions"],
+)
+async def admin_submission_correction(
+    receiptId: str,
+    body: AdminCorrectionRequest,
+    request: Request,
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    rid = _sanitize_receipt_id(receiptId)
+    sub = db.query(Submission).filter(Submission.submission_id == rid).first()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    if not ctx.is_super and ctx.campaign_ids and (sub.campaign_id or 0) not in ctx.campaign_ids:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    reason_code = (body.correction_reason_code or "").strip().upper() or "OTHER"
+    reason_detail = (body.correction_reason_detail or "").strip() or ""
+    at = datetime.utcnow()
+    at_iso = at.isoformat() + "Z"
+    actor_id = ctx.actor
+
+    before: Dict[str, Any] = {"total_amount": sub.total_amount}
+    after: Dict[str, Any] = {}
+    first_item = (
+        db.query(ReceiptItem)
+        .filter(ReceiptItem.submission_id == rid)
+        .order_by(ReceiptItem.seq_no.asc())
+        .first()
+    )
+    if first_item:
+        before["address"] = first_item.address
+
+    if body.total_amount is not None:
+        after["total_amount"] = max(0, int(body.total_amount))
+        sub.total_amount = after["total_amount"]
+    if body.address is not None and first_item is not None:
+        after["address"] = body.address.strip() if body.address else ""
+        first_item.address = after["address"] or None
+
+    if not after:
+        raise HTTPException(status_code=400, detail="At least one of total_amount or address required")
+
+    sub.updated_at = at
+    asset_tag = (body.asset_tag or "").strip() or CORRECTION_REASON_TO_ASSET_TAG.get(reason_code)
+    correction_entry = {
+        "from": before,
+        "to": after,
+        "reason_code": reason_code,
+        "reason_detail": reason_detail,
+        "actor_id": actor_id,
+        "at": at_iso,
+    }
+    trail_line = f"CORRECTION({at_iso} by {actor_id} reason={reason_code}): {before} -> {after}"
+    existing_trail = sub.audit_trail or sub.audit_log or ""
+    sub.audit_trail = (existing_trail + " | " + trail_line).strip(" |") if existing_trail else trail_line
+    sub.audit_log = sub.audit_trail
+
+    # GEMS 표준 Sidecar JSON (§6): receipt_id, ai_result, human_correction, asset_tag
+    human_correction = {
+        "final_amount": after.get("total_amount") or sub.total_amount,
+        "reason_code": reason_code,
+        "reason_desc": reason_detail or reason_code,
+        "reviewed_by": actor_id,
+        "at": at_iso,
+    }
+    if after.get("address") is not None:
+        human_correction["address"] = after["address"]
+    ai_result: Dict[str, Any] = {"amount": before.get("total_amount")}
+    if first_item and getattr(first_item, "confidence_score", None) is not None:
+        c = first_item.confidence_score
+        ai_result["confidence"] = round(c / 100.0, 2) if c is not None else None
+    else:
+        ai_result["confidence"] = None
+
+    try:
+        row = db.execute(
+            sql_text("SELECT submission_sidecar FROM submissions WHERE submission_id = :rid"),
+            {"rid": rid},
+        ).fetchone()
+        sidecar = dict(row[0]) if row and row[0] and isinstance(row[0], dict) else {}
+        correction_audit_list = list(sidecar.get("correction_audit") or [])
+        correction_audit_list.append(correction_entry)
+        sidecar["receipt_id"] = rid
+        sidecar["ai_result"] = ai_result
+        sidecar["human_correction"] = human_correction
+        sidecar["reviewer_correction"] = after
+        sidecar["correction_audit"] = correction_audit_list
+        if asset_tag:
+            sidecar["asset_tag"] = asset_tag
+        db.execute(
+            sql_text("UPDATE submissions SET submission_sidecar = :sc::jsonb WHERE submission_id = :rid"),
+            {"sc": json.dumps(sidecar), "rid": rid},
+        )
+    except Exception:
+        pass
+
+    db.commit()
+    db.refresh(sub)
+    _audit_log(
+        db,
+        actor=ctx.actor,
+        action="CORRECTION",
+        target_type="submission",
+        target_id=rid,
+        before_json=before,
+        after_json=after,
+        meta={
+            "reason_code": reason_code,
+            "reason_detail": reason_detail[:200] if reason_detail else None,
+            "asset_tag": asset_tag,
+            "client_ip": _admin_client_ip(request),
+        },
+    )
+    db.commit()
+    return AdminCorrectionResponse(
+        receiptId=rid,
+        total_amount=sub.total_amount,
+        address=first_item.address if first_item else (after.get("address") if after else None),
+        correction_audit=correction_entry,
+        human_correction=human_correction,
+        asset_tag=asset_tag,
     )
 
 

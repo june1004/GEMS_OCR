@@ -31,7 +31,7 @@ from fastapi.responses import JSONResponse
 import bcrypt
 import jwt
 from pydantic import BaseModel, Field, model_validator, UUID4, ConfigDict
-from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Float, DateTime, JSON, Boolean, ARRAY, ForeignKey, update, case
+from sqlalchemy import create_engine, Column, String, Integer, BigInteger, Float, DateTime, JSON, Boolean, ARRAY, ForeignKey, update, case, or_
 from sqlalchemy.ext.declarative import declarative_base
 from sqlalchemy.orm import sessionmaker, Session, relationship
 from sqlalchemy.dialects.postgresql import JSONB
@@ -1666,7 +1666,7 @@ async def _send_result_callback(
     url = url or OCR_RESULT_CALLBACK_URL
     if not url:
         return {"skipped": True, "reason": "OCR_RESULT_CALLBACK_URL is not set"}
-    # 검증 전까지 오류율 감소: 자동 분석 완료(purpose=auto) 시 FIT일 때만 FE로 콜백 전송
+    # 검증 전까지 오류율 감소: 자동 분석 완료(purpose=auto) 시 FIT일 때만 FE로 콜백 전송. 검수자 수동( MANUAL )은 FIT/UNFIT 모두 전송
     if purpose == "auto":
         status_val = (payload.get("status") or payload.get("overall_status") or "").strip().upper()
         if status_val != "FIT":
@@ -1675,11 +1675,13 @@ async def _send_result_callback(
                 receipt_id, purpose, status_val or "(empty)",
             )
             return {"skipped": True, "reason": f"FE callback FIT only; status={status_val or 'empty'}"}
-    # receiptId + receipt_id 둘 다 포함 (수신측이 snake_case로 검증하는 경우 대응)
+    # 판정 출처: FE에서 로직(자동) FIT vs 검수자 수동 FIT/UNFIT 구분용 (백엔드_요청사항_정리·콜백 구분)
+    status_source = "AUTO" if purpose == "auto" else ("MANUAL" if purpose in ("resend", "verify") else "SYSTEM")
     payload_with_id = {
         "schemaVersion": OCR_CALLBACK_SCHEMA_VERSION,
         "receiptId": receipt_id,
         "receipt_id": receipt_id,
+        "statusSource": status_source,
         **payload,
     }
     last_exception: Optional[Exception] = None
@@ -2042,6 +2044,9 @@ class MeResponse(BaseModel):
     orgType: Optional[str] = None
     campaignIds: List[int] = Field(default_factory=list)
     isSuper: bool = False
+    # 행정구역 통계 고도화: 캠페인 기본 지역(시도) — 타 시도 Dimmed 등 FE용
+    adminSidoCode: Optional[str] = None
+    adminSidoName: Optional[str] = None
 
 
 class AdminContextUpdateRequest(BaseModel):
@@ -2203,6 +2208,18 @@ async def admin_me(ctx: AdminContext = Depends(get_admin_context), db: Session =
             org_name = org.name
         if org_type is None and org:
             org_type = getattr(org, "org_type", None)
+    admin_sido_code: Optional[str] = None
+    admin_sido_name: Optional[str] = None
+    if org and (org.sido_code or "").strip():
+        admin_sido_code = (org.sido_code or "").strip()
+        try:
+            rdata = _load_regions_data()
+            for it in (rdata.get("sido") or []):
+                if str(it.get("code") or "").strip() == admin_sido_code:
+                    admin_sido_name = str(it.get("name") or "").strip() or None
+                    break
+        except Exception:
+            pass
     return MeResponse(
         id=user.id,
         email=user.email,
@@ -2217,6 +2234,8 @@ async def admin_me(ctx: AdminContext = Depends(get_admin_context), db: Session =
         orgType=org_type,
         campaignIds=ctx.campaign_ids,
         isSuper=ctx.is_super,
+        adminSidoCode=admin_sido_code,
+        adminSidoName=admin_sido_name,
     )
 
 
@@ -3349,12 +3368,19 @@ class AdminRegionStatsItem(BaseModel):
     submissionCount: int = 0
     fitCount: int = 0
     totalAmount: int = 0
+    # 행정구역 통계 고도화 §12: Hash(MD5) 검증 배지용. DB에 hash 필드 없으면 null
+    hashVerified: Optional[bool] = None
 
 
 class AdminRegionStatsResponse(BaseModel):
     level: str = Field(..., description="SIDO | SIGUNGU | SINGLE")
     scope: Dict[str, Any] = Field(default_factory=dict, description="요청 파라미터 요약")
     items: List[AdminRegionStatsItem] = Field(default_factory=list)
+    # 행정구역 통계 고도화 §12: 최소금액(6만/5만) 달성률·히트맵
+    minAmountAchieveCount: Optional[int] = Field(None, description="FIT 건 중 캠페인 최소금액 충족 건수")
+    minAmountStay: int = Field(60000, description="STAY 최소 금액 기준(정책). 달성률 분모용")
+    minAmountTour: int = Field(50000, description="TOUR 최소 금액 기준(정책). 달성률 분모용")
+    amountBySido: Optional[Dict[str, int]] = Field(None, description="시도별 total_amount. level=SIDO일 때 히트맵 색상용")
 
 
 @app.get(
@@ -3547,8 +3573,52 @@ async def admin_stats_by_region(
                 submissionCount=submission_count,
                 fitCount=fit_count,
                 totalAmount=total_amount,
+                hashVerified=None,
             )
         )
+
+    # 행정구역 통계 고도화 §12: 최소금액 달성 건수, 시도별 금액(히트맵), 정책 기준값
+    cfg = _get_judgment_rule_config(db)
+    min_stay = int(cfg.min_amount_stay or 60000)
+    min_tour = int(cfg.min_amount_tour or 50000)
+    min_amount_achieve_count: Optional[int] = None
+    amount_by_sido: Optional[Dict[str, int]] = None
+    try:
+        q_achieve = (
+            db.query(Submission)
+            .join(
+                ReceiptItem,
+                (ReceiptItem.submission_id == Submission.submission_id) & (ReceiptItem.seq_no == 1),
+            )
+            .filter(Submission.status == "FIT")
+            .filter(
+                or_(
+                    (Submission.project_type == "STAY") & (Submission.total_amount >= min_stay),
+                    (Submission.project_type == "TOUR") & (Submission.total_amount >= min_tour),
+                    ((Submission.project_type != "STAY") & (Submission.project_type != "TOUR")) & (Submission.total_amount >= min_tour),
+                )
+            )
+        )
+        if dt_from is not None:
+            q_achieve = q_achieve.filter(Submission.created_at >= dt_from)
+        if dt_to is not None:
+            q_achieve = q_achieve.filter(Submission.created_at <= dt_to)
+        if projectType:
+            q_achieve = q_achieve.filter(Submission.project_type == (projectType.strip().upper()))
+        if level == "SIGUNGU" and sido_name and sido_expr is not None:
+            allowed_aliases = []
+            for k, v in alias_map.items():
+                if v.get("code") == str(sido_code):
+                    allowed_aliases.append(k)
+            if allowed_aliases:
+                q_achieve = q_achieve.filter(sido_expr.in_(allowed_aliases))
+        if level == "SINGLE" and sigungu_name and sigungu_expr is not None:
+            q_achieve = q_achieve.filter(sigungu_expr == sigungu_name)
+        min_amount_achieve_count = q_achieve.count()
+    except Exception:
+        min_amount_achieve_count = None
+    if level == "SIDO" and items:
+        amount_by_sido = {it.regionCode: it.totalAmount for it in items if it.regionCode is not None}
 
     scope = {
         "sido": sido_name or sido,
@@ -3561,7 +3631,15 @@ async def admin_stats_by_region(
         "dateTo": dt_to.isoformat() if dt_to else None,
         "projectType": projectType.strip().upper() if projectType else None,
     }
-    return AdminRegionStatsResponse(level=level, scope=scope, items=items)
+    return AdminRegionStatsResponse(
+        level=level,
+        scope=scope,
+        items=items,
+        minAmountAchieveCount=min_amount_achieve_count,
+        minAmountStay=min_stay,
+        minAmountTour=min_tour,
+        amountBySido=amount_by_sido,
+    )
 
 
 # 5-2. 신규 상점 후보군(Unregistered Stores) 관리 API
@@ -3747,6 +3825,7 @@ async def admin_list_submissions(
     dateFrom: Optional[str] = Query(None, description="기간 시작 YYYY-MM-DD (from 과 동일)"),
     dateTo: Optional[str] = Query(None, description="기간 끝 YYYY-MM-DD (to 와 동일)"),
     campaignId: Optional[str] = Query(None, description="캠페인 ID로 필터. 기관·검수자: 자신의 캠페인만"),
+    regionCode: Optional[str] = Query(None, description="행정구역 통계 §12: 시군구 코드. 지정 시 해당 지역(첫 장 address/location) 제출만 조회"),
     limit: Optional[int] = Query(None, description="페이지 크기(기본 50, 최대 10000). 대시보드 집계 시 1000 등"),
     offset: Optional[int] = Query(None, description="건너뛸 개수(기본 0)"),
     db: Session = Depends(get_db),
@@ -3795,6 +3874,32 @@ async def admin_list_submissions(
             q = q.filter(Submission.created_at <= dt)
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid to/dateTo")
+    if regionCode and (regionCode := regionCode.strip()):
+        try:
+            rdata = _load_regions_data()
+            sigungu_name_for_filter = None
+            for _sc, items in (rdata.get("sigungu") or {}).items():
+                for it in items or []:
+                    if str(it.get("code") or "").strip() == regionCode:
+                        sigungu_name_for_filter = str(it.get("name") or "").strip()
+                        break
+                if sigungu_name_for_filter:
+                    break
+            if sigungu_name_for_filter:
+                subq = (
+                    db.query(ReceiptItem.submission_id)
+                    .filter(ReceiptItem.seq_no == 1)
+                    .filter(
+                        or_(
+                            ReceiptItem.location == sigungu_name_for_filter,
+                            ReceiptItem.address.like((sigungu_name_for_filter or "") + "%"),
+                        )
+                    )
+                    .distinct()
+                )
+                q = q.filter(Submission.submission_id.in_(subq))
+        except Exception:
+            pass
 
     total = q.count()
     rows = (

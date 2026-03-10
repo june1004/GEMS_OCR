@@ -1,15 +1,16 @@
 import { useState, useEffect } from "react";
 import type { AdminAuth } from "./api/admin";
+import { AdminDashboard } from "./components/admin/AdminDashboard";
 import { AdminRules } from "./components/admin/AdminRules";
 import { AdminCandidates } from "./components/admin/AdminCandidates";
 import { AdminSubmissions } from "./components/admin/AdminSubmissions";
 
-type AdminTab = "rules" | "candidates" | "submissions";
+type AdminTab = "dashboard" | "rules" | "candidates" | "submissions";
 
 function getTabFromHash(): AdminTab {
-  const h = window.location.hash.replace("#admin", "").replace(/^\/+/, "") || "rules";
-  if (h === "candidates" || h === "submissions") return h;
-  return "rules";
+  const h = window.location.hash.replace("#admin", "").replace(/^\/+/, "").split("/")[0] || "dashboard";
+  if (["dashboard", "rules", "candidates", "submissions"].includes(h)) return h as AdminTab;
+  return "dashboard";
 }
 
 export function AdminApp() {
@@ -37,7 +38,9 @@ export function AdminApp() {
   };
 
   const nav = (t: AdminTab) => {
-    window.location.hash = t === "rules" ? "#admin" : `#admin/${t}`;
+    if (t === "dashboard") window.location.hash = "#admin";
+    else if (t === "rules") window.location.hash = "#admin/rules";
+    else window.location.hash = `#admin/${t}`;
   };
 
   return (
@@ -75,7 +78,7 @@ export function AdminApp() {
           </div>
         </div>
         <nav className="mt-3 flex gap-2">
-          {(["rules", "candidates", "submissions"] as const).map((t) => (
+          {(["dashboard", "rules", "candidates", "submissions"] as const).map((t) => (
             <button
               key={t}
               type="button"
@@ -84,12 +87,19 @@ export function AdminApp() {
                 tab === t ? "bg-blue-500 text-white" : "bg-slate-100 text-slate-700 hover:bg-slate-200"
               }`}
             >
-              {t === "rules" ? "판정 규칙" : t === "candidates" ? "후보 상점" : "신청 검색"}
+              {t === "dashboard"
+                ? "대시보드"
+                : t === "rules"
+                  ? "판정 규칙"
+                  : t === "candidates"
+                    ? "후보 상점"
+                    : "신청 검색"}
             </button>
           ))}
         </nav>
       </header>
       <main className="mx-auto max-w-5xl px-4 py-6">
+        {tab === "dashboard" && <AdminDashboard auth={auth} />}
         {tab === "rules" && <AdminRules auth={auth} />}
         {tab === "candidates" && <AdminCandidates auth={auth} />}
         {tab === "submissions" && <AdminSubmissions auth={auth} />}

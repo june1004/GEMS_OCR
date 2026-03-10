@@ -95,14 +95,61 @@ export async function adminApproveCandidates(
   return r.json();
 }
 
+// --- 대시보드 집계
+export type AdminDashboardStats = {
+  todayCount: number;
+  yesterdayCount: number;
+  pendingCount: number;
+  approvedAmountSum: number;
+  byCategory: Record<string, number>;
+  dailyCounts: Array<{ date: string; count: number }>;
+};
+
+export async function adminGetDashboardStats(
+  params: { campaignId?: number; from?: string; to?: string } = {},
+  auth?: AdminAuth
+): Promise<AdminDashboardStats> {
+  const qs = new URLSearchParams();
+  if (params.campaignId != null) qs.set("campaignId", String(params.campaignId));
+  if (params.from) qs.set("from", params.from);
+  if (params.to) qs.set("to", params.to);
+  const r = await fetch(`${API_BASE}/api/v1/admin/dashboard/stats?${qs.toString()}`, {
+    headers: buildAdminHeaders(auth),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export type AdminRejectReasonItem = { reason: string; count: number };
+
+export async function adminGetRejectReasons(
+  params: { campaignId?: number; from?: string; to?: string; limit?: number } = {},
+  auth?: AdminAuth
+): Promise<AdminRejectReasonItem[]> {
+  const qs = new URLSearchParams();
+  if (params.campaignId != null) qs.set("campaignId", String(params.campaignId));
+  if (params.from) qs.set("from", params.from);
+  if (params.to) qs.set("to", params.to);
+  if (params.limit != null) qs.set("limit", String(params.limit));
+  const r = await fetch(`${API_BASE}/api/v1/admin/dashboard/reject-reasons?${qs.toString()}`, {
+    headers: buildAdminHeaders(auth),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
 // --- 신청(Submission) 검색/상세
 export type AdminSubmissionListItem = {
   receiptId: string;
   userUuid: string;
   project_type?: string | null;
+  projectType?: string | null;
   status?: string | null;
   total_amount: number;
   created_at?: string | null;
+  thumbnail_url?: string | null;
+  confidence?: number | null;
+  integrityCheck?: boolean | null;
 };
 
 export type AdminSubmissionListResponse = {
@@ -123,16 +170,25 @@ export async function adminListSubmissions(
     receiptId?: string;
     dateFrom?: string;
     dateTo?: string;
+    from?: string;
+    to?: string;
+    campaignId?: number;
     limit?: number;
     offset?: number;
   },
   auth?: AdminAuth
 ): Promise<AdminSubmissionListResponse> {
   const qs = new URLSearchParams();
-  Object.entries(params).forEach(([k, v]) => {
-    if (v == null || v === "") return;
-    qs.set(k, String(v));
-  });
+  const fromVal = params.from ?? params.dateFrom;
+  const toVal = params.to ?? params.dateTo;
+  if (fromVal) qs.set("from", fromVal);
+  if (toVal) qs.set("to", toVal);
+  if (params.campaignId != null) qs.set("campaignId", String(params.campaignId));
+  if (params.status) qs.set("status", params.status);
+  if (params.userUuid) qs.set("userUuid", params.userUuid);
+  if (params.receiptId) qs.set("receiptId", params.receiptId);
+  if (params.limit != null) qs.set("limit", String(params.limit));
+  if (params.offset != null) qs.set("offset", String(params.offset));
   const r = await fetch(`${API_BASE}/api/v1/admin/submissions?${qs.toString()}`, {
     headers: buildAdminHeaders(auth),
   });

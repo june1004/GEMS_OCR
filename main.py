@@ -1666,6 +1666,15 @@ async def _send_result_callback(
     url = url or OCR_RESULT_CALLBACK_URL
     if not url:
         return {"skipped": True, "reason": "OCR_RESULT_CALLBACK_URL is not set"}
+    # 검증 전까지 오류율 감소: 자동 분석 완료(purpose=auto) 시 FIT일 때만 FE로 콜백 전송
+    if purpose == "auto":
+        status_val = (payload.get("status") or payload.get("overall_status") or "").strip().upper()
+        if status_val != "FIT":
+            logger.info(
+                "OCR result callback skipped (FIT only): receiptId=%s purpose=%s status=%s",
+                receipt_id, purpose, status_val or "(empty)",
+            )
+            return {"skipped": True, "reason": f"FE callback FIT only; status={status_val or 'empty'}"}
     # receiptId + receipt_id 둘 다 포함 (수신측이 snake_case로 검증하는 경우 대응)
     payload_with_id = {
         "schemaVersion": OCR_CALLBACK_SCHEMA_VERSION,

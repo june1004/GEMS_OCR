@@ -979,7 +979,9 @@ async def get_presigned_url(
     1단계: 고객 영수증 업로드용 Presigned URL 발급 (기본 10분 유효, PRESIGNED_URL_EXPIRES_SEC 설정 가능).
     - type 미전달 시 TOUR로 처리. objectKey는 항상 {STAY|TOUR}/receipts/... 형태.
     - receiptId를 전달하면 동일 신청(합산형)으로 이미지를 계속 추가할 수 있음.
+    - contentType이 비어 있으면 image/jpeg로 서명 (FE가 file.type 빈 값일 때 PUT Content-Type과 일치시키기 위함).
     """
+    content_type_for_signing = (contentType or "").strip() or "image/jpeg"
     user_uuid = _normalize_user_uuid(userUuid)
     receipt_id = receiptId or str(uuid.uuid4())
     # MinIO STAY/TOUR 폴더 분기: type으로 저장 경로 결정 → OCR 시 경로 기반 모델 선택
@@ -992,7 +994,7 @@ async def get_presigned_url(
     try:
         url = s3_client.generate_presigned_url(
             "put_object",
-            Params={"Bucket": S3_BUCKET, "Key": object_key, "ContentType": contentType},
+            Params={"Bucket": S3_BUCKET, "Key": object_key, "ContentType": content_type_for_signing},
             ExpiresIn=PRESIGNED_URL_EXPIRES_SEC,
         )
     except ClientError as e:

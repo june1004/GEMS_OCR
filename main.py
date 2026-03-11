@@ -654,6 +654,16 @@ app.add_middleware(
 )
 
 
+# 전역 예외 핸들러: 5xx 시에도 JSONResponse로 반환해 CORS 미들웨어가 적용되도록 (백엔드_요청사항_정리 §13)
+@app.exception_handler(Exception)
+async def _global_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled exception: %s", exc)
+    return JSONResponse(
+        status_code=500,
+        content={"detail": "Internal server error"},
+    )
+
+
 # Swagger 문서 분리: FE(외부)·Admin(관리자) 구분 노출로 보안 강화
 @app.get("/openapi.json", include_in_schema=False)
 def _openapi_fe_json():

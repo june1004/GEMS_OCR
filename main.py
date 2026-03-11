@@ -6461,7 +6461,10 @@ async def analyze_receipt_task(req: CompleteRequest):
         submission.status = "ERROR"
         submission.updated_at = datetime.utcnow()
         submission.total_amount = 0
-        submission.fail_reason = str(e)
+        err_msg = (str(e) or type(e).__name__).strip()
+        if len(err_msg) > 255:
+            err_msg = err_msg[:252] + "..."
+        submission.fail_reason = err_msg
         submission.global_fail_reason = submission.fail_reason
         submission.audit_log = "complete 처리 중 예외 발생"
         submission.audit_trail = submission.audit_log

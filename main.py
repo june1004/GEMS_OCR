@@ -76,6 +76,9 @@ OCR_CALLBACK_RETRIES = max(0, min(3, int(os.getenv("OCR_CALLBACK_RETRIES", "2"))
 OCR_CALLBACK_SCHEMA_VERSION = 2
 OCR_CALLBACK_MAX_AUDIT_TRAIL_CHARS = int(os.getenv("OCR_CALLBACK_MAX_AUDIT_TRAIL_CHARS", "2000"))
 OCR_CALLBACK_MAX_ERROR_MESSAGE_CHARS = int(os.getenv("OCR_CALLBACK_MAX_ERROR_MESSAGE_CHARS", "200"))
+# 영수증 검증 결과 저장 시 DB 컬럼 길이 제한 (StringDataRightTruncation 방지)
+SUBMISSION_FAIL_REASON_MAX_LEN = 255
+SUBMISSION_AUDIT_MAX_LEN = 2000
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 # 관리자 API 보호(선택): 설정 시 /api/v1/admin/* 호출에 X-Admin-Key 필요
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip() or None
@@ -1829,7 +1832,7 @@ async def _process_verifying_timeout_run(db: Session, actor: str = "system") -> 
     if not overdue:
         return 0, []
     processed: List[str] = []
-    reason = "VERIFYING_TIMEOUT (대기 시간 초과)"
+    reason = _truncate_submission_reason("VERIFYING_TIMEOUT (대기 시간 초과)")
     for sub in overdue:
         try:
             sub.status = action
@@ -4009,12 +4012,14 @@ async def admin_bulk_reject(
             continue
         try:
             sub.status = "UNFIT"
-            sub.fail_reason = reason_msg
-            sub.global_fail_reason = reason_msg
+            sub.fail_reason = _truncate_submission_reason(reason_msg)
+            sub.global_fail_reason = sub.fail_reason
             sub.updated_at = datetime.utcnow()
-            line = f"BULK_REJECT({datetime.utcnow().isoformat()}, actor={ctx.actor}, reasonCode={reason_code or '-'}, tagAsError={body.tagAsError}): {reason_msg}"
+            reason_short = _truncate_submission_reason(reason_msg) or (reason_msg[:200] + "..." if reason_msg and len(reason_msg) > 200 else reason_msg) or "-"
+            line = f"BULK_REJECT({datetime.utcnow().isoformat()}, actor={ctx.actor}, reasonCode={reason_code or '-'}, tagAsError={body.tagAsError}): {reason_short}"
             existing = sub.audit_trail or sub.audit_log or ""
-            sub.audit_trail = (existing + " | " + line).strip(" |") if existing else line
+            combined = (existing + " | " + line).strip(" |") if existing else line
+            sub.audit_trail = _truncate_submission_audit(combined)
             sub.audit_log = sub.audit_trail
             processed.append(rid)
         except Exception:
@@ -4401,7 +4406,8 @@ async def admin_receipt_tag(
         raise HTTPException(status_code=400, detail="tag required")
     line = f"TAG({tag_val} by {ctx.actor} at {datetime.utcnow().isoformat()})"
     existing = sub.audit_trail or sub.audit_log or ""
-    sub.audit_trail = (existing + " | " + line).strip(" |") if existing else line
+    combined = (existing + " | " + line).strip(" |") if existing else line
+    sub.audit_trail = _truncate_submission_audit(combined)
     sub.audit_log = sub.audit_trail
     sub.updated_at = datetime.utcnow()
     if hasattr(sub, "asset_tag"):
@@ -4520,7 +4526,8 @@ async def admin_submission_correction(
     }
     trail_line = f"CORRECTION({at_iso} by {actor_id} reason={reason_code}): {before} -> {after}"
     existing_trail = sub.audit_trail or sub.audit_log or ""
-    sub.audit_trail = (existing_trail + " | " + trail_line).strip(" |") if existing_trail else trail_line
+    combined = (existing_trail + " | " + trail_line).strip(" |") if existing_trail else trail_line
+    sub.audit_trail = _truncate_submission_audit(combined)
     sub.audit_log = sub.audit_trail
 
     # GEMS 표준 Sidecar JSON (§6): receipt_id, ai_result, human_correction, asset_tag
@@ -4626,12 +4633,14 @@ async def admin_override_submission(
     prev_status = submission.status or ""
     submission.status = body.status.strip()
     submission.updated_at = datetime.utcnow()
-    submission.fail_reason = None if submission.status == "FIT" else (body.reason.strip() or submission.fail_reason)
+    submission.fail_reason = None if submission.status == "FIT" else _truncate_submission_reason(body.reason.strip() or submission.fail_reason)
     submission.global_fail_reason = submission.fail_reason
     # 감사/추적을 위해 audit_trail에 override 기록을 append
-    override_line = f"OVERRIDE({datetime.utcnow().isoformat()}): {body.reason.strip()}"
+    reason_display = _truncate_submission_reason((body.reason or "").strip()) if (body.reason or "").strip() else "-"
+    override_line = f"OVERRIDE({datetime.utcnow().isoformat()}): {reason_display}"
     existing = submission.audit_trail or submission.audit_log or ""
-    submission.audit_trail = (existing + " | " + override_line).strip(" |") if existing else override_line
+    combined = (existing + " | " + override_line).strip(" |") if existing else override_line
+    submission.audit_trail = _truncate_submission_audit(combined)
     submission.audit_log = submission.audit_trail
     if body.override_reward_amount is not None:
         # rewardAmount는 응답 계산 로직이 있으므로, 필요 시 별도 컬럼 도입이 더 안전함.
@@ -5668,14 +5677,35 @@ def _register_new_candidate_store(
 ) -> None:
     """
     마스터 미등록 상점을 임시 등록(TEMP_VALID).
-    biz_num+address+tel 조합 우선으로 중복 등록 방지.
-    predicted_category/confidence/classifier_type 은 업종 자동 분류 결과(선택).
+    동일 상점(금액·품목 다른 제출건 포함)은 unregistered_stores로만 처리하고, 중복으로 인해 제출건을 ERROR로 두지 않음.
+    - 동일 요청 내 같은 (biz_num, address, tel): 세션 pending 기준 1건만 두고 occurrence만 증가.
+    - DB 기존 행 있으면 occurrence 증가 후 return.
+    - 신규 시: INSERT ON CONFLICT DO UPDATE(업서트) 사용해 UniqueViolation 방지.
     """
     biz_num = _normalize_biz_num((parsed.get("businessNum") or "").strip()) if parsed.get("businessNum") else None
     address = _normalize_address((parsed.get("address") or "").strip()) if parsed.get("address") else None
     tel = _extract_store_tel(ocr_raw or {}) if ocr_raw else None
     store_name_raw = (parsed.get("storeName") or "").strip() or None
     store_name = re.sub(r"\s+", " ", store_name_raw).strip() if store_name_raw else None
+
+    def _key(o: UnregisteredStore) -> tuple:
+        return (getattr(o, "biz_num") or "", getattr(o, "address") or "", getattr(o, "tel") or "")
+
+    want_key = (biz_num or "", address or "", tel or "")
+
+    # 동일 세션에서 아직 flush 안 된 동일 키 후보가 있으면 occurrence만 올리고 return (UniqueViolation 방지)
+    for obj in db.new:
+        if isinstance(obj, UnregisteredStore) and _key(obj) == want_key:
+            obj.occurrence_count = (obj.occurrence_count or 0) + 1
+            obj.recent_receipt_id = submission_id
+            obj.updated_at = datetime.utcnow()
+            if predicted_category is not None:
+                obj.predicted_category = predicted_category
+            if category_confidence is not None:
+                obj.category_confidence = category_confidence
+            if classifier_type is not None:
+                obj.classifier_type = classifier_type
+            return
 
     q = db.query(UnregisteredStore).filter(UnregisteredStore.status == "TEMP_VALID")
     if biz_num:
@@ -5698,23 +5728,86 @@ def _register_new_candidate_store(
             exists.classifier_type = classifier_type
         return
 
-    db.add(
-        UnregisteredStore(
-            store_name=store_name,
-            biz_num=biz_num,
-            address=address,
-            tel=tel,
-            status="TEMP_VALID",
-            source_submission_id=submission_id,
-            occurrence_count=1,
-            first_detected_at=now,
-            recent_receipt_id=submission_id,
-            predicted_category=predicted_category,
-            category_confidence=category_confidence,
-            classifier_type=classifier_type,
-            updated_at=now,
+    # 동일 상점(금액·품목 다를 수 있음) 중복 INSERT 시 UniqueViolation 방지: 업서트로 처리해 제출건을 ERROR로 두지 않음
+    store_name_safe = (store_name or "")[:255] if store_name else None
+    try:
+        db.execute(
+            sql_text("""
+            INSERT INTO unregistered_stores (
+                id, store_name, biz_num, address, tel, status, source_submission_id,
+                occurrence_count, first_detected_at, recent_receipt_id,
+                predicted_category, category_confidence, classifier_type, created_at, updated_at
+            ) VALUES (
+                :id, :store_name, :biz_num, :address, :tel, 'TEMP_VALID', :source_submission_id,
+                1, :now, :source_submission_id,
+                :predicted_category, :category_confidence, :classifier_type, :now, :now
+            )
+            ON CONFLICT ( (COALESCE(biz_num, '')), (COALESCE(address, '')), (COALESCE(tel, '')) )
+            DO UPDATE SET
+                occurrence_count = unregistered_stores.occurrence_count + 1,
+                recent_receipt_id = EXCLUDED.recent_receipt_id,
+                updated_at = EXCLUDED.updated_at,
+                predicted_category = COALESCE(EXCLUDED.predicted_category, unregistered_stores.predicted_category),
+                category_confidence = COALESCE(EXCLUDED.category_confidence, unregistered_stores.category_confidence),
+                classifier_type = COALESCE(EXCLUDED.classifier_type, unregistered_stores.classifier_type)
+            """),
+            {
+                "id": str(uuid.uuid4()),
+                "store_name": store_name_safe,
+                "biz_num": biz_num,
+                "address": address,
+                "tel": tel,
+                "source_submission_id": submission_id,
+                "now": now,
+                "predicted_category": predicted_category,
+                "category_confidence": category_confidence,
+                "classifier_type": classifier_type,
+            },
         )
-    )
+    except Exception:
+        # ON CONFLICT 표현식이 인덱스와 안 맞는 등 예외 시: UPDATE로만 처리 후 없으면 INSERT (중복 시 ERROR 방지)
+        upd = db.execute(
+            sql_text("""
+            UPDATE unregistered_stores
+            SET occurrence_count = occurrence_count + 1, recent_receipt_id = :sid, updated_at = :now,
+                predicted_category = COALESCE(:predicted_category, predicted_category),
+                category_confidence = COALESCE(:category_confidence, category_confidence),
+                classifier_type = COALESCE(:classifier_type, classifier_type)
+            WHERE status = 'TEMP_VALID'
+              AND (COALESCE(biz_num, '') = COALESCE(:biz_num, ''))
+              AND (COALESCE(address, '') = COALESCE(:address, ''))
+              AND (COALESCE(tel, '') = COALESCE(:tel, ''))
+            """),
+            {
+                "sid": submission_id,
+                "now": now,
+                "predicted_category": predicted_category,
+                "category_confidence": category_confidence,
+                "classifier_type": classifier_type,
+                "biz_num": biz_num,
+                "address": address,
+                "tel": tel,
+            },
+        )
+        if upd.rowcount and upd.rowcount > 0:
+            return
+        db.add(
+            UnregisteredStore(
+                store_name=store_name_safe,
+                biz_num=biz_num,
+                address=address,
+                tel=tel,
+                status="TEMP_VALID",
+                source_submission_id=submission_id,
+                occurrence_count=1,
+                first_detected_at=now,
+                recent_receipt_id=submission_id,
+                predicted_category=predicted_category,
+                category_confidence=category_confidence,
+                classifier_type=classifier_type,
+                updated_at=now,
+            )
+        )
 
 
 def _fail_message(code: Optional[str]) -> Optional[str]:
@@ -5746,6 +5839,20 @@ def _fail_message(code: Optional[str]) -> Optional[str]:
     return msg.get(code, code)
 
 
+def _truncate_submission_reason(s: Optional[str], max_len: int = SUBMISSION_FAIL_REASON_MAX_LEN) -> Optional[str]:
+    """fail_reason, global_fail_reason 저장 시 DB varchar 제한 준수."""
+    if not s or len(s) <= max_len:
+        return s
+    return (s[: max_len - 3] + "...") if max_len > 3 else s[:max_len]
+
+
+def _truncate_submission_audit(s: Optional[str], max_len: int = SUBMISSION_AUDIT_MAX_LEN) -> Optional[str]:
+    """audit_log, audit_trail 저장 시 과도한 길이·DB 오류 방지."""
+    if not s or len(s) <= max_len:
+        return s
+    return (s[: max_len - 3] + "...") if max_len > 3 else s[:max_len]
+
+
 def _normalize_error_code(code: Optional[str]) -> Optional[str]:
     """에러 문자열에서 표준 코드 토큰 추출."""
     if not code:
@@ -5771,17 +5878,25 @@ def _resolve_item_status_error(code: Optional[str]) -> Tuple[str, Optional[str],
 
 
 def _global_fail_reason(code: Optional[str]) -> Optional[str]:
-    """submission(마스터) 단위 fail reason 표준화."""
+    """submission(마스터) 단위 fail reason 표준화. FE/로그용 짧은 문구 반환."""
     if not code:
         return None
     mapping = {
-        "BIZ_003": "UNFIT_TOTAL_AMOUNT (BIZ_003, 합산 금액 미달)",
-        "BIZ_011": "UNFIT_STAY_MISMATCH (BIZ_011, 숙박-증빙 불일치)",
-        "BIZ_004": "UNFIT_REGION (BIZ_004, 지역 불일치)",
+        "BIZ_001": "UNFIT_DUPLICATE (BIZ_001, 중복 제출)",
         "BIZ_002": "UNFIT_DATE (BIZ_002, 결제일/기간 오류)",
+        "BIZ_003": "UNFIT_TOTAL_AMOUNT (BIZ_003, 합산 금액 미달)",
+        "BIZ_004": "UNFIT_REGION (BIZ_004, 지역 불일치)",
+        "BIZ_008": "UNFIT_CATEGORY (BIZ_008, 부적격 업종)",
+        "BIZ_010": "BIZ_010 (문서 구성 요건 불충족)",
+        "BIZ_011": "UNFIT_STAY_MISMATCH (BIZ_011, 숙박-증빙 불일치)",
+        "OCR_001": "ERROR_OCR (OCR_001, 영수증 판독 불가)",
+        "OCR_003": "OCR_003 (마스터 상호 미등록)",
+        "OCR_004": "PENDING_VERIFICATION (OCR_004, 인식 불량·수동 검수)",
         "PENDING_NEW": "PENDING_NEW (신규 상점 확인 필요)",
-        "PENDING_VERIFICATION": "PENDING_VERIFICATION (입력값- OCR 불일치)",
+        "PENDING_VERIFICATION": "PENDING_VERIFICATION (입력값-OCR 불일치)",
         "UNFIT_CATEGORY": "UNFIT_CATEGORY (제외 업종)",
+        "UNFIT_REGION": "UNFIT_REGION (지역 불일치)",
+        "UNFIT_DATE": "UNFIT_DATE (기간/날짜 불일치)",
         "UNFIT_DUPLICATE": "UNFIT_DUPLICATE (중복 제출)",
         "ERROR_OCR": "ERROR_OCR (판독 불가)",
     }
@@ -5888,17 +6003,17 @@ def finalize_submission(submission: Submission, total_amount: int, min_criteria:
         submission.fail_reason = None
     elif resolved in ("PENDING_NEW", "PENDING_VERIFICATION"):
         submission.status = resolved
-        reason = _global_fail_reason(resolved)
+        reason = _truncate_submission_reason(_global_fail_reason(resolved))
         submission.global_fail_reason = reason
         submission.fail_reason = reason
     elif resolved in ("UNFIT_CATEGORY", "UNFIT_REGION", "UNFIT_DATE", "UNFIT_DUPLICATE", "ERROR_OCR"):
         submission.status = resolved
-        reason = _global_fail_reason(resolved)
+        reason = _truncate_submission_reason(_global_fail_reason(resolved))
         submission.global_fail_reason = reason
         submission.fail_reason = reason
     else:
         submission.status = _status_for_code(resolved or "BIZ_003")
-        reason = _global_fail_reason(resolved or "BIZ_003")
+        reason = _truncate_submission_reason(_global_fail_reason(resolved or "BIZ_003"))
         submission.global_fail_reason = reason
         submission.fail_reason = reason
 
@@ -6032,9 +6147,9 @@ async def analyze_receipt_task(req: CompleteRequest):
             submission.status = "UNFIT"
             submission.updated_at = datetime.utcnow()
             submission.total_amount = 0
-            submission.fail_reason = _global_fail_reason("BIZ_010")
+            submission.fail_reason = _truncate_submission_reason(_global_fail_reason("BIZ_010"))
             submission.global_fail_reason = submission.fail_reason
-            submission.audit_log = "문서 구성 요건 불충족"
+            submission.audit_log = _truncate_submission_audit("문서 구성 요건 불충족")
             submission.audit_trail = submission.audit_log
             db.commit()
             return
@@ -6446,7 +6561,8 @@ async def analyze_receipt_task(req: CompleteRequest):
         )
 
         finalize_submission(submission, total_amount, min_criteria, fail_code)
-        submission.audit_log = " | ".join(audit_lines) if audit_lines else (submission.fail_reason or "")
+        raw_audit = " | ".join(audit_lines) if audit_lines else (submission.fail_reason or "")
+        submission.audit_log = _truncate_submission_audit(raw_audit)
         submission.audit_trail = submission.audit_log
         db.commit()
         payload = _build_status_payload(submission, item_rows)
@@ -6461,9 +6577,7 @@ async def analyze_receipt_task(req: CompleteRequest):
         submission.status = "ERROR"
         submission.updated_at = datetime.utcnow()
         submission.total_amount = 0
-        err_msg = (str(e) or type(e).__name__).strip()
-        if len(err_msg) > 255:
-            err_msg = err_msg[:252] + "..."
+        err_msg = _truncate_submission_reason((str(e) or type(e).__name__).strip())
         submission.fail_reason = err_msg
         submission.global_fail_reason = submission.fail_reason
         submission.audit_log = "complete 처리 중 예외 발생"

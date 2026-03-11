@@ -5601,6 +5601,8 @@ def _check_duplicate_receipt_item(
 # 유흥업소 등 부적격 업태 키워드 (BIZ_008)
 FORBIDDEN_BUSINESS_KEYWORDS = ("단란주점", "유흥주점", "유흥주점영업", "무도장", "사교춤장")
 OCR_CONFIDENCE_THRESHOLD = int(os.getenv("OCR_CONFIDENCE_THRESHOLD", "90"))  # >= 이 값이면 OCR 우선 신뢰(사용자 입력 대체 안 함)
+# OCR 금액이 이 값(원) 미만이면 오인식(예: 68000→8) 가능성으로 수동 검증 유도 또는 사용자 입력 금액 사용
+SUSPICIOUS_AMOUNT_THRESHOLD = int(os.getenv("SUSPICIOUS_AMOUNT_THRESHOLD", "10000"))
 # 저신뢰도 또는 핵심 필드(상점명·사업자번호·주소) 누락 시 수동 검수(보정) 유도
 OCR_LOW_CONFIDENCE_REVIEW_THRESHOLD = int(os.getenv("OCR_LOW_CONFIDENCE_REVIEW_THRESHOLD", "70"))
 OCR_KEY_FIELDS_MIN_FILLED = int(os.getenv("OCR_KEY_FIELDS_MIN_FILLED", "2"))  # 3개 중 최소 채워져야 하는 개수
@@ -6432,6 +6434,9 @@ async def analyze_receipt_task(req: CompleteRequest):
                                         item_fail = "PENDING_NEW"
                             else:
                                 item_fail = fc
+                            # 금액 오인식(68,000→8 등) 시 기준 미달 반려 대신 수동 검증으로 보내 담당자가 교정 가능하게
+                            if item_fail == "BIZ_003" and amount is not None and amount < SUSPICIOUS_AMOUNT_THRESHOLD:
+                                item_fail = "PENDING_VERIFICATION"
                     if not item_fail and _check_duplicate_receipt_item(
                         db, req.receiptId, biz_num, pay_date_stored, amount, card_num
                     ):
@@ -6501,6 +6506,14 @@ async def analyze_receipt_task(req: CompleteRequest):
                     a = ocr_assets[i]
                     p = a["parsed"]
                     amount = _normalize_amount(p.get("amount"))
+                    # TOUR: OCR 금액이 비정상적으로 작을 때(오인식 가능) 사용자 입력 금액 사용
+                    user_amt, _, _ = _get_user_input_for_document(req.data, i)
+                    if amount is not None and amount < SUSPICIOUS_AMOUNT_THRESHOLD and user_amt is not None:
+                        amount = user_amt
+                        p["amount"] = user_amt
+                        na = _normalize_amount(user_amt)
+                        if na is not None:
+                            item_rows[i].amount = na
                     pay_date = p.get("payDate") or ""
                     store_name = _normalize_store_name(p.get("storeName"))
                     address = _normalize_address((p.get("address") or "").strip()) or ""
@@ -6588,6 +6601,9 @@ async def analyze_receipt_task(req: CompleteRequest):
                         conf = p.get("confidenceScore") if isinstance(p.get("confidenceScore"), int) else None
                         if _should_require_manual_review_for_low_quality(store_name, biz_num, address, conf):
                             item_fail = "OCR_004"
+                    # 금액 오인식(68,000→8 등)으로 기준 미달일 때: 반려 대신 수동 검증 유도
+                    if not item_fail and amount is not None and amount < min_amount_tour and amount < SUSPICIOUS_AMOUNT_THRESHOLD:
+                        item_fail = "PENDING_VERIFICATION"
 
                     if item_fail:
                         mark_item(i, item_fail)

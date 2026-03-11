@@ -13,6 +13,7 @@ import boto3
 from PIL import Image, ImageOps, ImageEnhance
 from botocore.exceptions import ClientError, BotoCoreError
 from datetime import datetime, date, timedelta, timezone
+from zoneinfo import ZoneInfo
 from typing import Any, Dict, List, Optional, Union, Tuple, Literal
 from dotenv import load_dotenv
 from dateutil import parser as dateutil_parser
@@ -3813,13 +3814,14 @@ class AdminSubmissionListItem(BaseModel):
 class AdminSubmissionListResponse(BaseModel):
     total: int
     items: List[AdminSubmissionListItem] = Field(default_factory=list)
+    approvedAmountSum: Optional[int] = Field(None, description="aggregate=sum 요청 시 동일 조건·status=FIT인 건의 total_amount 합계")
 
 
 @app.get(
     "/api/v1/admin/submissions",
     response_model=AdminSubmissionListResponse,
     summary="신청 목록 검색(관리자)",
-    description="대시보드·검수용. from/to, campaignId, status(또는 statusStage), dateField(created_at|updated_at), limit(최대 10000), offset, regionCode 지원.",
+    description="대시보드·검수용. from/to, campaignId, status(또는 statusStage), dateField(created_at|updated_at), limit(최대 10000), offset, regionCode 지원. aggregate=sum 시 응답에 approvedAmountSum(승인 건 금액 합계) 포함.",
     tags=["Admin - Submissions"],
 )
 async def admin_list_submissions(
@@ -3846,6 +3848,7 @@ async def admin_list_submissions(
         status_val = (status_val or "").strip()
     date_field_name = (qp.get("dateField") if qp else None) or "created_at"
     date_field = Submission.updated_at if (date_field_name or "").strip().lower() == "updated_at" else Submission.created_at
+    aggregate_sum = (qp.get("aggregate") if qp else "").strip().lower() == "sum"
 
     cid: Optional[int] = None
     if campaignId not in (None, ""):
@@ -3869,7 +3872,11 @@ async def admin_list_submissions(
         s = status_val
         if s.upper() == "APPROVED":
             s = "FIT"
-        q = q.filter(Submission.status == s)
+        # 검수 대기: FE의 statusStage=MANUAL_REVIEW에 대응해 DB의 검수대기 상태 전체 포함 (백엔드_요청사항_정리 §2.3)
+        if s == "MANUAL_REVIEW":
+            q = q.filter(Submission.status.in_(["MANUAL_REVIEW", "PENDING_VERIFICATION", "PENDING_NEW", "VERIFYING"]))
+        else:
+            q = q.filter(Submission.status == s)
     if cid is not None:
         q = q.filter(Submission.campaign_id == cid)
     start_raw = from_val
@@ -3921,6 +3928,63 @@ async def admin_list_submissions(
         .all()
     )
 
+    approved_amount_sum: Optional[int] = None
+    if aggregate_sum:
+        sq = db.query(Submission)
+        if not ctx.is_super and ctx.campaign_ids:
+            sq = sq.filter(Submission.campaign_id.in_(ctx.campaign_ids))
+        elif not ctx.is_super:
+            sq = sq.filter(Submission.campaign_id == -1)
+        if receiptId:
+            sq = sq.filter(Submission.submission_id == receiptId.strip())
+        if userUuid:
+            sq = sq.filter(Submission.user_uuid == userUuid.strip())
+        sq = sq.filter(Submission.status == "FIT")
+        if cid is not None:
+            sq = sq.filter(Submission.campaign_id == cid)
+        if start_raw:
+            try:
+                sq = sq.filter(date_field >= dateutil_parser.parse(start_raw))
+            except Exception:
+                pass
+        if end_raw:
+            try:
+                sq = sq.filter(date_field <= dateutil_parser.parse(end_raw))
+            except Exception:
+                pass
+        if regionCode and (regionCode := (regionCode or "").strip()):
+            try:
+                rdata = _load_regions_data()
+                sigungu_name_for_filter = None
+                for _sc, items in (rdata.get("sigungu") or {}).items():
+                    for it in items or []:
+                        if str(it.get("code") or "").strip() == regionCode:
+                            sigungu_name_for_filter = str(it.get("name") or "").strip()
+                            break
+                    if sigungu_name_for_filter:
+                        break
+                if sigungu_name_for_filter:
+                    subq = (
+                        db.query(ReceiptItem.submission_id)
+                        .filter(ReceiptItem.seq_no == 1)
+                        .filter(
+                            or_(
+                                ReceiptItem.location == sigungu_name_for_filter,
+                                ReceiptItem.address.like((sigungu_name_for_filter or "") + "%"),
+                            )
+                        )
+                        .distinct()
+                    )
+                    sq = sq.filter(Submission.submission_id.in_(subq))
+            except Exception:
+                pass
+        try:
+            approved_amount_sum = int(
+                (sq.with_entities(func.coalesce(func.sum(Submission.total_amount), 0)).scalar()) or 0
+            )
+        except Exception:
+            approved_amount_sum = 0
+
     def _normalize_project_type_for_response(raw: Optional[str]) -> str:
         """STAY/TOUR만 반환. null·빈값·소문자 시 TOUR로 통일해 FE 업종/필터가 동작하도록."""
         v = (raw or "").strip().upper()
@@ -3970,7 +4034,7 @@ async def admin_list_submissions(
                 integrityCheck=integrity_ok,
             )
         )
-    return AdminSubmissionListResponse(total=total, items=items)
+    return AdminSubmissionListResponse(total=total, items=items, approvedAmountSum=approved_amount_sum)
 
 
 class AdminBulkRejectRequest(BaseModel):
@@ -4070,43 +4134,68 @@ class AdminDashboardStatsResponse(BaseModel):
     "/api/v1/admin/dashboard/stats",
     response_model=AdminDashboardStatsResponse,
     summary="대시보드 집계 수치",
-    description="campaignId, from, to 기준 금일/전일 건수, MANUAL_REVIEW 건수, 승인 금액 합계, 유형별·일자별 건수.",
+    description="campaignId, from, to, timezone(선택) 기준. 금일/전일 건수, 검수 대기 건수(MANUAL_REVIEW·PENDING_VERIFICATION·VERIFYING 등), 승인 금액 합계, byCategory(STAY/TOUR), 일자별 건수.",
     tags=["Admin - Submissions"],
 )
 async def admin_dashboard_stats(
+    request: Request,
     campaignId: Optional[int] = Query(None),
     from_: Optional[str] = Query(None, alias="from", description="YYYY-MM-DD"),
     to: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    timezone_param: Optional[str] = Query(None, alias="timezone", description="금일/전일 집계용 타임존. 미지정 시 Asia/Seoul 적용"),
     db: Session = Depends(get_db),
     ctx: AdminContext = Depends(get_admin_context),
 ):
-    q = db.query(Submission)
+    # 캠페인만 적용한 쿼리(금일/전일 집계용). from/to 는 일자별 추이·기타 집계에만 사용
+    q_campaign = db.query(Submission)
     if not ctx.is_super and ctx.campaign_ids:
-        q = q.filter(Submission.campaign_id.in_(ctx.campaign_ids))
+        q_campaign = q_campaign.filter(Submission.campaign_id.in_(ctx.campaign_ids))
     elif not ctx.is_super:
-        q = q.filter(Submission.campaign_id == -1)
+        q_campaign = q_campaign.filter(Submission.campaign_id == -1)
     if campaignId is not None:
-        q = q.filter(Submission.campaign_id == campaignId)
+        q_campaign = q_campaign.filter(Submission.campaign_id == campaignId)
+
+    q = q_campaign
     if from_:
         try:
-            q = q.filter(Submission.created_at >= dateutil_parser.parse(from_))
+            from_dt = dateutil_parser.parse(from_)
+            q = q.filter(Submission.created_at >= from_dt)
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid from")
     if to:
         try:
-            q = q.filter(Submission.created_at <= dateutil_parser.parse(to))
+            to_dt = dateutil_parser.parse(to)
+            # 종료일 당일 전체 포함: "2026-03-12" → 2026-03-13 00:00:00 미만
+            if getattr(to_dt, "hour", 0) == 0 and getattr(to_dt, "minute", 0) == 0:
+                to_end = to_dt + timedelta(days=1)
+                q = q.filter(Submission.created_at < to_end)
+            else:
+                q = q.filter(Submission.created_at <= to_dt)
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid to")
 
     base_q = q
-    today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
-    yesterday_start = today_start - timedelta(days=1)
-    today_count = base_q.filter(Submission.created_at >= today_start).count()
-    yesterday_count = base_q.filter(
+    tz_str = (request.query_params.get("timezone") if request else None) or (timezone_param or "") or "Asia/Seoul"
+    try:
+        z = ZoneInfo(tz_str)
+        now_local = datetime.now(z)
+        today_start_local = now_local.replace(hour=0, minute=0, second=0, microsecond=0)
+        yesterday_start_local = today_start_local - timedelta(days=1)
+        today_start = today_start_local.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+        yesterday_start = yesterday_start_local.astimezone(ZoneInfo("UTC")).replace(tzinfo=None)
+    except Exception:
+        today_start = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+        yesterday_start = today_start - timedelta(days=1)
+    # 금일/전일은 from·to 없이 캠페인만 적용해 집계 (FE가 from/to=최근7일 보낼 때도 금일 신규접수가 0이 되지 않도록)
+    today_count = q_campaign.filter(Submission.created_at >= today_start).count()
+    yesterday_count = q_campaign.filter(
         Submission.created_at >= yesterday_start,
         Submission.created_at < today_start,
     ).count()
-    pending_count = base_q.filter(Submission.status == "MANUAL_REVIEW").count()
+    # 검수 대기: FE 대시보드 "대기중"에 대응 (백엔드_요청사항_정리 §2.2, §2.3)
+    pending_count = base_q.filter(
+        Submission.status.in_(["MANUAL_REVIEW", "PENDING_VERIFICATION", "PENDING_NEW", "VERIFYING"])
+    ).count()
     try:
         approved_sum = (
             base_q.filter(Submission.status == "FIT")
@@ -4115,17 +4204,19 @@ async def admin_dashboard_stats(
         ) or 0
     except Exception:
         approved_sum = 0
-    by_category: Dict[str, int] = {}
+    by_category: Dict[str, int] = {"STAY": 0, "TOUR": 0}
     for row in (
         base_q.with_entities(Submission.project_type, func.count(Submission.submission_id))
         .group_by(Submission.project_type)
         .all()
     ):
-        key = (row[0] or "UNKNOWN").strip() or "UNKNOWN"
-        by_category[key] = row[1]
+        raw_key = (row[0] or "").strip().upper()
+        key = "STAY" if raw_key == "STAY" else "TOUR"
+        by_category[key] = by_category.get(key, 0) + row[1]
     daily: List[Dict[str, Any]] = []
     try:
         date_expr = func.date(Submission.created_at)
+        day_counts: Dict[str, int] = {}
         for row in (
             base_q.with_entities(date_expr.label("d"), func.count(Submission.submission_id))
             .group_by(date_expr)
@@ -4133,7 +4224,26 @@ async def admin_dashboard_stats(
             .all()
         ):
             d = row[0]
-            daily.append({"date": d.isoformat() if hasattr(d, "isoformat") else str(d), "count": row[1]})
+            key = d.isoformat() if hasattr(d, "isoformat") else str(d)
+            if key:
+                day_counts[key[:10]] = row[1]
+        # 요청 구간(from~to)의 모든 일자를 포함해 0건인 날도 반환 (차트가 빈 날 표시 가능)
+        if from_ and to:
+            try:
+                start = dateutil_parser.parse(from_).date()
+                end = dateutil_parser.parse(to).date()
+                if start <= end:
+                    cur = start
+                    while cur <= end:
+                        key = cur.isoformat()
+                        daily.append({"date": key, "count": day_counts.get(key, 0)})
+                        cur = cur + timedelta(days=1)
+            except Exception:
+                for k, v in sorted(day_counts.items()):
+                    daily.append({"date": k, "count": v})
+        else:
+            for k, v in sorted(day_counts.items()):
+                daily.append({"date": k, "count": v})
     except Exception:
         pass
     return AdminDashboardStatsResponse(

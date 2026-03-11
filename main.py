@@ -3848,7 +3848,7 @@ async def admin_list_submissions(
         status_val = (status_val or "").strip()
     date_field_name = (qp.get("dateField") if qp else None) or "created_at"
     date_field = Submission.updated_at if (date_field_name or "").strip().lower() == "updated_at" else Submission.created_at
-    aggregate_sum = (qp.get("aggregate") if qp else "").strip().lower() == "sum"
+    aggregate_sum = ((qp.get("aggregate") or "") if qp else "").strip().lower() == "sum"
 
     cid: Optional[int] = None
     if campaignId not in (None, ""):

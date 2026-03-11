@@ -3819,7 +3819,7 @@ class AdminSubmissionListResponse(BaseModel):
     "/api/v1/admin/submissions",
     response_model=AdminSubmissionListResponse,
     summary="신청 목록 검색(관리자)",
-    description="대시보드·검수용. from/to(또는 dateFrom/dateTo), campaignId, status, limit(최대 10000), offset 지원.",
+    description="대시보드·검수용. from/to, campaignId, status(또는 statusStage), dateField(created_at|updated_at), limit(최대 10000), offset, regionCode 지원.",
     tags=["Admin - Submissions"],
 )
 async def admin_list_submissions(
@@ -3840,6 +3840,13 @@ async def admin_list_submissions(
     qp = getattr(request, "query_params", None)
     from_val = (qp.get("from") if qp else None) or dateFrom
     to_val = (qp.get("to") if qp else None) or dateTo
+    # statusStage: FE 대시보드·검수 필터용 별칭 (백엔드_요청사항_정리 §2.3)
+    status_val = (status or "").strip() or (qp.get("statusStage") if qp else None) or ""
+    if status_val:
+        status_val = (status_val or "").strip()
+    date_field_name = (qp.get("dateField") if qp else None) or "created_at"
+    date_field = Submission.updated_at if (date_field_name or "").strip().lower() == "updated_at" else Submission.created_at
+
     cid: Optional[int] = None
     if campaignId not in (None, ""):
         try:
@@ -3858,8 +3865,8 @@ async def admin_list_submissions(
         q = q.filter(Submission.submission_id == receiptId.strip())
     if userUuid:
         q = q.filter(Submission.user_uuid == userUuid.strip())
-    if status:
-        s = status.strip()
+    if status_val:
+        s = status_val
         if s.upper() == "APPROVED":
             s = "FIT"
         q = q.filter(Submission.status == s)
@@ -3870,13 +3877,13 @@ async def admin_list_submissions(
     if start_raw:
         try:
             dt = dateutil_parser.parse(start_raw)
-            q = q.filter(Submission.created_at >= dt)
+            q = q.filter(date_field >= dt)
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid from/dateFrom")
     if end_raw:
         try:
             dt = dateutil_parser.parse(end_raw)
-            q = q.filter(Submission.created_at <= dt)
+            q = q.filter(date_field <= dt)
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid to/dateTo")
     if regionCode and (regionCode := regionCode.strip()):
@@ -3908,7 +3915,7 @@ async def admin_list_submissions(
 
     total = q.count()
     rows = (
-        q.order_by(Submission.created_at.desc())
+        q.order_by(date_field.desc())
         .offset(offset_val)
         .limit(limit_val)
         .all()
@@ -4136,6 +4143,70 @@ async def admin_dashboard_stats(
         approvedAmountSum=int(approved_sum),
         byCategory=by_category,
         dailyCounts=daily,
+    )
+
+
+class AdminAssetizationKpiResponse(BaseModel):
+    """데이터 자산화 대시보드 KPI (백엔드_요청사항_정리 §11). 미집계 시 null/0 placeholder."""
+    ocrAccuracyRaw: Optional[float] = Field(None, description="OCR 인식 정확도(Raw): 수정 없이 AI 판독값 그대로 승인된 비율")
+    correctionRateByField: Optional[Dict[str, float]] = Field(None, description="필드별 교정률 (금액/일시/주소)")
+    confidenceVsCorrectionMatch: Optional[float] = Field(None, description="신뢰도-정답 일치도")
+    goldenDatasetCount: Optional[int] = Field(None, description="골든 데이터셋 누적 건수")
+    reTrainingRequiredRatio: Optional[float] = Field(None, description="재학습 필요 비중 (asset_tag=RE_TRAINING_REQUIRED)")
+    autoJudgmentAcceptRate: Optional[float] = Field(None, description="자동 판정 처리율")
+    reviewLeadTimeHours: Optional[float] = Field(None, description="검수 리드타임(제출~승인 평균 시간, 시간)")
+    anomalyPrecision: Optional[float] = Field(None, description="부정수급 탐지 적중률")
+    correctionTrendByWeek: Optional[List[Dict[str, Any]]] = Field(None, description="주별 교정률 추이")
+    errorTypeBreakdown: Optional[Dict[str, int]] = Field(None, description="반려/교정 사유별 건수")
+
+
+@app.get(
+    "/api/v1/admin/dashboard/assetization",
+    response_model=AdminAssetizationKpiResponse,
+    summary="데이터 자산화 대시보드 KPI",
+    description="백엔드_요청사항_정리 §11. OCR 정확도·교정률·골든 데이터셋·재학습 비중 등. 미집계 시 placeholder 반환.",
+    tags=["Admin - Submissions"],
+)
+async def admin_dashboard_assetization(
+    campaignId: Optional[int] = Query(None),
+    from_: Optional[str] = Query(None, alias="from", description="YYYY-MM-DD"),
+    to: Optional[str] = Query(None, description="YYYY-MM-DD"),
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    """데이터 자산화 KPI. 향후 Sidecar·교정 이력 집계 시 실제 값 채움. 현재는 구조만 반환."""
+    q = db.query(Submission)
+    if not ctx.is_super and ctx.campaign_ids:
+        q = q.filter(Submission.campaign_id.in_(ctx.campaign_ids))
+    elif not ctx.is_super:
+        q = q.filter(Submission.campaign_id == -1)
+    if campaignId is not None:
+        q = q.filter(Submission.campaign_id == campaignId)
+    if from_:
+        try:
+            q = q.filter(Submission.created_at >= dateutil_parser.parse(from_))
+        except Exception:
+            pass
+    if to:
+        try:
+            q = q.filter(Submission.created_at <= dateutil_parser.parse(to))
+        except Exception:
+            pass
+    # placeholder: 승인 건 중 human_correction(sidecar) 없는 비율 등 추후 구현
+    fit_count = q.filter(Submission.status == "FIT").count()
+    total_reviewed = q.filter(Submission.status.in_(["FIT", "UNFIT", "UNFIT_REGION", "UNFIT_DATE", "UNFIT_CATEGORY", "UNFIT_DUPLICATE", "ERROR"])).count()
+    ocr_accuracy = (fit_count / total_reviewed * 100.0) if total_reviewed else None
+    return AdminAssetizationKpiResponse(
+        ocrAccuracyRaw=round(ocr_accuracy, 2) if ocr_accuracy is not None else None,
+        correctionRateByField=None,
+        confidenceVsCorrectionMatch=None,
+        goldenDatasetCount=None,
+        reTrainingRequiredRatio=None,
+        autoJudgmentAcceptRate=None,
+        reviewLeadTimeHours=None,
+        anomalyPrecision=None,
+        correctionTrendByWeek=None,
+        errorTypeBreakdown=None,
     )
 
 

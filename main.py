@@ -5104,6 +5104,101 @@ async def admin_override_submission(
     )
 
 
+class AdminReprocessResponse(BaseModel):
+    receiptId: str
+    previous_status: str
+    new_status: str
+    total_amount: int = 0
+    updated_at: str
+    callback_sent: bool = False
+
+
+@app.post(
+    "/api/v1/admin/submissions/{receiptId}/reprocess",
+    response_model=AdminReprocessResponse,
+    summary="재처리(판정 로직만 재적용)",
+    description="OCR API 호출 없이, 저장된 OCR 결과로 현재 판정 규칙·로직만 다시 적용. 정책/로직 변경 시 관리자 페이지에서 재처리 버튼으로 자동 반영.",
+    tags=["Admin - Submissions"],
+)
+async def admin_reprocess_submission(
+    receiptId: str,
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    """기존 영수증 데이터로 판정만 재계산. OCR 미호출(유료 API 비용 없음)."""
+    rid = _sanitize_receipt_id(receiptId)
+    submission = db.query(Submission).filter(Submission.submission_id == rid).first()
+    if not submission:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    if not ctx.is_super and ctx.campaign_ids and (submission.campaign_id or 0) not in ctx.campaign_ids:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    item_rows = (
+        db.query(ReceiptItem)
+        .filter(ReceiptItem.submission_id == rid)
+        .order_by(ReceiptItem.seq_no.asc())
+        .all()
+    )
+    if not item_rows:
+        raise HTTPException(status_code=400, detail="No receipt items to reprocess")
+    prev_status = submission.status or ""
+    rule_cfg = _get_judgment_rule_config(db)
+    min_criteria = int(rule_cfg.min_amount_stay or 60000) if submission.project_type == "STAY" else int(rule_cfg.min_amount_tour or 50000)
+    total_amount = sum(it.amount or 0 for it in item_rows if it.status == "FIT")
+    total_all_amounts = sum(it.amount or 0 for it in item_rows)
+    pending_new_cnt = sum(1 for it in item_rows if it.status == "PENDING_NEW")
+    pending_verification_cnt = sum(1 for it in item_rows if it.status == "PENDING_VERIFICATION")
+    unfit_codes = [it.error_code for it in item_rows if it.error_code and (str(it.status or "").startswith("UNFIT") or it.status == "ERROR_OCR")]
+    if unfit_codes:
+        fail_code = _normalize_error_code(unfit_codes[0]) or unfit_codes[0]
+    elif pending_new_cnt > 0:
+        fail_code = "PENDING_NEW"
+    elif pending_verification_cnt > 0:
+        fail_code = "PENDING_VERIFICATION"
+    elif total_all_amounts < min_criteria:
+        fail_code = "BIZ_003"
+    else:
+        fail_code = None
+    finalize_submission(
+        submission,
+        total_amount,
+        min_criteria,
+        fail_code,
+        total_all_amounts=total_all_amounts,
+        unknown_store_policy=getattr(rule_cfg, "unknown_store_policy", None),
+    )
+    reprocess_line = f"REPROCESS({datetime.utcnow().isoformat()}): 정책/로직 반영 재적용(OCR 미호출)"
+    existing = submission.audit_trail or submission.audit_log or ""
+    submission.audit_trail = _truncate_submission_audit((existing + " | " + reprocess_line).strip(" |"))
+    submission.audit_log = submission.audit_trail
+    db.commit()
+    db.refresh(submission)
+    cb_policy = _normalize_override_callback_policy(getattr(rule_cfg, "override_callback_policy", None))
+    callback_sent = False
+    if cb_policy == "AUTO":
+        payload = _build_status_payload(submission, item_rows)
+        await _send_result_callback(rid, payload, purpose="resend", actor=ctx.actor)
+        _audit_log(db, actor=ctx.actor, action="CALLBACK_RESEND", target_type="submission", target_id=rid, meta={"trigger": "reprocess"})
+        db.commit()
+        callback_sent = True
+    _audit_log(
+        db,
+        actor=ctx.actor,
+        action="SUBMISSION_REPROCESS",
+        target_type="submission",
+        target_id=rid,
+        meta={"previous_status": prev_status, "new_status": submission.status, "callback_sent": callback_sent},
+    )
+    db.commit()
+    return AdminReprocessResponse(
+        receiptId=rid,
+        previous_status=prev_status,
+        new_status=submission.status or "",
+        total_amount=submission.total_amount or 0,
+        updated_at=submission.updated_at.isoformat() if submission.updated_at else datetime.utcnow().isoformat(),
+        callback_sent=callback_sent,
+    )
+
+
 class AdminCallbackResendRequest(BaseModel):
     target_url: Optional[str] = None
 
@@ -6423,6 +6518,7 @@ def finalize_submission(
     min_criteria: int,
     fail_code: Optional[str],
     total_all_amounts: Optional[int] = None,
+    unknown_store_policy: Optional[str] = None,
 ) -> None:
     """
     submission 최종 판정/감사로그 저장 (§10.3).
@@ -6430,6 +6526,7 @@ def finalize_submission(
     - 최대 3장 중 한 장이라도 정상조건(금액·2026 이벤트 기간 내 날짜 등) 충족 시 FIT 판정.
     - UNFIT_DATE 등 개별 장만의 사유는 합산 기준 충족 시 전체를 UNFIT로 두지 않음.
     - 장별 금액 합산(total_all_amounts)이 기준 충족인데 BIZ_003만 있으면 FIT 처리(합산 금액 미달 오판 방지).
+    - 금액 충족인데 유일 사유가 PENDING_NEW이고 정책이 자동처리(AUTO_REGISTER)면 FIT 처리(에러 아님).
     """
     submission.updated_at = datetime.utcnow()
     resolved = _normalize_error_code(fail_code) or fail_code
@@ -6440,6 +6537,15 @@ def finalize_submission(
     if resolved == "BIZ_003" and total_all_amounts is not None and total_all_amounts >= min_criteria:
         resolved = None
         total_amount = total_all_amounts  # API에 기준 충족 금액 반영
+    # 금액 충족 + 신규상점(PENDING_NEW)만 있는 경우, 자동처리 정책이면 FIT으로 판정(에러로 두지 않음)
+    if (
+        resolved == "PENDING_NEW"
+        and total_all_amounts is not None
+        and total_all_amounts >= min_criteria
+        and _normalize_unknown_store_policy(unknown_store_policy) == "AUTO_REGISTER"
+    ):
+        resolved = None
+        total_amount = total_all_amounts
     amount_ok = total_amount >= min_criteria or (total_all_amounts is not None and total_all_amounts >= min_criteria)
     submission.total_amount = total_amount
     if not resolved and amount_ok:
@@ -7034,7 +7140,14 @@ async def analyze_receipt_task(req: CompleteRequest):
             f"신규상점대기 {pending_new_cnt}매, 수동검증대기 {pending_verification_cnt}매"
         )
 
-        finalize_submission(submission, total_amount, min_criteria, fail_code, total_all_amounts=total_all_amounts)
+        finalize_submission(
+            submission,
+            total_amount,
+            min_criteria,
+            fail_code,
+            total_all_amounts=total_all_amounts,
+            unknown_store_policy=getattr(rule_cfg, "unknown_store_policy", None),
+        )
         raw_audit = " | ".join(audit_lines) if audit_lines else (submission.fail_reason or "")
         submission.audit_log = _truncate_submission_audit(raw_audit)
         submission.audit_trail = submission.audit_log

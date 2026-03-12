@@ -211,6 +211,8 @@ class JudgmentRuleConfig(Base):
     expired_candidate_minutes = Column(Integer, default=1440)
     verifying_timeout_minutes = Column(Integer, default=0)   # 0 = 비활성. VERIFYING 대기 허용(분)
     verifying_timeout_action = Column(String(16), default="UNFIT")  # UNFIT | ERROR
+    # Override 시 콜백 재전송: AUTO=자동전송(override 시 항상 FE로 전송), MANUAL=수동전송(resend_callback:true일 때만)
+    override_callback_policy = Column(String(16), default="AUTO")
     updated_at = Column(DateTime, default=datetime.utcnow)
 
 
@@ -1333,6 +1335,24 @@ def _normalize_unknown_store_policy(raw: Optional[str]) -> str:
     return "AUTO_REGISTER"
 
 
+def _normalize_override_callback_policy(raw: Optional[str]) -> str:
+    """AUTO=자동전송, MANUAL=수동전송. FE 한글/영문 수용."""
+    s = (raw or "").strip().upper()
+    if s in ("AUTO", "MANUAL"):
+        return s
+    if raw and ("자동" in raw or "auto" in raw.lower()):
+        return "AUTO"
+    if raw and ("수동" in raw or "manual" in raw.lower()):
+        return "MANUAL"
+    return "AUTO"
+
+
+def _override_callback_policy_display(policy: str) -> str:
+    """콜백 재전송 옵션 표시용."""
+    p = _normalize_override_callback_policy(policy)
+    return "자동전송 (override 시 항상 FE로 전송)" if p == "AUTO" else "수동전송 (콜백 재전송 버튼/체크 시에만 전송)"
+
+
 def _unknown_store_policy_display(policy: str) -> str:
     """신규상점확인항목 등에서 그대로 쓸 표시 문구. FE가 매핑 실수하지 않도록 BE가 내려줌."""
     p = _normalize_unknown_store_policy(policy)
@@ -1370,6 +1390,7 @@ def _get_judgment_rule_config(db: Session) -> JudgmentRuleConfig:
         expired_candidate_minutes=1440,
         verifying_timeout_minutes=0,
         verifying_timeout_action="UNFIT",
+        override_callback_policy="AUTO",
         updated_at=datetime.utcnow(),
     )
     db.add(cfg)
@@ -2983,6 +3004,9 @@ class JudgmentRuleConfigResponse(BaseModel):
     expired_candidate_minutes: int = Field(1440, description="만료 후보 유효기간(분)")
     verifying_timeout_minutes: int = Field(0, description="VERIFYING 대기 허용(분). 0=비활성, 초과 시 action 적용 후 콜백")
     verifying_timeout_action: str = Field("UNFIT", description="대기 초과 시 적용: UNFIT | ERROR")
+    override_callback_policy: str = Field("AUTO", description="Override 시 콜백: AUTO=자동전송, MANUAL=수동전송")
+    overrideCallbackPolicy: Optional[str] = Field(None, description="FE 표시용 camelCase")
+    overrideCallbackPolicyLabel: Optional[str] = Field(None, description="표시용: 자동전송 | 수동전송")
     updated_at: Optional[str] = None
 
 
@@ -3003,6 +3027,8 @@ class JudgmentRuleConfigUpdateRequest(BaseModel):
     expired_candidate_unit: Optional[ValidityUnit] = Field(None, description="days | hours | minutes")
     verifying_timeout_minutes: Optional[int] = Field(None, ge=0, le=MAX_VALIDITY_MINUTES, description="VERIFYING 대기(분). 0=비활성")
     verifying_timeout_action: Optional[VERIFYING_TIMEOUT_ACTION] = Field(None, description="UNFIT | ERROR")
+    override_callback_policy: Optional[str] = Field(None, description="Override 시 콜백: AUTO=자동전송, MANUAL=수동전송")
+    overrideCallbackPolicy: Optional[str] = Field(None, description="FE 전송용 camelCase")
 
 
 @app.get(
@@ -3016,6 +3042,7 @@ async def get_judgment_rule_config(db: Session = Depends(get_db), actor: str = D
     o_min = _cfg_orphan_minutes(cfg)
     e_min = _cfg_expired_minutes(cfg)
     policy = _normalize_unknown_store_policy(cfg.unknown_store_policy)
+    cb_policy = _normalize_override_callback_policy(getattr(cfg, "override_callback_policy", None))
     return JudgmentRuleConfigResponse(
         unknown_store_policy=policy,
         unknownStorePolicy=policy,
@@ -3030,6 +3057,9 @@ async def get_judgment_rule_config(db: Session = Depends(get_db), actor: str = D
         expired_candidate_minutes=e_min,
         verifying_timeout_minutes=int(getattr(cfg, "verifying_timeout_minutes", None) or 0),
         verifying_timeout_action=(getattr(cfg, "verifying_timeout_action", None) or "UNFIT"),
+        override_callback_policy=cb_policy,
+        overrideCallbackPolicy=cb_policy,
+        overrideCallbackPolicyLabel=_override_callback_policy_display(getattr(cfg, "override_callback_policy", None)),
         updated_at=cfg.updated_at.isoformat() if cfg.updated_at else None,
     )
 
@@ -3058,6 +3088,7 @@ async def update_judgment_rule_config(
         "expired_candidate_minutes": e_min,
         "verifying_timeout_minutes": int(getattr(cfg, "verifying_timeout_minutes", None) or 0),
         "verifying_timeout_action": getattr(cfg, "verifying_timeout_action", None) or "UNFIT",
+        "override_callback_policy": getattr(cfg, "override_callback_policy", None) or "AUTO",
     }
     policy_in = body.unknown_store_policy if body.unknown_store_policy is not None else body.unknownStorePolicy
     if policy_in is not None:
@@ -3086,6 +3117,9 @@ async def update_judgment_rule_config(
         cfg.verifying_timeout_minutes = max(0, min(MAX_VALIDITY_MINUTES, body.verifying_timeout_minutes))
     if body.verifying_timeout_action is not None:
         cfg.verifying_timeout_action = body.verifying_timeout_action if body.verifying_timeout_action in ("UNFIT", "ERROR") else "UNFIT"
+    cb_policy_in = body.override_callback_policy if body.override_callback_policy is not None else body.overrideCallbackPolicy
+    if cb_policy_in is not None:
+        cfg.override_callback_policy = _normalize_override_callback_policy(cb_policy_in)
     cfg.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(cfg)
@@ -3103,6 +3137,7 @@ async def update_judgment_rule_config(
         "expired_candidate_minutes": e_min_after,
         "verifying_timeout_minutes": int(getattr(cfg, "verifying_timeout_minutes", None) or 0),
         "verifying_timeout_action": getattr(cfg, "verifying_timeout_action", None) or "UNFIT",
+        "override_callback_policy": getattr(cfg, "override_callback_policy", None) or "AUTO",
     }
     _audit_log(
         db,
@@ -3115,6 +3150,7 @@ async def update_judgment_rule_config(
     )
     db.commit()
     policy_after = _normalize_unknown_store_policy(cfg.unknown_store_policy)
+    cb_policy_after = _normalize_override_callback_policy(getattr(cfg, "override_callback_policy", None))
     return JudgmentRuleConfigResponse(
         unknown_store_policy=policy_after,
         unknownStorePolicy=policy_after,
@@ -3129,6 +3165,9 @@ async def update_judgment_rule_config(
         expired_candidate_minutes=e_min_after,
         verifying_timeout_minutes=int(getattr(cfg, "verifying_timeout_minutes", None) or 0),
         verifying_timeout_action=(getattr(cfg, "verifying_timeout_action", None) or "UNFIT"),
+        override_callback_policy=cb_policy_after,
+        overrideCallbackPolicy=cb_policy_after,
+        overrideCallbackPolicyLabel=_override_callback_policy_display(getattr(cfg, "override_callback_policy", None)),
         updated_at=cfg.updated_at.isoformat() if cfg.updated_at else None,
     )
 
@@ -4504,10 +4543,14 @@ async def admin_get_submission(
     status_payload = _build_status_payload_admin(submission, item_rows)
     cfg = _get_judgment_rule_config(db)
     policy = _normalize_unknown_store_policy(cfg.unknown_store_policy)
+    cb_policy = _normalize_override_callback_policy(getattr(cfg, "override_callback_policy", None))
     judgment_rule = {
         "unknown_store_policy": policy,
         "unknownStorePolicy": policy,
         "newStoreProcessingLabel": _unknown_store_policy_display(cfg.unknown_store_policy),
+        "override_callback_policy": cb_policy,
+        "overrideCallbackPolicy": cb_policy,
+        "overrideCallbackPolicyLabel": _override_callback_policy_display(getattr(cfg, "override_callback_policy", None)),
     }
     return AdminSubmissionDetailResponse(
         receiptId=rid,
@@ -5020,6 +5063,10 @@ async def admin_override_submission(
         pass
     db.commit()
     db.refresh(submission)
+    rule_cfg = _get_judgment_rule_config(db)
+    cb_policy = _normalize_override_callback_policy(getattr(rule_cfg, "override_callback_policy", None))
+    # 자동전송(AUTO): override 시 항상 콜백. 수동전송(MANUAL): resend_callback:true일 때만.
+    should_send_callback = (cb_policy == "AUTO") or bool(body.resend_callback)
     _audit_log(
         db,
         actor=ctx.actor,
@@ -5028,10 +5075,10 @@ async def admin_override_submission(
         target_id=rid,
         before_json=before,
         after_json={"status": submission.status, "fail_reason": submission.fail_reason, "audit_trail": submission.audit_trail},
-        meta={"resend_callback": bool(body.resend_callback)},
+        meta={"resend_callback": bool(body.resend_callback), "override_callback_policy": cb_policy, "callback_sent": should_send_callback},
     )
     db.commit()
-    if body.resend_callback:
+    if should_send_callback:
         item_rows = (
             db.query(ReceiptItem)
             .filter(ReceiptItem.submission_id == rid)

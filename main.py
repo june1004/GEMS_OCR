@@ -2950,6 +2950,7 @@ def _minutes_from_value_unit(value: int, unit: str) -> int:
 
 class JudgmentRuleConfigResponse(BaseModel):
     unknown_store_policy: str = Field(..., description="기본: AUTO_REGISTER(자동 상점추가). 검수 대기 시에만: PENDING_NEW(신규상점 검수 대기)")
+    unknownStorePolicy: Optional[str] = Field(None, description="FE 표시용 camelCase. unknown_store_policy와 동일.")
     auto_register_threshold: float = Field(..., description="0.0~1.0")
     enable_gemini_classifier: bool = Field(..., description="신규 상점 분류 시 Gemini 사용 여부")
     min_amount_stay: int = Field(..., description="STAY 최소 금액")
@@ -2965,6 +2966,7 @@ class JudgmentRuleConfigResponse(BaseModel):
 
 class JudgmentRuleConfigUpdateRequest(BaseModel):
     unknown_store_policy: Optional[str] = Field(None, description="미설정 시 기본값 AUTO_REGISTER. 검수 대기 원할 때만 PENDING_NEW")
+    unknownStorePolicy: Optional[str] = Field(None, description="FE 전송용 camelCase. unknown_store_policy와 동일하게 적용.")
     auto_register_threshold: Optional[float] = Field(None, description="0.0~1.0")
     enable_gemini_classifier: Optional[bool] = None
     min_amount_stay: Optional[int] = None
@@ -2991,8 +2993,10 @@ async def get_judgment_rule_config(db: Session = Depends(get_db), actor: str = D
     cfg = _get_judgment_rule_config(db)
     o_min = _cfg_orphan_minutes(cfg)
     e_min = _cfg_expired_minutes(cfg)
+    policy = _normalize_unknown_store_policy(cfg.unknown_store_policy)
     return JudgmentRuleConfigResponse(
-        unknown_store_policy=_normalize_unknown_store_policy(cfg.unknown_store_policy),
+        unknown_store_policy=policy,
+        unknownStorePolicy=policy,
         auto_register_threshold=float(cfg.auto_register_threshold or 0.90),
         enable_gemini_classifier=bool(cfg.enable_gemini_classifier),
         min_amount_stay=int(cfg.min_amount_stay or 60000),
@@ -3032,8 +3036,9 @@ async def update_judgment_rule_config(
         "verifying_timeout_minutes": int(getattr(cfg, "verifying_timeout_minutes", None) or 0),
         "verifying_timeout_action": getattr(cfg, "verifying_timeout_action", None) or "UNFIT",
     }
-    if body.unknown_store_policy is not None:
-        cfg.unknown_store_policy = _normalize_unknown_store_policy(body.unknown_store_policy)
+    policy_in = body.unknown_store_policy if body.unknown_store_policy is not None else body.unknownStorePolicy
+    if policy_in is not None:
+        cfg.unknown_store_policy = _normalize_unknown_store_policy(policy_in)
     if body.auto_register_threshold is not None:
         cfg.auto_register_threshold = max(0.0, min(1.0, float(body.auto_register_threshold)))
     if body.enable_gemini_classifier is not None:
@@ -6494,6 +6499,10 @@ async def analyze_receipt_task(req: CompleteRequest):
         return
 
     try:
+        # 사용자 입력 스냅샷: Complete 시 전송된 data가 있는데 아직 저장되지 않았으면 태스크에서 저장(관리자 페이지 표시용)
+        if getattr(submission, "user_input_snapshot", None) is None and req.data is not None:
+            submission.user_input_snapshot = req.data.model_dump()
+            db.commit()
         rule_cfg = _get_judgment_rule_config(db)
         unknown_store_policy = _normalize_unknown_store_policy(rule_cfg.unknown_store_policy)
         auto_register_threshold = float(rule_cfg.auto_register_threshold or CLASSIFIER_AUTO_THRESHOLD)
@@ -6707,6 +6716,7 @@ async def analyze_receipt_task(req: CompleteRequest):
                                             conf,
                                             ctype,
                                         )
+                                        db.flush()  # 동일 트랜잭션에서 재매칭 시 새 상점 반영
                                         # 자동 상점추가 후에는 검수 대기 없이 FIT. 데이터 자산화(master_stores + unregistered_stores) 완료.
                                         # item_fail 유지 None → 아래 FIT 처리
                                     else:
@@ -6799,6 +6809,9 @@ async def analyze_receipt_task(req: CompleteRequest):
                         na = _normalize_amount(user_amt)
                         if na is not None:
                             item_rows[i].amount = na
+                    # 데이터 교정/최종확정 표시용: OCR 인식 금액을 항상 item에 동기화(0원 오표시 방지)
+                    if amount is not None:
+                        item_rows[i].amount = _normalize_amount(amount) if _normalize_amount(amount) is not None else (int(amount) if isinstance(amount, (int, float)) else 0)
                     pay_date = p.get("payDate") or ""
                     store_name = _normalize_store_name(p.get("storeName"))
                     address = _normalize_address((p.get("address") or "").strip()) or ""
@@ -6849,6 +6862,7 @@ async def analyze_receipt_task(req: CompleteRequest):
                                         conf,
                                         ctype,
                                     )
+                                    db.flush()  # 동일 트랜잭션에서 재매칭 시 새 상점 반영
                                     # 자동 상점추가 후에는 검수 대기 없이 FIT. 데이터 자산화(master_stores + unregistered_stores) 완료.
                                     # item_fail 유지 None → 아래 FIT 처리
                                 else:

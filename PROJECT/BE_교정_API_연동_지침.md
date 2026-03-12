@@ -95,12 +95,18 @@ FE가 로컬에 저장하는 구조와 동일한 필드를 API Body로 보냅니
 4. **감사**  
    - 교정 API 호출 시 **수정자 ID, receiptId, 시각** 등 Audit Log 기록을 권장합니다.
 
+5. **목록 API에서 최종 확정 금액 반영**  
+   - 제출/결과 **목록**의 금액 컬럼은 수정 없으면 OCR 인식값, 검수자가 최종 확정으로 수정했으면 **수정한 금액**이 표시되어야 합니다.  
+   - 상세: [백엔드_요청사항_정리.md §10.5 목록 금액: 최종 확정(교정) 금액 반영](./백엔드_요청사항_정리.md#105-목록-금액-최종-확정교정-금액-반영)  
+   - FE: `GET /api/v1/admin/submissions` 응답의 각 항목에서 `final_amount`(또는 `correctedTotalAmount`)가 있으면 그 값, 없으면 `total_amount` 사용.
+
 ### 3.1 이 레포 구현 요약
 
 | 항목 | 동작 |
 |------|------|
 | submission 존재 확인 | `receipt_id::text = :rid`로 조회, 없으면 **404** |
-| total_amount 업데이트 | `payload.amount`가 숫자로 파싱 가능하면 `submissions.total_amount` 갱신 |
+| total_amount 업데이트 | `payload.amount`가 숫자로 파싱 가능하면 `submissions.total_amount`를 **최종 확정 금액으로 갱신** (§10.5 방법 A). 목록 API만으로도 수정 금액 표시 가능. |
+| 목록 API 최종 확정 금액 | `GET /api/v1/admin/submissions` 응답 항목에 `total_amount`, `final_amount`, `correctedTotalAmount` 포함. 방법 A 적용으로 교정 시 total_amount가 갱신되므로 세 필드 모두 동일한 값. FE는 `final_amount ?? total_amount` 또는 getDisplayAmount()로 표시. |
 | 감사 로그 | `admin_audit_log`에 `action='submission_correction'`, `after_json`에 payload 기록. **INSERT 실패 시** 로그만 남기고 요청은 **200 성공**으로 반환(테이블 없어도 500 아님). |
 | 응답 | `200 OK` + `{"receiptId": "<receipt_id>", "updated": true}` |
 | 예외 | DB 오류 시 `500` + `detail="Database error during correction"`, 기타 예외 시 `detail="Internal server error during correction"`. 서버 로그에 `correction: db error` / `correction: unexpected error` 기록. |

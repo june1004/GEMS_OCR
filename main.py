@@ -3904,6 +3904,9 @@ class AdminSubmissionListItem(BaseModel):
     projectType: Optional[str] = None  # FE 대시보드 유형별 비중 차트용 (project_type과 동일)
     status: Optional[str] = None
     total_amount: int = 0
+    # §10.5 목록 금액: FE는 final_amount ?? total_amount 로 표시. 방법 A 적용 시 교정 저장 시 total_amount 갱신하므로 동일값.
+    final_amount: Optional[int] = Field(None, description="최종 확정(교정) 금액. 있으면 목록/집계에 사용, 없으면 total_amount 사용. 방법 A: total_amount와 동일.")
+    correctedTotalAmount: Optional[int] = Field(None, description="final_amount와 동일(camelCase). FE getDisplayAmount()용.")
     created_at: Optional[str] = None
     thumbnail_url: Optional[str] = Field(None, description="목록·호버 썸네일 미리보기용 presigned URL(첫 장)")
     confidence: Optional[int] = Field(None, description="신뢰도 0~100, 슬라이더 필터용(첫 장 또는 최소값)")
@@ -4119,6 +4122,7 @@ async def admin_list_submissions(
         thumb_url = _presigned_get_url_for_key(first_item.image_key) if first_item and (first_item.image_key or "").strip() else None
         conf = min_confidence_per_sub.get(r.submission_id)
         integrity_ok = bool(r.status == "FIT" and not (r.fail_reason or r.global_fail_reason))
+        amt = r.total_amount or 0
         items.append(
             AdminSubmissionListItem(
                 receiptId=r.submission_id,
@@ -4126,7 +4130,9 @@ async def admin_list_submissions(
                 project_type=_normalize_project_type_for_response(r.project_type),
                 projectType=_normalize_project_type_for_response(r.project_type),
                 status=r.status,
-                total_amount=r.total_amount or 0,
+                total_amount=amt,
+                final_amount=amt,
+                correctedTotalAmount=amt,
                 created_at=r.created_at.isoformat() if r.created_at else None,
                 thumbnail_url=thumb_url,
                 confidence=conf,

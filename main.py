@@ -5283,14 +5283,20 @@ def _strip_trailing_date_junk(s: str) -> str:
     return s.strip(" -")
 
 
+# 2026년 이벤트 기간: UNFIT_DATE 전제(§10.3). 이 기간 내 유효한 날짜면 FIT 판정을 막지 않음.
+EVENT_YEAR_2026_START = date(2026, 1, 1)
+EVENT_YEAR_2026_END = date(2026, 12, 31)
+
+
 def _normalize_and_validate_2026_date(date_text: str) -> Tuple[bool, Optional[str]]:
     """
-    OCR 날짜 정규화 후 2026년 유효성 검사.
+    OCR 날짜 정규화 후 2026년 이벤트 기간 내 유효성 검사 (§10.3 UNFIT_DATE 전제).
+    - 이벤트 기간 내 유효한 날짜면 True 반환 → 해당 장 FIT 가능, UNFIT_DATE로 전체를 막지 않음.
     Step1: 괄호·요일 등 비날짜 접미사 제거 (예: "26.02.22 (일)" → "26.02.22")
     Step2: 구분자(., /, 공백)를 '-'로 치환
     Step3: 2026 또는 26으로 시작하는지 확인
-    Step4: dateutil.parser로 파싱 후 유효한 날짜인지 검증
-    반환: (2026년 유효 여부, 정규화된 날짜 문자열 또는 None)
+    Step4: dateutil.parser로 파싱 후 2026년 이벤트 기간 내인지 검증
+    반환: (2026년 이벤트 기간 내 유효 여부, 정규화된 날짜 문자열 또는 None)
     """
     if not date_text or not isinstance(date_text, str):
         return False, None
@@ -5304,9 +5310,10 @@ def _normalize_and_validate_2026_date(date_text: str) -> Tuple[bool, Optional[st
         s = "20" + s
     try:
         parsed = dateutil_parser.parse(s)
-        if parsed.year != 2026:
+        d = parsed.date() if hasattr(parsed, "date") else date(parsed.year, parsed.month, parsed.day)
+        if not (EVENT_YEAR_2026_START <= d <= EVENT_YEAR_2026_END):
             return False, None
-        normalized = parsed.strftime("%Y/%m/%d")
+        normalized = d.strftime("%Y/%m/%d")
         return True, normalized
     except (ValueError, TypeError):
         return False, None
@@ -5638,16 +5645,19 @@ CARD_NUM_NO_CARD = "1000"
 
 def _normalize_card_num(raw: Optional[str]) -> str:
     """
-    카드번호 정규화:
-    - 숫자 4자리 이상이면 마지막 4자리 저장
-    - 비어 있거나 **** 등 마스킹/미표시면 '1000'(카드번호 없음)
-    - 현금 여부는 _extract_card_num에서 OCR 전체로 판별 → '0000'
+    카드번호 정규화 (§10.3: 앞 4자리 저장·반영).
+    - 4자리만 추출된 경우: 앞 4자리로 해석해 저장 (영수증 마스킹이 앞 4자리 노출인 경우가 많음).
+    - 5자리 이상: 마지막 4자리 저장 (전체 번호에서 뒷 4자리만 노출된 경우).
+    - 비어 있거나 **** 등 마스킹/미표시면 '1000'(카드번호 없음).
+    - 현금 여부는 _extract_card_num에서 OCR 전체로 판별 → '0000'.
     """
     text = (raw or "").strip()
     if not text or re.match(r"^[\s*\-]+$", text):
         return CARD_NUM_NO_CARD
     digits = re.sub(r"[^0-9]", "", text)
-    if len(digits) >= 4:
+    if len(digits) == 4:
+        return digits  # 앞 4자리로 해석
+    if len(digits) > 4:
         return digits[-4:]
     return CARD_NUM_NO_CARD
 
@@ -6312,14 +6322,15 @@ def map_ocr_to_db(
 
 def finalize_submission(submission: Submission, total_amount: int, min_criteria: int, fail_code: Optional[str]) -> None:
     """
-    submission 최종 판정/감사로그 저장.
-    - FIT item 금액 합산 기준으로 최종 판정.
-    - 1개 이상 영수증이 조건 충족(합산 >= 기준)이면 개별 장의 UNFIT(업종/지역/날짜)로 전체를 덮지 않고 FIT 처리.
+    submission 최종 판정/감사로그 저장 (§10.3).
+    - FIT item 금액 합산으로 total_amount 반영(API 금액 = BE가 반영한 값).
+    - 최대 3장 중 한 장이라도 정상조건(금액·2026 이벤트 기간 내 날짜 등) 충족 시 FIT 판정.
+    - UNFIT_DATE 등 개별 장만의 사유는 합산 기준 충족 시 전체를 UNFIT로 두지 않음.
     """
     submission.total_amount = total_amount
     submission.updated_at = datetime.utcnow()
     resolved = _normalize_error_code(fail_code) or fail_code
-    # 1개 이상 조건 충족 시: 개별 장만의 사유(UNFIT_CATEGORY/REGION/DATE)는 전체를 UNFIT로 두지 않음
+    # §10.3: 한 장이라도 정상이면 FIT. UNFIT_DATE(2026 이벤트 기간 내 유효 날짜)는 FIT을 막지 않음.
     if total_amount >= min_criteria and resolved in ("UNFIT_CATEGORY", "UNFIT_REGION", "UNFIT_DATE"):
         resolved = None
     if not resolved and total_amount >= min_criteria:
@@ -6884,10 +6895,10 @@ async def analyze_receipt_task(req: CompleteRequest):
         pending_new_cnt = sum(1 for a in ocr_assets if a.get("status") == "PENDING_NEW")
         pending_verification_cnt = sum(1 for a in ocr_assets if a.get("status") == "PENDING_VERIFICATION")
 
-        # 4) 부모 상태 업데이트: total_amount는 반드시 item_rows FIT 합산으로 산출 (관리자 검증 정확도)
+        # 4) 부모 상태 업데이트 (§10.3): total_amount = 장별 FIT 합산(API가 내려줄 금액). 한 장이라도 정상이면 FIT.
         total_amount = sum(it.amount or 0 for it in item_rows if it.status == "FIT")
         min_criteria = min_amount_stay if req.type == "STAY" else min_amount_tour
-        # 1개 이상 영수증이 조건 충족(금액 기준 이상)이면 리워드 지급. 다른 장의 PENDING_NEW/PENDING_VERIFICATION으로 전체를 덮지 않음.
+        # 최대 3장 중 한 장이라도 정상조건 충족(금액 기준 이상)이면 FIT 판정.
         condition_met = fit_cnt >= 1 and total_amount >= min_criteria
         if not condition_met:
             if not fail_code and pending_new_cnt > 0:

@@ -184,13 +184,27 @@ FE가 로컬에 저장하는 구조와 동일한 필드를 API Body로 보냅니
 |------|-----------|------|
 | 1 | **이 레포(GEMS_OCR) 최신 코드 배포** | `PATCH /api/v1/admin/submissions/{receiptId}/correction` 라우트와 전역 예외 핸들러가 포함된 버전으로 배포. 이 레포의 main.py는 500 발생 시에도 JSON으로 응답해 CORS가 붙도록 되어 있음. |
 | 2 | **CORS_ORIGINS** | `CORS_ORIGINS=http://localhost:8080` 설정 후 서버 재시작. |
-| 3 | **500 원인 확인** | 500 응답이 `{"detail":"Internal server error","receiptId":"..."}` 형태면 **최신 코드가 배포된 상태**. 서버 로그에서 **반드시** 아래로 검색해 실제 예외 메시지 확인: `Correction API error (receiptId=` 또는 `Correction commit failed (receiptId=`. **흔한 원인:** (1) `submission_sidecar` 컬럼 없음 → `PROJECT/migrations/submission_sidecar_correction.sql` 적용, (2) `submissions.audit_trail`/`audit_log` 컬럼 없음 → `PROJECT/migrations/submission_audit_columns.sql` 적용, (3) `admin_audit_log` 테이블 없음(이 경우에도 교정 저장은 200 성공·감사 로그만 경고), (4) DB 연결/타임아웃. |
+| 3 | **500 원인 확인** | 500 응답 본문에 `receiptId`가 포함됨. 서버 로그에서 `Correction API error (receiptId=...)` 또는 `Correction commit failed (receiptId=...)` 로 검색. **흔한 원인:** (1) `submission_sidecar` 컬럼 없음 → `PROJECT/migrations/submission_sidecar_correction.sql` 적용, (2) `submissions.audit_trail`/`audit_log` 컬럼 없음, (3) `admin_audit_log` 테이블 없음(이 경우에도 교정 저장은 200으로 성공하고 감사 로그만 경고), (4) DB 연결/타임아웃. |
 
 이 레포 기준으로 교정 API는 (1) 요청 본문을 raw JSON으로 수락해 검증 실패(422) 가능성을 줄였고, (2) 예외 시 500도 `{"detail":"Internal server error","receiptId":"..."}` 형태로 JSON 반환하므로 CORS 헤더가 붙습니다. **동일 코드가 배포되어 있으면** 500이 나더라도 CORS로 막히지 않고, FE에서 receiptId를 활용해 사용자에게 안내할 수 있습니다. 여전히 CORS만 보인다면 배포 버전이 다르거나, 리버스 프록시/API 게이트웨이에서 500을 직접 반환하는 경우일 수 있습니다.
 
 ---
 
+## 6.1 수퍼관리자 판정 규칙(신규 상점 정책)이 증거 확인 화면에 반영되지 않을 때
+
+수퍼관리자가 **판정 규칙**에서 "자동 처리"로 저장했는데, **증거(영수증) 확인** 페이지에서는 여전히 "검수자 수동 처리"로 보이는 경우:
+
+| 확인 항목 | 설명 |
+|-----------|------|
+| **증거 페이지에서 "설정 새로고침"** | 데이터 교정 패널의 "현재 환경설정(판정 규칙)" 옆 **설정 새로고침** 버튼으로 최신 규칙을 다시 불러옵니다. (페이지 진입 시에도 자동으로 최신 규칙을 요청합니다.) |
+| **동일 API 사용** | 증거 확인·판정 규칙 모두 같은 Admin API(`GET/PUT /api/v1/admin/rules/judgment`)를 사용하는지 확인. 배포 서버(api.nanum.online 등)에 해당 라우트와 `judgment_rule_config` 테이블이 있어야 합니다. |
+| **BE 저장 여부** | 판정 규칙 저장 시 `PUT /api/v1/admin/rules/judgment`가 200으로 성공하는지, 배포 서버 DB에 `judgment_rule_config.unknown_store_policy = 'AUTO_REGISTER'`가 반영되는지 확인. |
+
+이 레포의 `backend/app/api/v1/routes/admin_rules.py`에는 GET/PUT이 구현되어 있으며, 기본값은 `PENDING_NEW`입니다. 테이블이 없거나 PUT이 실패하면 GET이 기본값을 반환해 "검수자 수동 처리"로 보일 수 있습니다.
+
+---
+
 ## 7. 관련 문서
 
-- [백엔드_요청사항_정리.md](./백엔드_요청사항_정리.md) – **섹션 10** (데이터 교정 및 Sidecar)
+- [백엔드_요청사항_정리.md](./백엔드_요청사항_정리.md) – **섹션 10** (데이터 교정 및 Sidecar), [**§10.3** 판정·금액·날짜·카드번호 BE 지침](./백엔드_요청사항_정리.md#103-증거-확인-판정금액날짜카드번호-be-지침)
 - [GEMS_표준_수정_반려_사유_분류.md](./GEMS_표준_수정_반려_사유_분류.md) – reason_code·asset_tag 표준 값

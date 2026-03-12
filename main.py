@@ -4623,6 +4623,21 @@ async def admin_receipt_tag(
     )
 
 
+# FE 요청서 §10.1 reason_code 별칭 → GEMS 표준 코드
+CORRECTION_REASON_ALIAS = {
+    "OCR_ERROR": "ERR_OCR_AMOUNT",
+    "ocr_error": "ERR_OCR_AMOUNT",
+    "USER_MISTAKE": "USER_AMOUNT_MISTAKE",
+    "user_mistake": "USER_AMOUNT_MISTAKE",
+    "AMOUNT_SUM_ERROR": "AMOUNT_SUM_MISMATCH",
+    "amount_sum_error": "AMOUNT_SUM_MISMATCH",
+    "POLICY_EXCEPTION": "OTHER",
+    "policy_exception": "OTHER",
+    "ADDRESS_MISMATCH": "ERR_REGION_OCR",
+    "address_mismatch": "ERR_REGION_OCR",
+    "OTHER": "OTHER",
+    "other": "OTHER",
+}
 # GEMS 표준 수정·반려 사유 (GEMS_표준_수정_반려_사유_분류.md) → asset_tag 매핑
 CORRECTION_REASON_TO_ASSET_TAG = {
     "ERR_OCR_AMOUNT": "RE_TRAINING_REQUIRED",
@@ -4644,7 +4659,7 @@ class AdminCorrectionRequest(BaseModel):
     address: Optional[str] = Field(None, description="교정할 주소(첫 장 receipt_item)")
     correction_reason_code: str = Field(
         ...,
-        description="GEMS 표준: ERR_OCR_AMOUNT|ERR_UNIT_DECIMAL|USER_AMOUNT_MISTAKE|AMOUNT_SUM_MISMATCH|ERR_REGION_OCR|CATEGORY_RECLASSIFY|STORE_NAME_MISSING|IMAGE_BLUR|IMAGE_CROP|DUPLICATE_SUSPECT|OTHER",
+        description="사유 코드. FE 별칭: ocr_error|user_mistake|amount_sum_error|policy_exception|address_mismatch|other. GEMS 표준: ERR_OCR_AMOUNT, USER_AMOUNT_MISTAKE, AMOUNT_SUM_MISMATCH, ERR_REGION_OCR, OTHER 등",
     )
     correction_reason_detail: Optional[str] = Field(None, description="수정 사유 상세(reason_desc)")
     asset_tag: Optional[str] = Field(None, description="RE_TRAINING_REQUIRED|USER_ERROR_LABEL|LOW_QUALITY_SAMPLE|FRAUD_CHECK, 미지정 시 reason_code로 매핑")
@@ -4664,7 +4679,7 @@ class AdminCorrectionResponse(BaseModel):
     "/api/v1/admin/submissions/{receiptId}/correction",
     response_model=AdminCorrectionResponse,
     summary="증거(영수증) 데이터 교정",
-    description="검수 화면에서 금액·주소 등 교정. audit_trail 및 Sidecar(교정 이력)에 기록해 AI 재학습·정답지 활용.",
+    description="FE 교정 데이터(최종 금액·주소, reason_code, reason_detail, asset_tag) 수신 → DB 갱신 + Sidecar JSON에 교정 이력 저장. AI 학습·정답지 활용용. 마이그레이션: submission_sidecar_correction.sql",
     tags=["Admin - Submissions"],
 )
 async def admin_submission_correction(
@@ -4680,7 +4695,10 @@ async def admin_submission_correction(
         raise HTTPException(status_code=404, detail="Submission not found")
     if not ctx.is_super and ctx.campaign_ids and (sub.campaign_id or 0) not in ctx.campaign_ids:
         raise HTTPException(status_code=404, detail="Submission not found")
-    reason_code = (body.correction_reason_code or "").strip().upper() or "OTHER"
+    raw_reason = (body.correction_reason_code or "").strip() or "OTHER"
+    reason_code = CORRECTION_REASON_ALIAS.get(raw_reason, CORRECTION_REASON_ALIAS.get(raw_reason.upper(), raw_reason))
+    if reason_code not in CORRECTION_REASON_TO_ASSET_TAG:
+        reason_code = "OTHER"
     reason_detail = (body.correction_reason_detail or "").strip() or ""
     at = datetime.utcnow()
     at_iso = at.isoformat() + "Z"
@@ -4723,7 +4741,7 @@ async def admin_submission_correction(
     sub.audit_trail = _truncate_submission_audit(combined)
     sub.audit_log = sub.audit_trail
 
-    # GEMS 표준 Sidecar JSON (§6): receipt_id, ai_result, human_correction, asset_tag
+    # GEMS 표준 Sidecar JSON (§10.2): receipt_id, ai_result, human_correction(final_amount, final_address 등), asset_tag
     human_correction = {
         "final_amount": after.get("total_amount") or sub.total_amount,
         "reason_code": reason_code,
@@ -4733,6 +4751,7 @@ async def admin_submission_correction(
     }
     if after.get("address") is not None:
         human_correction["address"] = after["address"]
+        human_correction["final_address"] = after["address"]
     ai_result: Dict[str, Any] = {"amount": before.get("total_amount")}
     if first_item and getattr(first_item, "confidence_score", None) is not None:
         c = first_item.confidence_score
@@ -4759,8 +4778,12 @@ async def admin_submission_correction(
             sql_text("UPDATE submissions SET submission_sidecar = :sc::jsonb WHERE submission_id = :rid"),
             {"sc": json.dumps(sidecar), "rid": rid},
         )
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(
+            "Correction sidecar save failed (receiptId=%s). Apply migration submission_sidecar_correction.sql if needed: %s",
+            rid,
+            e,
+        )
 
     db.commit()
     db.refresh(sub)

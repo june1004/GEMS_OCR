@@ -4623,10 +4623,11 @@ async def admin_receipt_tag(
     )
 
 
-# FE 요청서 §10.1 reason_code 별칭 → GEMS 표준 코드
+# FE 요청서 §10.1·BE_교정_API_연동_지침: reason_code / reasonId 별칭 → GEMS 표준 코드
 CORRECTION_REASON_ALIAS = {
     "OCR_ERROR": "ERR_OCR_AMOUNT",
     "ocr_error": "ERR_OCR_AMOUNT",
+    "err_ocr_amount": "ERR_OCR_AMOUNT",
     "USER_MISTAKE": "USER_AMOUNT_MISTAKE",
     "user_mistake": "USER_AMOUNT_MISTAKE",
     "AMOUNT_SUM_ERROR": "AMOUNT_SUM_MISMATCH",
@@ -4655,14 +4656,16 @@ CORRECTION_REASON_TO_ASSET_TAG = {
 
 
 class AdminCorrectionRequest(BaseModel):
-    total_amount: Optional[int] = Field(None, description="교정할 총 금액")
-    address: Optional[str] = Field(None, description="교정할 주소(첫 장 receipt_item)")
-    correction_reason_code: str = Field(
-        ...,
-        description="사유 코드. FE 별칭: ocr_error|user_mistake|amount_sum_error|policy_exception|address_mismatch|other. GEMS 표준: ERR_OCR_AMOUNT, USER_AMOUNT_MISTAKE, AMOUNT_SUM_MISMATCH, ERR_REGION_OCR, OTHER 등",
-    )
-    correction_reason_detail: Optional[str] = Field(None, description="수정 사유 상세(reason_desc)")
-    asset_tag: Optional[str] = Field(None, description="RE_TRAINING_REQUIRED|USER_ERROR_LABEL|LOW_QUALITY_SAMPLE|FRAUD_CHECK, 미지정 시 reason_code로 매핑")
+    """BE_교정_API_연동_지침·백엔드_요청사항_정리 §10.1. FE payload: amount, address, reasonId, reason_code, reason_detail, asset_tag (모두 선택)."""
+    amount: Optional[Union[str, int]] = Field(None, description="담당자 확정 금액(문자열 또는 숫자). FE는 문자열로 전송")
+    total_amount: Optional[int] = Field(None, description="교정할 총 금액 (amount와 동일, 숫자형)")
+    address: Optional[str] = Field(None, description="담당자 확정 가맹점 주소/지역(첫 장 receipt_item)")
+    reasonId: Optional[str] = Field(None, description="FE 수정 사유 프리셋 ID (예: err_ocr_amount, other)")
+    reason_code: Optional[str] = Field(None, description="Sidecar 기록용 표준 코드 (예: ERR_OCR_AMOUNT, USER_AMOUNT_MISTAKE)")
+    correction_reason_code: Optional[str] = Field(None, description="reason_code와 동일. 하위 호환")
+    reason_detail: Optional[str] = Field(None, description="사유 상세(프리셋 설명 또는 사용자 입력)")
+    correction_reason_detail: Optional[str] = Field(None, description="reason_detail과 동일. 하위 호환")
+    asset_tag: Optional[str] = Field(None, description="학습 데이터 분류: RE_TRAINING_REQUIRED|USER_ERROR_LABEL|LOW_QUALITY_SAMPLE|FRAUD_CHECK")
     audit: Optional[Dict[str, Any]] = Field(None, description="FE 전달용, 서버에서 actor·시각으로 덮어씀")
 
 
@@ -4695,11 +4698,13 @@ async def admin_submission_correction(
         raise HTTPException(status_code=404, detail="Submission not found")
     if not ctx.is_super and ctx.campaign_ids and (sub.campaign_id or 0) not in ctx.campaign_ids:
         raise HTTPException(status_code=404, detail="Submission not found")
-    raw_reason = (body.correction_reason_code or "").strip() or "OTHER"
+    raw_reason = (
+        (body.reason_code or body.correction_reason_code or body.reasonId or "").strip() or "OTHER"
+    )
     reason_code = CORRECTION_REASON_ALIAS.get(raw_reason, CORRECTION_REASON_ALIAS.get(raw_reason.upper(), raw_reason))
     if reason_code not in CORRECTION_REASON_TO_ASSET_TAG:
         reason_code = "OTHER"
-    reason_detail = (body.correction_reason_detail or "").strip() or ""
+    reason_detail = (body.reason_detail or body.correction_reason_detail or "").strip() or ""
     at = datetime.utcnow()
     at_iso = at.isoformat() + "Z"
     actor_id = ctx.actor
@@ -4715,15 +4720,20 @@ async def admin_submission_correction(
     if first_item:
         before["address"] = first_item.address
 
-    if body.total_amount is not None:
-        after["total_amount"] = max(0, int(body.total_amount))
-        sub.total_amount = after["total_amount"]
-    if body.address is not None and first_item is not None:
-        after["address"] = body.address.strip() if body.address else ""
+    amount_val = body.amount if body.amount is not None else body.total_amount
+    if amount_val is not None and str(amount_val).strip() != "":
+        try:
+            n = int(amount_val) if isinstance(amount_val, (int, float)) else int(str(amount_val).strip())
+            after["total_amount"] = max(0, n)
+            sub.total_amount = after["total_amount"]
+        except (ValueError, TypeError):
+            pass
+    if body.address is not None and body.address != "" and first_item is not None:
+        after["address"] = body.address.strip()
         first_item.address = after["address"] or None
 
-    if not after:
-        raise HTTPException(status_code=400, detail="At least one of total_amount or address required")
+    if not after and not reason_code and not reason_detail and not body.asset_tag:
+        raise HTTPException(status_code=400, detail="At least one of amount, address, reason_code, reason_detail, or asset_tag required")
 
     sub.updated_at = at
     asset_tag = (body.asset_tag or "").strip() or CORRECTION_REASON_TO_ASSET_TAG.get(reason_code)
@@ -4735,7 +4745,10 @@ async def admin_submission_correction(
         "actor_id": actor_id,
         "at": at_iso,
     }
-    trail_line = f"CORRECTION({at_iso} by {actor_id} reason={reason_code}): {before} -> {after}"
+    if after:
+        trail_line = f"CORRECTION({at_iso} by {actor_id} reason={reason_code}): {before} -> {after}"
+    else:
+        trail_line = f"CORRECTION({at_iso} by {actor_id} reason={reason_code}, reason_only)"
     existing_trail = sub.audit_trail or sub.audit_log or ""
     combined = (existing_trail + " | " + trail_line).strip(" |") if existing_trail else trail_line
     sub.audit_trail = _truncate_submission_audit(combined)

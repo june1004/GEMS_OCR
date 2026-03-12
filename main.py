@@ -4692,6 +4692,22 @@ async def admin_submission_correction(
     db: Session = Depends(get_db),
     ctx: AdminContext = Depends(get_admin_context),
 ):
+    try:
+        return _admin_submission_correction_impl(receiptId, body, request, db, ctx)
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Correction API error (receiptId=%s): %s", receiptId, e)
+        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+
+
+def _admin_submission_correction_impl(
+    receiptId: str,
+    body: AdminCorrectionRequest,
+    request: Request,
+    db: Session,
+    ctx: AdminContext,
+):
     rid = _sanitize_receipt_id(receiptId)
     sub = db.query(Submission).filter(Submission.submission_id == rid).first()
     if not sub:
@@ -4808,22 +4824,25 @@ async def admin_submission_correction(
         "reason_detail": body.reason_detail or body.correction_reason_detail,
         "asset_tag": body.asset_tag,
     }
-    _audit_log(
-        db,
-        actor=ctx.actor,
-        action="submission_correction",
-        target_type="submission",
-        target_id=rid,
-        before_json=before,
-        after_json=payload_for_audit,
-        meta={
-            "reason_code": reason_code,
-            "reason_detail": reason_detail[:200] if reason_detail else None,
-            "asset_tag": asset_tag,
-            "client_ip": _admin_client_ip(request),
-        },
-    )
-    db.commit()
+    try:
+        _audit_log(
+            db,
+            actor=ctx.actor,
+            action="submission_correction",
+            target_type="submission",
+            target_id=rid,
+            before_json=before,
+            after_json=payload_for_audit,
+            meta={
+                "reason_code": reason_code,
+                "reason_detail": reason_detail[:200] if reason_detail else None,
+                "asset_tag": asset_tag,
+                "client_ip": _admin_client_ip(request),
+            },
+        )
+        db.commit()
+    except Exception as audit_err:
+        logger.warning("Correction audit_log failed (receiptId=%s): %s", rid, audit_err)
     return AdminCorrectionResponse(
         receiptId=rid,
         total_amount=sub.total_amount,

@@ -125,7 +125,55 @@ FE가 로컬에 저장하는 구조와 동일한 필드를 API Body로 보냅니
 
 ---
 
-## 6. 관련 문서
+## 6. API 서버(api.nanum.online) 환경 설정
+
+교정 API를 배포한 뒤, **같은 버튼으로 서버 전송**이 되고 "서버에 반영되었습니다."가 나오려면, API 서버에서 **CORS**를 FE 주소로 허용해야 합니다.
+
+### 6.1 등록할 환경 변수
+
+| 환경 변수 | 설명 | 예시 |
+|-----------|------|------|
+| **CORS_ORIGINS** | API를 호출할 수 있는 프론트엔드 **Origin** 목록. 쉼표로 구분. | 아래 참고 |
+
+- **Origin** = 브라우저가 요청을 보내는 페이지의 `프로토콜 + 호스트 + 포트` (예: `https://GEMS.nanum.online`, `http://localhost:8080`).
+- 이 레포 BE는 `CORS_ORIGINS`가 **비어 있으면** 기본 목록(localhost:5173, localhost:8080 등)을 사용하고, **값이 있으면 해당 값으로 완전히 대체**합니다. 따라서 로컬과 운영을 모두 쓰려면 허용할 origin을 **전부** 나열해야 합니다.
+
+### 6.2 설정 예시
+
+| 상황 | CORS_ORIGINS 값 |
+|------|------------------|
+| **현재: 로컬 FE만** (http://localhost:8080에서 api.nanum.online 호출) | `http://localhost:8080` |
+| **향후: FE를 GEMS.nanum.online에 배포** (https://GEMS.nanum.online에서 API 호출) | `https://GEMS.nanum.online` |
+| **로컬 + 운영 동시 허용** | `http://localhost:8080,https://GEMS.nanum.online` |
+
+- 프로토콜(`http` / `https`), 호스트, 포트까지 **실제 FE URL과 동일**하게 적어야 합니다. 끝에 `/` 없이.
+- 예: FE가 `https://GEMS.nanum.online` 이면 `https://GEMS.nanum.online` 만 추가. `https://GEMS.nanum.online/` (슬래시 있음)은 다른 origin으로 인식될 수 있으므로 권장하지 않습니다.
+
+### 6.3 정리
+
+- **지금(localhost):** API 서버에 `CORS_ORIGINS=http://localhost:8080` 설정 → 같은 버튼으로 서버 전송 시 "서버에 반영되었습니다." 동작.
+- **나중에(GEMS.nanum.online):** FE 배포 URL이 정해지면 해당 origin을 `CORS_ORIGINS`에 추가. 로컬도 계속 쓰려면 `http://localhost:8080,https://GEMS.nanum.online` 처럼 쉼표로 함께 등록.
+
+### 6.4 트러블슈팅: "서버 전송 실패 • 로컬에 저장됨" / CORS / 500
+
+**증상:** 저장 클릭 시 "CORS/네트워크 오류로 서버에 보내지 못했습니다" 또는 브라우저 콘솔에  
+`Access to fetch ... has been blocked by CORS policy: No 'Access-Control-Allow-Origin' header` + `500 (Internal Server Error)`.
+
+**원인:** 서버(api.nanum.online)에서 **먼저 500**이 나고, 그 500 응답에 CORS 헤더가 없어서 브라우저가 CORS 오류로 막습니다. 즉, **근본 원인은 500**이고, CORS는 그 결과로 보이는 현상입니다.
+
+**배포 서버에서 확인할 것**
+
+| 순서 | 확인 항목 | 조치 |
+|------|-----------|------|
+| 1 | **이 레포(GEMS_OCR) 최신 코드 배포** | `PATCH /api/v1/admin/submissions/{receiptId}/correction` 라우트와 전역 예외 핸들러가 포함된 버전으로 배포. 이 레포의 main.py는 500 발생 시에도 JSON으로 응답해 CORS가 붙도록 되어 있음. |
+| 2 | **CORS_ORIGINS** | `CORS_ORIGINS=http://localhost:8080` 설정 후 서버 재시작. |
+| 3 | **500 원인 확인** | 서버(컨테이너/호스트) 로그에서 해당 PATCH 요청 시 스택 트레이스 확인. 예: `submission_sidecar` 컬럼 없음 → `PROJECT/migrations/submission_sidecar_correction.sql` 실행, `admin_audit_log` 테이블 없음 → 해당 마이그레이션 적용. |
+
+이 레포 기준으로 교정 API는 예외 시 500도 JSON으로 반환하므로, **동일 코드가 배포되어 있으면** 500이 나더라도 CORS 헤더는 붙어야 합니다. 여전히 CORS만 보인다면 배포 버전이 다르거나, 리버스 프록시/API 게이트웨이에서 500을 직접 반환하는 경우일 수 있습니다.
+
+---
+
+## 7. 관련 문서
 
 - [백엔드_요청사항_정리.md](./백엔드_요청사항_정리.md) – **섹션 10** (데이터 교정 및 Sidecar)
 - [GEMS_표준_수정_반려_사유_분류.md](./GEMS_표준_수정_반려_사유_분류.md) – reason_code·asset_tag 표준 값

@@ -188,8 +188,9 @@
 | **Method** | `GET` |
 | **Path** | `/api/v1/admin/stats/by-region` |
 | **Query** | `sido`(선택), `sigungu`(선택), `from`/`to`(선택, 기간. `dateFrom`/`dateTo` 와 동일), `projectType`(선택: STAY/TOUR) |
-| **Response** | `{ \"level\": \"SIDO|SIGUNGU|SINGLE\", \"scope\": { ... }, \"items\": [ { \"regionCode\", \"regionName\", \"submissionCount\", \"fitCount\", \"totalAmount\" } ] }` |
+| **Response** | `{ "level", "scope", "items": [ { "regionCode", "regionName", "name", "sigungu", "sigunguName", "sigungu_name", "submissionCount", "fitCount", "totalAmount" } ], ... }` |
 | **집계 기준** | submission 당 **첫 장(seq_no=1)** 의 `address/location` 기반(대표 지역) |
+| **시군구 컬럼** | `items[].regionName` 또는 `items[].sigungu` 또는 `items[].sigunguName` 사용 시 시군구/시도명 바로 표시(별도 목록 API 불필요) |
 
 **동작 규칙**
 

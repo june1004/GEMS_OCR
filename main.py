@@ -3389,7 +3389,12 @@ async def admin_maps_svg_url(
 
 class AdminRegionStatsItem(BaseModel):
     regionCode: Optional[str] = None
-    regionName: str
+    regionName: str = Field(..., description="행정구역 표시명(시도명 또는 시군구명)")
+    # FE 시군구 통계 표시용: 시군구 목록 API 없이 바로 이름 표시 (regionName과 동일 값)
+    name: Optional[str] = Field(None, description="표시용 이름. regionName과 동일.")
+    sigungu_name: Optional[str] = Field(None, description="시군구명. level=SIGUNGU/SINGLE일 때 시군구명, SIDO일 때 시도명.")
+    sigunguName: Optional[str] = Field(None, description="시군구명(camelCase). FE 표시용.")
+    sigungu: Optional[str] = Field(None, description="시군구 컬럼 표시용. regionName과 동일.")
     submissionCount: int = 0
     fitCount: int = 0
     totalAmount: int = 0
@@ -3591,10 +3596,15 @@ async def admin_stats_by_region(
                 region_code = found["code"]
                 region_name = found.get("name") or raw
 
+        display_name = region_name or raw
         items.append(
             AdminRegionStatsItem(
                 regionCode=region_code,
-                regionName=region_name,
+                regionName=display_name,
+                name=display_name or None,
+                sigungu_name=display_name or None,
+                sigunguName=display_name or None,
+                sigungu=display_name or None,
                 submissionCount=submission_count,
                 fitCount=fit_count,
                 totalAmount=total_amount,
@@ -6320,20 +6330,34 @@ def map_ocr_to_db(
     return items, total_fit_amount
 
 
-def finalize_submission(submission: Submission, total_amount: int, min_criteria: int, fail_code: Optional[str]) -> None:
+def finalize_submission(
+    submission: Submission,
+    total_amount: int,
+    min_criteria: int,
+    fail_code: Optional[str],
+    total_all_amounts: Optional[int] = None,
+) -> None:
     """
     submission 최종 판정/감사로그 저장 (§10.3).
     - FIT item 금액 합산으로 total_amount 반영(API 금액 = BE가 반영한 값).
     - 최대 3장 중 한 장이라도 정상조건(금액·2026 이벤트 기간 내 날짜 등) 충족 시 FIT 판정.
     - UNFIT_DATE 등 개별 장만의 사유는 합산 기준 충족 시 전체를 UNFIT로 두지 않음.
+    - 장별 금액 합산(total_all_amounts)이 기준 충족인데 BIZ_003만 있으면 FIT 처리(합산 금액 미달 오판 방지).
     """
-    submission.total_amount = total_amount
     submission.updated_at = datetime.utcnow()
     resolved = _normalize_error_code(fail_code) or fail_code
     # §10.3: 한 장이라도 정상이면 FIT. UNFIT_DATE(2026 이벤트 기간 내 유효 날짜)는 FIT을 막지 않음.
-    if total_amount >= min_criteria and resolved in ("UNFIT_CATEGORY", "UNFIT_REGION", "UNFIT_DATE"):
+    # 장별 금액 합산이 기준 충족 시 "합산 금액 미달"(BIZ_003)로 부적합 처리하지 않음.
+    if total_amount >= min_criteria and resolved in ("UNFIT_CATEGORY", "UNFIT_REGION", "UNFIT_DATE", "BIZ_003"):
         resolved = None
-    if not resolved and total_amount >= min_criteria:
+    if resolved == "BIZ_003" and total_all_amounts is not None and total_all_amounts >= min_criteria:
+        resolved = None
+        total_amount = total_all_amounts  # API에 기준 충족 금액 반영
+    amount_ok = total_amount >= min_criteria or (total_all_amounts is not None and total_all_amounts >= min_criteria)
+    submission.total_amount = total_amount
+    if not resolved and amount_ok:
+        if total_amount < min_criteria and total_all_amounts is not None:
+            submission.total_amount = total_all_amounts
         submission.status = "FIT"
         submission.global_fail_reason = None
         submission.fail_reason = None
@@ -6898,6 +6922,10 @@ async def analyze_receipt_task(req: CompleteRequest):
         # 4) 부모 상태 업데이트 (§10.3): total_amount = 장별 FIT 합산(API가 내려줄 금액). 한 장이라도 정상이면 FIT.
         total_amount = sum(it.amount or 0 for it in item_rows if it.status == "FIT")
         min_criteria = min_amount_stay if req.type == "STAY" else min_amount_tour
+        # 장별 금액 합산(전체 item 금액 합): 기준 충족 시 "합산 금액 미달"(BIZ_003) 사유 사용 금지.
+        total_all_amounts = sum(it.amount or 0 for it in item_rows)
+        if fail_code == "BIZ_003" and total_all_amounts >= min_criteria:
+            fail_code = "PENDING_NEW" if pending_new_cnt > 0 else ("PENDING_VERIFICATION" if pending_verification_cnt > 0 else None)
         # 최대 3장 중 한 장이라도 정상조건 충족(금액 기준 이상)이면 FIT 판정.
         condition_met = fit_cnt >= 1 and total_amount >= min_criteria
         if not condition_met:
@@ -6910,7 +6938,7 @@ async def analyze_receipt_task(req: CompleteRequest):
             f"신규상점대기 {pending_new_cnt}매, 수동검증대기 {pending_verification_cnt}매"
         )
 
-        finalize_submission(submission, total_amount, min_criteria, fail_code)
+        finalize_submission(submission, total_amount, min_criteria, fail_code, total_all_amounts=total_all_amounts)
         raw_audit = " | ".join(audit_lines) if audit_lines else (submission.fail_reason or "")
         submission.audit_log = _truncate_submission_audit(raw_audit)
         submission.audit_trail = submission.audit_log

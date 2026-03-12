@@ -28,7 +28,7 @@ from store_classifier import (
 from fastapi import FastAPI, File, Form, HTTPException, BackgroundTasks, Depends, UploadFile, Header, Query, Body, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.openapi.docs import get_swagger_ui_html
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 import bcrypt  # type: ignore[reportMissingImports]
 import jwt
 from pydantic import BaseModel, Field, model_validator, UUID4, ConfigDict
@@ -4578,17 +4578,23 @@ async def admin_get_submission(
     )
 
 
+def _presigned_response_content_type(image_key: str) -> str:
+    """이미지 키 확장자에 맞는 Content-Type. ORB 회피용(§7.1)."""
+    key = (image_key or "").strip().lower()
+    if key.endswith(".png"):
+        return "image/png"
+    if key.endswith((".jpg", ".jpeg")):
+        return "image/jpeg"
+    return "image/jpeg"  # 기본값: 확장자 없거나 기타일 때도 타입 지정으로 ORB 감소
+
+
 def _presigned_get_url_for_key(image_key: str, expires_sec: Optional[int] = None) -> Optional[str]:
-    """이미지 키에 대한 GET용 presigned URL 생성. 목록 썸네일 등에 사용."""
+    """이미지 키에 대한 GET용 presigned URL 생성. 목록 썸네일 등에 사용. §7.1: ResponseContentType 지정으로 ORB 감소."""
     key = (image_key or "").strip()
     if not key:
         return None
     try:
-        params = {"Bucket": S3_BUCKET, "Key": key}
-        if key.lower().endswith(".png"):
-            params["ResponseContentType"] = "image/png"
-        elif key.lower().endswith((".jpg", ".jpeg")):
-            params["ResponseContentType"] = "image/jpeg"
+        params = {"Bucket": S3_BUCKET, "Key": key, "ResponseContentType": _presigned_response_content_type(key)}
         return s3_client.generate_presigned_url(
             "get_object",
             Params=params,
@@ -4603,6 +4609,7 @@ class AdminReceiptImageItem(BaseModel):
     doc_type: Optional[str] = None
     image_key: str
     image_url: str
+    image_proxy_url: Optional[str] = Field(None, description="§7.1 ORB 회피: 같은 오리진 프록시 URL. 있으면 <img src>에 이 URL 사용 권장.")
 
 
 class AdminReceiptImagesResponse(BaseModel):
@@ -4612,10 +4619,50 @@ class AdminReceiptImagesResponse(BaseModel):
 
 
 @app.get(
+    "/api/v1/admin/receipts/{receiptId}/images/{itemId}/bytes",
+    response_class=Response,
+    summary="이미지 바이트 프록시 (ORB 회피, §7.1)",
+    description="같은 오리진으로 이미지를 스트리밍. Content-Type 올바르게 설정해 ERR_BLOCKED_BY_ORB 방지. FE는 image_proxy_url로 이 엔드포인트 사용 권장.",
+    tags=["Admin - Submissions"],
+)
+async def admin_receipt_image_bytes(
+    receiptId: str,
+    itemId: str,
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    rid = _sanitize_receipt_id(receiptId)
+    sub = db.query(Submission).filter(Submission.submission_id == rid).first()
+    if not sub:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    if not ctx.is_super and ctx.campaign_ids and (sub.campaign_id or 0) not in ctx.campaign_ids:
+        raise HTTPException(status_code=404, detail="Submission not found")
+    item = (
+        db.query(ReceiptItem)
+        .filter(ReceiptItem.submission_id == rid, ReceiptItem.item_id == itemId.strip())
+        .first()
+    )
+    if not item or not (item.image_key or "").strip():
+        raise HTTPException(status_code=404, detail="Image not found")
+    try:
+        body, content_type = _get_image_bytes_from_s3((item.image_key or "").strip())
+        if not content_type or content_type == "application/octet-stream":
+            content_type = _presigned_response_content_type(item.image_key or "")
+        return Response(
+            content=body,
+            media_type=content_type,
+            headers={"X-Content-Type-Options": "nosniff"},
+        )
+    except Exception as e:
+        logger.warning("admin_receipt_image_bytes S3 read failed receiptId=%s itemId=%s: %s", rid, itemId, e)
+        raise HTTPException(status_code=502, detail="Failed to load image from storage")
+
+
+@app.get(
     "/api/v1/admin/receipts/{receiptId}/images",
     response_model=AdminReceiptImagesResponse,
     summary="신청 이미지 presigned GET(관리자)",
-    description="증거 보기(모달) 시 호출. 열람 이력(관리자 ID, 시각, IP, receiptId)을 감사 로그에 기록.",
+    description="증거 보기(모달) 시 호출. 열람 이력(관리자 ID, 시각, IP, receiptId)을 감사 로그에 기록. §7.1: image_proxy_url 제공 시 ORB 회피용으로 사용 권장.",
     tags=["Admin - Submissions"],
 )
 async def admin_get_receipt_images(
@@ -4650,23 +4697,16 @@ async def admin_get_receipt_images(
         key = (it.image_key or "").strip()
         if not key:
             continue
-        params = {"Bucket": S3_BUCKET, "Key": key}
-        # 저장 시 Content-Type이 잘못돼 있어도 브라우저가 이미지로 렌더하도록 응답 타입 지정
-        if key.lower().endswith(".png"):
-            params["ResponseContentType"] = "image/png"
-        elif key.lower().endswith((".jpg", ".jpeg")):
-            params["ResponseContentType"] = "image/jpeg"
-        url = s3_client.generate_presigned_url(
-            "get_object",
-            Params=params,
-            ExpiresIn=PRESIGNED_URL_EXPIRES_SEC,
-        )
+        params = {"Bucket": S3_BUCKET, "Key": key, "ResponseContentType": _presigned_response_content_type(key)}
+        url = s3_client.generate_presigned_url("get_object", Params=params, ExpiresIn=PRESIGNED_URL_EXPIRES_SEC)
+        proxy_path = f"/api/v1/admin/receipts/{rid}/images/{it.item_id}/bytes"
         items.append(
             AdminReceiptImageItem(
                 item_id=str(it.item_id),
                 doc_type=it.doc_type,
                 image_key=key,
                 image_url=url,
+                image_proxy_url=proxy_path,
             )
         )
     return AdminReceiptImagesResponse(receiptId=rid, expiresIn=PRESIGNED_URL_EXPIRES_SEC, items=items)

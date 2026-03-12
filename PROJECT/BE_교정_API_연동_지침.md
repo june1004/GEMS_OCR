@@ -15,6 +15,11 @@
 
 - 이 레포 BE는 `main.py`에서 전역 예외 핸들러를 두어 500 시에도 JSON + CORS가 적용되도록 되어 있습니다. 배포 시 동일 코드 적용이 필요합니다.
 
+**500이 계속 날 때:** 배포 서버(api.nanum.online 등)에서 다음을 확인하세요.
+- **이 레포의 교정 라우트가 배포되어 있는지** (`PATCH …/correction` 핸들러 포함 여부)
+- **DB 스키마:** `submissions` 테이블에 `receipt_id`(UUID), `total_amount`(BIGINT) 컬럼이 있는지. `admin_audit_log` 테이블이 있으면 감사 로그까지 기록되며, **없어도** 교정 API는 200을 반환하도록 되어 있음(감사 로그만 스킵).
+- **서버 로그:** 500 발생 시 백엔드 로그에 `correction: db error` 또는 `correction: unexpected error`가 남으므로, 해당 로그로 원인 확인.
+
 ---
 
 ## 1. 현재 FE 동작
@@ -22,15 +27,17 @@
 | 구분 | 내용 |
 |------|------|
 | API 호출 | `PATCH /api/v1/admin/submissions/:receiptId/correction` (인증 헤더 포함) |
-| 성공 시 | 로컬 캐시(localStorage) 저장 + 토스트 "서버에 반영되었습니다." |
-| 실패 시 | 토스트 "저장 실패" + 에러 메시지 (CORS/500이면 브라우저에서 네트워크 오류로 표시) |
-| localStorage 키 | `admin_correction_v1:{receiptId}` (API 성공 후 캐시용) |
+| 성공 시 | 로컬 캐시(localStorage) 저장 + 토스트 **"교정 데이터 저장됨"** / "서버에 반영되었습니다." |
+| 실패 시 | **입력값은 항상 로컬에 저장.** 토스트 **"서버 전송 실패 · 로컬에 저장됨"** + 원인 안내(CORS/네트워크 오류 시 별도 문구, 그 외 API 에러 메시지). |
+| localStorage 키 | `admin_correction_v1:{receiptId}` (API 성공 시 캐시, 실패 시에도 로컬 백업용 저장) |
 
 ---
 
-## 2. BE에서 구현할 API
+## 2. BE API 사양 (이 레포에 구현됨)
 
-### 2.1 엔드포인트 (권장)
+이 레포의 `backend/`에는 아래 사양의 교정 API가 구현되어 있습니다. 배포 서버에 동일 코드를 반영하면 됩니다.
+
+### 2.1 엔드포인트
 
 | 항목 | 내용 |
 |------|------|
@@ -82,11 +89,21 @@ FE가 로컬에 저장하는 구조와 동일한 필드를 API Body로 보냅니
      - `asset_tag` (학습 데이터 분류용)
 
 3. **응답**  
-   - 성공: `200 OK` 또는 `204 No Content`.  
-   - 실패: `4xx`/`5xx` + FE에서 토스트 등으로 에러 메시지 표시 가능하도록 메시지 포함 권장.
+   - 성공: `200 OK` + 본문 예: `{"receiptId": "<uuid>", "updated": true}`. 또는 `204 No Content`.  
+   - 실패: `404`(submission 없음), `5xx`(서버 오류) — FE에서 토스트로 에러 메시지 표시.
 
 4. **감사**  
    - 교정 API 호출 시 **수정자 ID, receiptId, 시각** 등 Audit Log 기록을 권장합니다.
+
+### 3.1 이 레포 구현 요약
+
+| 항목 | 동작 |
+|------|------|
+| submission 존재 확인 | `receipt_id::text = :rid`로 조회, 없으면 **404** |
+| total_amount 업데이트 | `payload.amount`가 숫자로 파싱 가능하면 `submissions.total_amount` 갱신 |
+| 감사 로그 | `admin_audit_log`에 `action='submission_correction'`, `after_json`에 payload 기록. **INSERT 실패 시** 로그만 남기고 요청은 **200 성공**으로 반환(테이블 없어도 500 아님). |
+| 응답 | `200 OK` + `{"receiptId": "<receipt_id>", "updated": true}` |
+| 예외 | DB 오류 시 `500` + `detail="Database error during correction"`, 기타 예외 시 `detail="Internal server error during correction"`. 서버 로그에 `correction: db error` / `correction: unexpected error` 기록. |
 
 ---
 
@@ -116,12 +133,12 @@ FE가 로컬에 저장하는 구조와 동일한 필드를 API Body로 보냅니
 
 ## 5. 연동 체크리스트 (BE)
 
-- [ ] `PATCH /api/v1/admin/submissions/:receiptId/correction` (또는 동일 역할의 경로) 구현
-- [ ] Request Body에서 `amount`, `address`, `reason_code`, `reason_detail`, `asset_tag` 수신
-- [ ] Sidecar JSON(또는 동등 저장소)에 `human_correction`, `asset_tag` 기록
-- [ ] (선택) submission 테이블 `total_amount`, 주소 등 업데이트
-- [ ] (권장) 교정 API 호출에 대한 Audit Log 기록
-- [ ] FE 연동: BE 배포 후 FE에서 해당 API 호출로 전환 (localStorage 저장과 병행 또는 대체)
+- [x] `PATCH /api/v1/admin/submissions/:receiptId/correction` — **이 레포에 구현됨**
+- [x] Request Body에서 `amount`, `address`, `reasonId`, `reason_code`, `reason_detail`, `asset_tag` 수신 (`CorrectionIn` 스키마)
+- [ ] Sidecar JSON(또는 동등 저장소)에 `human_correction`, `asset_tag` 기록 — 확장 시 참고(현재는 `admin_audit_log.after_json`에 payload 저장)
+- [x] (선택) submission 테이블 `total_amount` 업데이트 — **구현됨** (amount 파싱 가능 시)
+- [x] (권장) 교정 API 호출에 대한 Audit Log 기록 — **구현됨** (`admin_audit_log`, 실패 시에도 200 반환)
+- [x] FE 연동: FE는 이미 해당 API를 호출함. BE 배포 및 `CORS_ORIGINS` 설정만 확인하면 됨.
 
 ---
 
@@ -136,7 +153,7 @@ FE가 로컬에 저장하는 구조와 동일한 필드를 API Body로 보냅니
 | **CORS_ORIGINS** | API를 호출할 수 있는 프론트엔드 **Origin** 목록. 쉼표로 구분. | 아래 참고 |
 
 - **Origin** = 브라우저가 요청을 보내는 페이지의 `프로토콜 + 호스트 + 포트` (예: `https://GEMS.nanum.online`, `http://localhost:8080`).
-- 이 레포 BE는 `CORS_ORIGINS`가 **비어 있으면** 기본 목록(localhost:5173, localhost:8080 등)을 사용하고, **값이 있으면 해당 값으로 완전히 대체**합니다. 따라서 로컬과 운영을 모두 쓰려면 허용할 origin을 **전부** 나열해야 합니다.
+- 이 레포 BE는 `CORS_ORIGINS`가 **비어 있으면** 기본 목록(`http://localhost:8080`, `http://169.254.240.5:8080`)을 사용하고, **값이 있으면 해당 값으로 완전히 대체**합니다. 따라서 로컬과 운영을 모두 쓰려면 허용할 origin을 **전부** 나열해야 합니다.
 
 ### 6.2 설정 예시
 
@@ -167,9 +184,9 @@ FE가 로컬에 저장하는 구조와 동일한 필드를 API Body로 보냅니
 |------|-----------|------|
 | 1 | **이 레포(GEMS_OCR) 최신 코드 배포** | `PATCH /api/v1/admin/submissions/{receiptId}/correction` 라우트와 전역 예외 핸들러가 포함된 버전으로 배포. 이 레포의 main.py는 500 발생 시에도 JSON으로 응답해 CORS가 붙도록 되어 있음. |
 | 2 | **CORS_ORIGINS** | `CORS_ORIGINS=http://localhost:8080` 설정 후 서버 재시작. |
-| 3 | **500 원인 확인** | 서버(컨테이너/호스트) 로그에서 해당 PATCH 요청 시 스택 트레이스 확인. 예: `submission_sidecar` 컬럼 없음 → `PROJECT/migrations/submission_sidecar_correction.sql` 실행, `admin_audit_log` 테이블 없음 → 해당 마이그레이션 적용. |
+| 3 | **500 원인 확인** | 500 응답 본문에 `receiptId`가 포함됨. 서버 로그에서 `Correction API error (receiptId=...)` 또는 `Correction commit failed (receiptId=...)` 로 검색. **흔한 원인:** (1) `submission_sidecar` 컬럼 없음 → `PROJECT/migrations/submission_sidecar_correction.sql` 적용, (2) `submissions.audit_trail`/`audit_log` 컬럼 없음, (3) `admin_audit_log` 테이블 없음(이 경우에도 교정 저장은 200으로 성공하고 감사 로그만 경고), (4) DB 연결/타임아웃. |
 
-이 레포 기준으로 교정 API는 예외 시 500도 JSON으로 반환하므로, **동일 코드가 배포되어 있으면** 500이 나더라도 CORS 헤더는 붙어야 합니다. 여전히 CORS만 보인다면 배포 버전이 다르거나, 리버스 프록시/API 게이트웨이에서 500을 직접 반환하는 경우일 수 있습니다.
+이 레포 기준으로 교정 API는 (1) 요청 본문을 raw JSON으로 수락해 검증 실패(422) 가능성을 줄였고, (2) 예외 시 500도 `{"detail":"Internal server error","receiptId":"..."}` 형태로 JSON 반환하므로 CORS 헤더가 붙습니다. **동일 코드가 배포되어 있으면** 500이 나더라도 CORS로 막히지 않고, FE에서 receiptId를 활용해 사용자에게 안내할 수 있습니다. 여전히 CORS만 보인다면 배포 버전이 다르거나, 리버스 프록시/API 게이트웨이에서 500을 직접 반환하는 경우일 수 있습니다.
 
 ---
 

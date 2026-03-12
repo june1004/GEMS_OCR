@@ -46,6 +46,8 @@ logging.basicConfig(
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
 )
 logger = logging.getLogger(__name__)
+# httpx INFO 로그에 API URL·쿼리(key= 등)가 포함될 수 있으므로 WARNING으로 제한
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 # 1. 인프라 설정 (환경 변수)
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -995,6 +997,13 @@ async def get_presigned_url(
     content_type_for_signing = (contentType or "").strip() or "image/jpeg"
     user_uuid = _normalize_user_uuid(userUuid)
     receipt_id = receiptId or str(uuid.uuid4())
+    # FE가 fileName을 undefined로 보내는 경우 대비 (로그: fileName=undefined-.jpeg). S3 key에 /, \ 사용 방지.
+    _fn = (fileName or "").strip().replace("\\", "_").replace("/", "_")
+    if not _fn or _fn.lower().startswith("undefined") or _fn == "-":
+        ext = "jpg" if "png" not in (content_type_for_signing or "").lower() else "png"
+        fileName = f"upload-{uuid.uuid4().hex[:12]}.{ext}"
+    else:
+        fileName = _fn
     # MinIO STAY/TOUR 폴더 분기: type으로 저장 경로 결정 → OCR 시 경로 기반 모델 선택
     raw = type.value if hasattr(type, "value") else str(type)
     prefix = (raw or "TOUR").strip().upper()
@@ -4655,6 +4664,40 @@ CORRECTION_REASON_TO_ASSET_TAG = {
 }
 
 
+def _parse_correction_body(d: Any) -> "AdminCorrectionRequest":
+    """FE가 보낸 raw dict를 AdminCorrectionRequest와 동일한 인터페이스로 파싱. 검증 실패·형식 오류 시에도 500 방지."""
+    if d is None:
+        d = {}
+    if not isinstance(d, dict):
+        d = {}
+    raw_amount = d.get("amount") if d.get("amount") is not None else d.get("total_amount")
+    raw_total = d.get("total_amount")
+    if raw_total is not None and isinstance(raw_total, (int, float)):
+        total_amount = int(raw_total)
+    elif raw_amount is not None and isinstance(raw_amount, (int, float)):
+        total_amount = int(raw_amount)
+    else:
+        total_amount = None
+    addr = d.get("address")
+    address = (addr.strip() if isinstance(addr, str) and addr else None) or None
+    def _str(v: Any) -> Optional[str]:
+        if v is None: return None
+        s = (v.strip() if isinstance(v, str) else str(v)).strip() or None
+        return s
+    return AdminCorrectionRequest(
+        amount=raw_amount,
+        total_amount=total_amount,
+        address=address,
+        reasonId=_str(d.get("reasonId")),
+        reason_code=_str(d.get("reason_code")),
+        correction_reason_code=_str(d.get("correction_reason_code")),
+        reason_detail=_str(d.get("reason_detail")),
+        correction_reason_detail=_str(d.get("correction_reason_detail")),
+        asset_tag=_str(d.get("asset_tag")),
+        audit=d.get("audit") if isinstance(d.get("audit"), dict) else None,
+    )
+
+
 class AdminCorrectionRequest(BaseModel):
     """BE_교정_API_연동_지침·백엔드_요청사항_정리 §10.1. FE payload: amount, address, reasonId, reason_code, reason_detail, asset_tag (모두 선택)."""
     amount: Optional[Union[str, int]] = Field(None, description="담당자 확정 금액(문자열 또는 숫자). FE는 문자열로 전송")
@@ -4687,18 +4730,28 @@ class AdminCorrectionResponse(BaseModel):
 )
 async def admin_submission_correction(
     receiptId: str,
-    body: AdminCorrectionRequest,
     request: Request,
     db: Session = Depends(get_db),
     ctx: AdminContext = Depends(get_admin_context),
 ):
+    # FE payload를 raw dict로 수락해 검증 오류로 422/500 나는 경우 최소화 (수동 파싱)
+    try:
+        raw_body = await request.json()
+    except Exception:
+        raw_body = {}
+    if not isinstance(raw_body, dict):
+        raw_body = {}
+    body = _parse_correction_body(raw_body)
     try:
         return _admin_submission_correction_impl(receiptId, body, request, db, ctx)
     except HTTPException:
         raise
     except Exception as e:
         logger.exception("Correction API error (receiptId=%s): %s", receiptId, e)
-        return JSONResponse(status_code=500, content={"detail": "Internal server error"})
+        return JSONResponse(
+            status_code=500,
+            content={"detail": "Internal server error", "receiptId": receiptId},
+        )
 
 
 def _admin_submission_correction_impl(
@@ -4814,8 +4867,13 @@ def _admin_submission_correction_impl(
             e,
         )
 
-    db.commit()
-    db.refresh(sub)
+    try:
+        db.commit()
+        db.refresh(sub)
+    except Exception as commit_err:
+        db.rollback()
+        logger.exception("Correction commit failed (receiptId=%s): %s", rid, commit_err)
+        raise
     payload_for_audit = {
         "amount": body.amount,
         "address": body.address,

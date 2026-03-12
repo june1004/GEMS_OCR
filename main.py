@@ -4866,6 +4866,15 @@ def _admin_submission_correction_impl(
             rid,
             e,
         )
+        # Sidecar 실패 시 트랜잭션이 중단된 상태가 되므로 rollback 후 교정값만 다시 적용해 commit 가능하게 함
+        db.rollback()
+        if after.get("total_amount") is not None:
+            sub.total_amount = after["total_amount"]
+        sub.audit_trail = _truncate_submission_audit(combined)
+        sub.audit_log = sub.audit_trail
+        sub.updated_at = at
+        if first_item and after.get("address") is not None:
+            first_item.address = after["address"]
 
     try:
         db.commit()

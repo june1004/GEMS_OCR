@@ -5165,6 +5165,7 @@ async def admin_reprocess_submission(
         fail_code,
         total_all_amounts=total_all_amounts,
         unknown_store_policy=getattr(rule_cfg, "unknown_store_policy", None),
+        item_rows=item_rows,
     )
     reprocess_line = f"REPROCESS({datetime.utcnow().isoformat()}): 정책/로직 반영 재적용(OCR 미호출)"
     existing = submission.audit_trail or submission.audit_log or ""
@@ -6519,6 +6520,7 @@ def finalize_submission(
     fail_code: Optional[str],
     total_all_amounts: Optional[int] = None,
     unknown_store_policy: Optional[str] = None,
+    item_rows: Optional[List[Any]] = None,
 ) -> None:
     """
     submission 최종 판정/감사로그 저장 (§10.3).
@@ -6527,6 +6529,7 @@ def finalize_submission(
     - UNFIT_DATE 등 개별 장만의 사유는 합산 기준 충족 시 전체를 UNFIT로 두지 않음.
     - 장별 금액 합산(total_all_amounts)이 기준 충족인데 BIZ_003만 있으면 FIT 처리(합산 금액 미달 오판 방지).
     - 금액 충족인데 유일 사유가 PENDING_NEW이고 정책이 자동처리(AUTO_REGISTER)면 FIT 처리(에러 아님).
+    - 자동처리로 FIT 올릴 때 item_rows의 PENDING_NEW 장도 FIT으로 통일해 FE에서 에러로 안 보이게 함.
     """
     submission.updated_at = datetime.utcnow()
     resolved = _normalize_error_code(fail_code) or fail_code
@@ -6538,6 +6541,7 @@ def finalize_submission(
         resolved = None
         total_amount = total_all_amounts  # API에 기준 충족 금액 반영
     # 금액 충족 + 신규상점(PENDING_NEW)만 있는 경우, 자동처리 정책이면 FIT으로 판정(에러로 두지 않음)
+    pending_new_upgraded = False
     if (
         resolved == "PENDING_NEW"
         and total_all_amounts is not None
@@ -6546,6 +6550,7 @@ def finalize_submission(
     ):
         resolved = None
         total_amount = total_all_amounts
+        pending_new_upgraded = True
     amount_ok = total_amount >= min_criteria or (total_all_amounts is not None and total_all_amounts >= min_criteria)
     submission.total_amount = total_amount
     if not resolved and amount_ok:
@@ -6554,6 +6559,13 @@ def finalize_submission(
         submission.status = "FIT"
         submission.global_fail_reason = None
         submission.fail_reason = None
+        # 자동처리로 PENDING_NEW → FIT 올린 경우, 장(ReceiptItem)도 FIT으로 통일해 FE에서 에러 박스 안 나오게
+        if pending_new_upgraded and item_rows:
+            for it in item_rows:
+                if getattr(it, "status", None) == "PENDING_NEW":
+                    it.status = "FIT"
+                    it.error_code = None
+                    it.error_message = None
     elif resolved in ("PENDING_NEW", "PENDING_VERIFICATION"):
         submission.status = resolved
         reason = _truncate_submission_reason(_global_fail_reason(resolved))
@@ -7147,6 +7159,7 @@ async def analyze_receipt_task(req: CompleteRequest):
             fail_code,
             total_all_amounts=total_all_amounts,
             unknown_store_policy=getattr(rule_cfg, "unknown_store_policy", None),
+            item_rows=item_rows,
         )
         raw_audit = " | ".join(audit_lines) if audit_lines else (submission.fail_reason or "")
         submission.audit_log = _truncate_submission_audit(raw_audit)

@@ -200,7 +200,7 @@ FE가 로컬에 저장하는 구조와 동일한 필드를 API Body로 보냅니
 | **동일 API 사용** | 증거 확인·판정 규칙 모두 같은 Admin API(`GET/PUT /api/v1/admin/rules/judgment`)를 사용하는지 확인. 배포 서버(api.nanum.online 등)에 해당 라우트와 `judgment_rule_config` 테이블이 있어야 합니다. |
 | **BE 저장 여부** | 판정 규칙 저장 시 `PUT /api/v1/admin/rules/judgment`가 200으로 성공하는지, 배포 서버 DB에 `judgment_rule_config.unknown_store_policy = 'AUTO_REGISTER'`가 반영되는지 확인. |
 
-이 레포의 `backend/app/api/v1/routes/admin_rules.py`에는 GET/PUT이 구현되어 있으며, 기본값은 `PENDING_NEW`입니다. 테이블이 없거나 PUT이 실패하면 GET이 기본값을 반환해 "검수자 수동 처리"로 보일 수 있습니다.
+이 레포(main.py)에서는 **기본값이 `AUTO_REGISTER`**(자동 처리)이며, GET/PUT은 `/api/v1/admin/rules/judgment`에서 제공합니다. 증거 확인 화면에서 "검수자 수동 처리"로 보인다면 (1) **GET /api/v1/admin/submissions/{receiptId}** 응답의 **judgmentRule.newStoreProcessingLabel** 또는 **judgmentRule.unknownStorePolicy**를 사용해 표시하면, 저장된 규칙과 일치합니다. (2) 판정 규칙 GET 응답의 **newStoreProcessingLabel**을 그대로 표시해도 됩니다. FE가 `unknownStorePolicy === "AUTO_REGISTER"`일 때 "자동 처리"로 매핑하면 됩니다.
 
 ---
 

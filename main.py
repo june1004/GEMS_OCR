@@ -1316,10 +1316,31 @@ def _parse_city_county_from_address(address: Optional[str]) -> Optional[str]:
 
 
 def _normalize_unknown_store_policy(raw: Optional[str]) -> str:
-    s = (raw or "").strip().upper()
-    if s in ("PENDING_NEW", "AUTO_REGISTER"):
-        return s
+    """FE에서 '자동처리'/'auto' 등으로 보내도 AUTO_REGISTER로 저장. '검수자 수동'/'manual' 등은 PENDING_NEW."""
+    s = (raw or "").strip()
+    if not s:
+        return "AUTO_REGISTER"
+    u = s.upper()
+    if u in ("PENDING_NEW", "AUTO_REGISTER"):
+        return u
+    # FE 한글/영문 표기 수용
+    if u in ("AUTO", "MANUAL"):
+        return "AUTO_REGISTER" if u == "AUTO" else "PENDING_NEW"
+    if "자동" in s or "AUTO" in u or s in ("자동처리", "자동 처리"):
+        return "AUTO_REGISTER"
+    if "수동" in s or "MANUAL" in u or "검수" in s or "PENDING" in u:
+        return "PENDING_NEW"
     return "AUTO_REGISTER"
+
+
+def _unknown_store_policy_display(policy: str) -> str:
+    """신규상점확인항목 등에서 그대로 쓸 표시 문구. FE가 매핑 실수하지 않도록 BE가 내려줌."""
+    p = _normalize_unknown_store_policy(policy)
+    return (
+        "자동 처리 (미등록 상점 테이블에 자동 등록)"
+        if p == "AUTO_REGISTER"
+        else "검수자 수동 처리 (PENDING_NEW)"
+    )
 
 
 def _get_judgment_rule_config(db: Session) -> JudgmentRuleConfig:
@@ -2951,6 +2972,7 @@ def _minutes_from_value_unit(value: int, unit: str) -> int:
 class JudgmentRuleConfigResponse(BaseModel):
     unknown_store_policy: str = Field(..., description="기본: AUTO_REGISTER(자동 상점추가). 검수 대기 시에만: PENDING_NEW(신규상점 검수 대기)")
     unknownStorePolicy: Optional[str] = Field(None, description="FE 표시용 camelCase. unknown_store_policy와 동일.")
+    newStoreProcessingLabel: Optional[str] = Field(None, description="신규상점확인항목 표시용. '자동 처리 (...)' | '검수자 수동 처리 (PENDING_NEW)'")
     auto_register_threshold: float = Field(..., description="0.0~1.0")
     enable_gemini_classifier: bool = Field(..., description="신규 상점 분류 시 Gemini 사용 여부")
     min_amount_stay: int = Field(..., description="STAY 최소 금액")
@@ -2997,6 +3019,7 @@ async def get_judgment_rule_config(db: Session = Depends(get_db), actor: str = D
     return JudgmentRuleConfigResponse(
         unknown_store_policy=policy,
         unknownStorePolicy=policy,
+        newStoreProcessingLabel=_unknown_store_policy_display(cfg.unknown_store_policy),
         auto_register_threshold=float(cfg.auto_register_threshold or 0.90),
         enable_gemini_classifier=bool(cfg.enable_gemini_classifier),
         min_amount_stay=int(cfg.min_amount_stay or 60000),
@@ -3091,8 +3114,11 @@ async def update_judgment_rule_config(
         after_json=after,
     )
     db.commit()
+    policy_after = _normalize_unknown_store_policy(cfg.unknown_store_policy)
     return JudgmentRuleConfigResponse(
-        unknown_store_policy=_normalize_unknown_store_policy(cfg.unknown_store_policy),
+        unknown_store_policy=policy_after,
+        unknownStorePolicy=policy_after,
+        newStoreProcessingLabel=_unknown_store_policy_display(cfg.unknown_store_policy),
         auto_register_threshold=float(cfg.auto_register_threshold or 0.90),
         enable_gemini_classifier=bool(cfg.enable_gemini_classifier),
         min_amount_stay=int(cfg.min_amount_stay or 60000),
@@ -4414,6 +4440,7 @@ class AdminSubmissionDetailResponse(BaseModel):
     receiptId: str
     submission: Dict[str, Any]
     statusPayload: Dict[str, Any]
+    judgmentRule: Optional[Dict[str, Any]] = Field(None, description="현재 판정 규칙(신규상점 정책). 증거 확인 화면에서 '자동처리' 표시용.")
 
 
 def _build_status_payload_admin(submission: Submission, item_rows: List[ReceiptItem]) -> Dict[str, Any]:
@@ -4475,6 +4502,13 @@ async def admin_get_submission(
         .all()
     )
     status_payload = _build_status_payload_admin(submission, item_rows)
+    cfg = _get_judgment_rule_config(db)
+    policy = _normalize_unknown_store_policy(cfg.unknown_store_policy)
+    judgment_rule = {
+        "unknown_store_policy": policy,
+        "unknownStorePolicy": policy,
+        "newStoreProcessingLabel": _unknown_store_policy_display(cfg.unknown_store_policy),
+    }
     return AdminSubmissionDetailResponse(
         receiptId=rid,
         submission={
@@ -4491,6 +4525,7 @@ async def admin_get_submission(
             "user_input_snapshot": getattr(submission, "user_input_snapshot", None),
         },
         statusPayload=status_payload,
+        judgmentRule=judgment_rule,
     )
 
 

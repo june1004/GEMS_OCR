@@ -4800,14 +4800,22 @@ async def admin_submission_correction(
 
     db.commit()
     db.refresh(sub)
+    payload_for_audit = {
+        "amount": body.amount,
+        "address": body.address,
+        "reasonId": body.reasonId,
+        "reason_code": body.reason_code or body.correction_reason_code,
+        "reason_detail": body.reason_detail or body.correction_reason_detail,
+        "asset_tag": body.asset_tag,
+    }
     _audit_log(
         db,
         actor=ctx.actor,
-        action="CORRECTION",
+        action="submission_correction",
         target_type="submission",
         target_id=rid,
         before_json=before,
-        after_json=after,
+        after_json=payload_for_audit,
         meta={
             "reason_code": reason_code,
             "reason_detail": reason_detail[:200] if reason_detail else None,

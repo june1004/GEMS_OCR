@@ -144,7 +144,7 @@ class Submission(Base):
     fail_reason = Column(String)
     audit_log = Column(String)
     user_input_snapshot = Column(JSONB, nullable=True)  # Complete 시 FE가 보낸 data (방식2: items[])
-    # submission_sidecar(JSONB): §10 교정 이력. migration 적용 시 존재 (submission_sidecar_correction.sql)
+    submission_sidecar = Column(JSONB, nullable=True)  # §10 교정 이력. migration: submission_sidecar_correction.sql
     # Presigned 발급 횟수: TOUR 3매·STAY 2매 제한 적용용 (migration: presigned_issued_count.sql)
     presigned_issued_count = Column(Integer, default=0, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
@@ -3991,8 +3991,13 @@ async def admin_list_submissions(
             raise HTTPException(status_code=400, detail="Invalid from/dateFrom")
     if end_raw:
         try:
-            dt = dateutil_parser.parse(end_raw)
-            q = q.filter(date_field <= dt)
+            to_dt = dateutil_parser.parse(end_raw)
+            # 종료일 당일 전체 포함: "2026-03-12" → 2026-03-13 00:00:00 미만 (일자별 접수 추이·대시보드 정확 집계)
+            if getattr(to_dt, "hour", 0) == 0 and getattr(to_dt, "minute", 0) == 0:
+                to_end = to_dt + timedelta(days=1)
+                q = q.filter(date_field < to_end)
+            else:
+                q = q.filter(date_field <= to_dt)
         except Exception:
             raise HTTPException(status_code=400, detail="Invalid to/dateTo")
     if regionCode and (regionCode := regionCode.strip()):
@@ -4051,7 +4056,11 @@ async def admin_list_submissions(
                 pass
         if end_raw:
             try:
-                sq = sq.filter(date_field <= dateutil_parser.parse(end_raw))
+                to_dt = dateutil_parser.parse(end_raw)
+                if getattr(to_dt, "hour", 0) == 0 and getattr(to_dt, "minute", 0) == 0:
+                    sq = sq.filter(date_field < to_dt + timedelta(days=1))
+                else:
+                    sq = sq.filter(date_field <= to_dt)
             except Exception:
                 pass
         if regionCode and (regionCode := (regionCode or "").strip()):
@@ -4225,7 +4234,7 @@ async def admin_bulk_reject(
     return AdminBulkRejectResponse(processed=len(processed), skipped=skipped, failed=failed)
 
 
-# 5-3-1. 대시보드 집계 API
+# 5-3-1. 대시보드 집계 API (상태별_집계_디자인_지침 §2·§4 연동)
 class AdminDashboardStatsResponse(BaseModel):
     todayCount: int = 0
     yesterdayCount: int = 0
@@ -4233,6 +4242,10 @@ class AdminDashboardStatsResponse(BaseModel):
     approvedAmountSum: int = 0
     byCategory: Dict[str, int] = Field(default_factory=dict, description="STAY, TOUR 등 유형별 건수")
     dailyCounts: List[Dict[str, Any]] = Field(default_factory=list, description="[{ date, count }] 일자별 제출 건수")
+    byStatus: Dict[str, int] = Field(default_factory=dict, description="상태별 건수(FIT, UNFIT, PENDING_VERIFICATION 등). Status Cards·Reason Analysis 도넛용")
+    minAmountStay: int = Field(60000, description="캠페인 정책 STAY 최소 금액(원). Policy Chart·정책 대비 달성률용")
+    minAmountTour: int = Field(50000, description="캠페인 정책 TOUR 최소 금액(원)")
+    lastAggregatedAt: Optional[str] = Field(None, description="마지막 집계 시각(ISO). FE '마지막 집계: MM/dd HH:mm' 표기용")
 
 
 @app.get(
@@ -4351,6 +4364,19 @@ async def admin_dashboard_stats(
                 daily.append({"date": k, "count": v})
     except Exception:
         pass
+    by_status: Dict[str, int] = {}
+    try:
+        for row in (
+            base_q.with_entities(Submission.status, func.count(Submission.submission_id))
+            .group_by(Submission.status)
+            .all()
+        ):
+            key = (row[0] or "UNKNOWN").strip() or "UNKNOWN"
+            by_status[key] = row[1]
+    except Exception:
+        pass
+    min_stay, min_tour = _admin_min_amounts_from_config(db)
+    last_agg = datetime.utcnow().isoformat() + "Z"
     return AdminDashboardStatsResponse(
         todayCount=today_count,
         yesterdayCount=yesterday_count,
@@ -4358,15 +4384,20 @@ async def admin_dashboard_stats(
         approvedAmountSum=int(approved_sum),
         byCategory=by_category,
         dailyCounts=daily,
+        byStatus=by_status,
+        minAmountStay=min_stay,
+        minAmountTour=min_tour,
+        lastAggregatedAt=last_agg,
     )
 
 
 class AdminAssetizationKpiResponse(BaseModel):
-    """데이터 자산화 대시보드 KPI (백엔드_요청사항_정리 §11). 미집계 시 null/0 placeholder."""
+    """데이터 자산화 대시보드 KPI (백엔드_요청사항_정리 §11, 상태별_집계_디자인_지침 §3). 미집계 시 null/0 placeholder."""
     ocrAccuracyRaw: Optional[float] = Field(None, description="OCR 인식 정확도(Raw): 수정 없이 AI 판독값 그대로 승인된 비율")
     correctionRateByField: Optional[Dict[str, float]] = Field(None, description="필드별 교정률 (금액/일시/주소)")
+    humanCorrectionCount: Optional[int] = Field(None, description="교정 이력(Sidecar human_correction) 있는 건수. AI 자산화·교정률 KPI용")
     confidenceVsCorrectionMatch: Optional[float] = Field(None, description="신뢰도-정답 일치도")
-    goldenDatasetCount: Optional[int] = Field(None, description="골든 데이터셋 누적 건수")
+    goldenDatasetCount: Optional[int] = Field(None, description="골든 데이터셋: FIT이며 Sidecar human_correction 완비 건수")
     reTrainingRequiredRatio: Optional[float] = Field(None, description="재학습 필요 비중 (asset_tag=RE_TRAINING_REQUIRED)")
     autoJudgmentAcceptRate: Optional[float] = Field(None, description="자동 판정 처리율")
     reviewLeadTimeHours: Optional[float] = Field(None, description="검수 리드타임(제출~승인 평균 시간, 시간)")
@@ -4407,15 +4438,29 @@ async def admin_dashboard_assetization(
             q = q.filter(Submission.created_at <= dateutil_parser.parse(to))
         except Exception:
             pass
-    # placeholder: 승인 건 중 human_correction(sidecar) 없는 비율 등 추후 구현
     fit_count = q.filter(Submission.status == "FIT").count()
     total_reviewed = q.filter(Submission.status.in_(["FIT", "UNFIT", "UNFIT_REGION", "UNFIT_DATE", "UNFIT_CATEGORY", "UNFIT_DUPLICATE", "ERROR"])).count()
     ocr_accuracy = (fit_count / total_reviewed * 100.0) if total_reviewed else None
+    human_correction_count: Optional[int] = None
+    golden_count: Optional[int] = None
+    try:
+        if getattr(Submission, "submission_sidecar", None) is not None:
+            q_sidecar = q.filter(Submission.submission_sidecar.isnot(None))
+            human_correction_count = q_sidecar.filter(Submission.submission_sidecar.op("?")("human_correction")).count()
+            golden_count = (
+                q.filter(Submission.status == "FIT")
+                .filter(Submission.submission_sidecar.isnot(None))
+                .filter(Submission.submission_sidecar.op("?")("human_correction"))
+                .count()
+            )
+    except Exception:
+        pass
     return AdminAssetizationKpiResponse(
         ocrAccuracyRaw=round(ocr_accuracy, 2) if ocr_accuracy is not None else None,
         correctionRateByField=None,
+        humanCorrectionCount=human_correction_count,
         confidenceVsCorrectionMatch=None,
-        goldenDatasetCount=None,
+        goldenDatasetCount=golden_count,
         reTrainingRequiredRatio=None,
         autoJudgmentAcceptRate=None,
         reviewLeadTimeHours=None,

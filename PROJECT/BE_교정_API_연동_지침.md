@@ -81,7 +81,7 @@ FE가 로컬에 저장하는 구조와 동일한 필드를 API Body로 보냅니
    - `receiptId`: 교정 대상 제출(영수증) ID (UUID).
 
 2. **처리 내용**  
-   - (선택) 해당 submission의 `total_amount`, `address` 등 DB 컬럼 업데이트.  
+   - (선택) 해당 submission의 `total_amount`(또는 별도 `final_amount` 컬럼), `address` 등 DB 컬럼 업데이트. 목록 API에서 **최종 확정 금액**을 내려줄 수 있도록, 교정 저장 시 반영 필요. (목록 표시: [§10.5 목록 금액](./백엔드_요청사항_정리.md#105-목록-금액-최종-확정교정-금액-반영))  
    - **Sidecar JSON**에 교정 이력 기록:
      - `human_correction.final_amount`, `human_correction.final_address`
      - `human_correction.reason_code`, `human_correction.reason_desc` (또는 `reason_detail`)
@@ -95,18 +95,12 @@ FE가 로컬에 저장하는 구조와 동일한 필드를 API Body로 보냅니
 4. **감사**  
    - 교정 API 호출 시 **수정자 ID, receiptId, 시각** 등 Audit Log 기록을 권장합니다.
 
-5. **목록 API에서 최종 확정 금액 반영**  
-   - 제출/결과 **목록**의 금액 컬럼은 수정 없으면 OCR 인식값, 검수자가 최종 확정으로 수정했으면 **수정한 금액**이 표시되어야 합니다.  
-   - 상세: [백엔드_요청사항_정리.md §10.5 목록 금액: 최종 확정(교정) 금액 반영](./백엔드_요청사항_정리.md#105-목록-금액-최종-확정교정-금액-반영)  
-   - FE: `GET /api/v1/admin/submissions` 응답의 각 항목에서 `final_amount`(또는 `correctedTotalAmount`)가 있으면 그 값, 없으면 `total_amount` 사용.
-
 ### 3.1 이 레포 구현 요약
 
 | 항목 | 동작 |
 |------|------|
 | submission 존재 확인 | `receipt_id::text = :rid`로 조회, 없으면 **404** |
-| total_amount 업데이트 | `payload.amount`가 숫자로 파싱 가능하면 `submissions.total_amount`를 **최종 확정 금액으로 갱신** (§10.5 방법 A). 목록 API만으로도 수정 금액 표시 가능. |
-| 목록 API 최종 확정 금액 | `GET /api/v1/admin/submissions` 응답 항목에 `total_amount`, `final_amount`, `correctedTotalAmount` 포함. 방법 A 적용으로 교정 시 total_amount가 갱신되므로 세 필드 모두 동일한 값. FE는 `final_amount ?? total_amount` 또는 getDisplayAmount()로 표시. |
+| total_amount 업데이트 | `payload.amount`가 숫자로 파싱 가능하면 `submissions.total_amount` 갱신 |
 | 감사 로그 | `admin_audit_log`에 `action='submission_correction'`, `after_json`에 payload 기록. **INSERT 실패 시** 로그만 남기고 요청은 **200 성공**으로 반환(테이블 없어도 500 아님). |
 | 응답 | `200 OK` + `{"receiptId": "<receipt_id>", "updated": true}` |
 | 예외 | DB 오류 시 `500` + `detail="Database error during correction"`, 기타 예외 시 `detail="Internal server error during correction"`. 서버 로그에 `correction: db error` / `correction: unexpected error` 기록. |
@@ -210,19 +204,32 @@ FE가 로컬에 저장하는 구조와 동일한 필드를 API Body로 보냅니
 
 ---
 
-## 6.2 재처리(로직/정책만 재적용, OCR 미호출)
+## 6.2 재처리 API (로직/정책만 재적용, OCR 미호출)
 
 **정책·로직이 변경된 뒤** 이미 완료된 제출 건에 새 판정을 반영하려면 **재처리** API를 사용합니다. **OCR API를 호출하지 않으므로 유료 비용이 발생하지 않습니다.**
 
+### 추가된 API
+
 | 항목 | 내용 |
 |------|------|
-| **메서드** | `POST` |
-| **경로** | `/api/v1/admin/submissions/{receiptId}/reprocess` |
-| **인증** | Admin API 동일 |
-| **동작** | 저장된 OCR 결과(ReceiptItem)만 사용해, **현재 판정 규칙**으로 submission 상태·금액·실패사유만 재계산. OCR API 미호출. |
-| **응답** | `previous_status`, `new_status`, `total_amount`, `callback_sent` 등. 콜백 재전송 정책이 "자동전송"이면 재처리 후 FE로 콜백 전송. |
+| **메서드·경로** | `POST /api/v1/admin/submissions/{receiptId}/reprocess` |
+| **요청 본문** | **없음** (FE는 본문 없이 POST만 전송). 본문을 기대하는 경우 빈 객체 `{}` 허용 권장. |
+| **역할** | 해당 제출 건에 대해 **판정 로직만 재적용** (정책/로직 변경 반영). **OCR 미호출.** |
+| **인증** | 기존 Admin API와 동일. |
+| **처리** | ReceiptItem의 `amount`·`status`·`error_code`만 사용해 `total_amount`, `total_all_amounts`, `fail_code` 재계산 후 `finalize_submission` 호출. **STAY인 경우** 금액은 **첫 번째 ReceiptItem의 amount만** 사용 ([백엔드_요청사항_정리 §10.6](./백엔드_요청사항_정리.md#106-stay-업종-영수증-1매--거래명세서-1부--금액은-첫-번째-이미지만)). (금액 충족 + PENDING_NEW + 자동처리 → FIT 등 현재 로직 그대로 적용) |
+| **감사** | `audit_trail`에 `REPROCESS(날짜): 정책/로직 반영 재적용(OCR 미호출)` 추가. |
+| **콜백** | 재처리 결과가 **FIT으로 변경된 경우에만** 사용자에게 콜백 URL 자동 전송. **이미 FIT이었던 건**(previous_status === FIT)은 콜백을 다시 보내지 않음. (수동검수(Override) 시 FIT으로 변경된 사용자에게는 FE가 `resend_callback: true`로 이미 콜백 전송 중.) |
+| **응답** | `receiptId`, `previous_status`, `new_status`, `total_amount`, `updated_at`, `callback_sent`. |
 
-관리자 페이지 **증거(영수증) 확인** 화면에 **「재처리」** 버튼을 두고, 클릭 시 위 API를 호출하면 됩니다. 로직/정책 변경 후 해당 건만 골라 재처리할 수 있습니다.
+**BE 구현:** 재처리 완료 후 `previous_status !== 'FIT' && new_status === 'FIT'` 일 때만 콜백 전송. `previous_status === 'FIT'` 이면 콜백 미전송.
+
+### 관리자 페이지 연동
+
+- **증거(영수증) 확인** 화면에 **「재처리」** 버튼 추가. 클릭 시 `POST /api/v1/admin/submissions/{receiptId}/reprocess` 호출(요청 본문 없음).
+- 성공 시 화면 상태/금액/실패사유를 새 결과로 갱신(상세·상태 쿼리 재요청).
+- **400 Bad Request** 시 FE는 응답 본문(예: `detail`)을 토스트에 표시하므로, BE는 400 시 원인(예: 해당 건 재처리 불가 상태)을 JSON으로 내려주면 디버깅에 유리합니다.
+
+로직/정책만 바뀐 경우에는 **재처리** 버튼만으로 비용 없이 자동 반영할 수 있고, OCR을 다시 돌리고 싶을 때만 별도 "OCR 재실행" 같은 유료 플로우를 두면 됩니다.
 
 ---
 

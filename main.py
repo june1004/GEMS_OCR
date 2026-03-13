@@ -5264,9 +5264,11 @@ async def admin_reprocess_submission(
     submission.audit_log = submission.audit_trail
     db.commit()
     db.refresh(submission)
+    new_status = submission.status or ""
+    # 재처리 콜백: FIT으로 변경된 경우에만 전송. 이미 FIT이었던 건은 콜백 미전송 (BE_교정_API_연동_지침 §6.2)
     cb_policy = _normalize_override_callback_policy(getattr(rule_cfg, "override_callback_policy", None))
     callback_sent = False
-    if cb_policy == "AUTO":
+    if cb_policy == "AUTO" and (prev_status or "").strip().upper() != "FIT" and new_status.strip().upper() == "FIT":
         payload = _build_status_payload(submission, item_rows)
         await _send_result_callback(rid, payload, purpose="resend", actor=ctx.actor)
         _audit_log(db, actor=ctx.actor, action="CALLBACK_RESEND", target_type="submission", target_id=rid, meta={"trigger": "reprocess"})
@@ -5284,7 +5286,7 @@ async def admin_reprocess_submission(
     return AdminReprocessResponse(
         receiptId=rid,
         previous_status=prev_status,
-        new_status=submission.status or "",
+        new_status=new_status,
         total_amount=submission.total_amount or 0,
         updated_at=submission.updated_at.isoformat() if submission.updated_at else datetime.utcnow().isoformat(),
         callback_sent=callback_sent,

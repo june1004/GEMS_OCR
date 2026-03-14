@@ -5331,6 +5331,13 @@ async def admin_override_submission(
     if body.override_reward_amount is not None:
         # rewardAmount는 응답 계산 로직이 있으므로, 필요 시 별도 컬럼 도입이 더 안전함.
         pass
+    # Override 시 하위 receipt_items의 status도 동기화해 목록·상세 일치 (백엔드_요청사항_정리 §2.3)
+    new_status = submission.status.strip()
+    for it in db.query(ReceiptItem).filter(ReceiptItem.submission_id == rid).all():
+        it.status = new_status
+        if new_status == "FIT":
+            it.error_code = None
+            it.error_message = None
     db.commit()
     db.refresh(submission)
     rule_cfg = _get_judgment_rule_config(db)

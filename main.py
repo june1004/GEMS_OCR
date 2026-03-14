@@ -4586,27 +4586,27 @@ class AdminRejectReasonItem(BaseModel):
     count: int = Field(..., description="건수")
 
 
-@app.get(
-    "/api/v1/admin/dashboard/reject-reasons",
-    response_model=List[AdminRejectReasonItem],
-    summary="반려 사유별 건수(대시보드 Top N용)",
-    description="fail_reason/global_fail_reason 기준 집계. campaignId, from, to 필터 적용.",
-    tags=["Admin - Submissions"],
-)
-@app.get(
-    "/api/v1/admin/receipts/reject-reasons",
-    response_model=List[AdminRejectReasonItem],
-    summary="반려 사유별 건수(영수증·FE 문서 경로)",
-    tags=["Admin - Submissions"],
-)
-async def admin_dashboard_reject_reasons(
-    campaignId: Optional[int] = Query(None),
-    from_: Optional[str] = Query(None, alias="from"),
-    to: Optional[str] = Query(None),
-    limit: int = Query(10, ge=1, le=50),
-    db: Session = Depends(get_db),
-    ctx: AdminContext = Depends(get_admin_context),
-):
+class AdminRejectReasonStatItem(BaseModel):
+    """주요 반려 사유 API 응답 항목. 대시보드 '주요 반려 사유' 카드용 (백엔드_요청사항_정리 §4)."""
+    reason_code: str = Field(..., description="표준 사유 코드 (예: BIZ_003, ERROR_OCR, IMAGE_BLUR)")
+    reason_label: str = Field(..., description="한글 라벨 (예: 합산 금액 미달, 이미지 흐림)")
+    count: int = Field(..., description="건수")
+
+
+class AdminRejectReasonStatResponse(BaseModel):
+    total: int = 0
+    items: List[AdminRejectReasonStatItem] = Field(default_factory=list)
+
+
+def _query_reject_reasons(
+    db: Session,
+    ctx: AdminContext,
+    campaign_id: Optional[int],
+    from_val: Optional[str],
+    to_val: Optional[str],
+    row_limit: int,
+) -> List[Tuple[str, int]]:
+    """반려 건을 fail_reason 기준 집계해 (reason_text, count) 목록 반환. stats/dashboard 공용."""
     q = db.query(Submission).filter(
         ~Submission.status.in_(["PENDING", "PROCESSING", "VERIFYING", "FIT"]),
     )
@@ -4614,16 +4614,20 @@ async def admin_dashboard_reject_reasons(
         q = q.filter(Submission.campaign_id.in_(ctx.campaign_ids))
     elif not ctx.is_super:
         q = q.filter(Submission.campaign_id == -1)
-    if campaignId is not None:
-        q = q.filter(Submission.campaign_id == campaignId)
-    if from_:
+    if campaign_id is not None:
+        q = q.filter(Submission.campaign_id == campaign_id)
+    if from_val:
         try:
-            q = q.filter(Submission.created_at >= dateutil_parser.parse(from_))
+            q = q.filter(Submission.created_at >= dateutil_parser.parse(from_val))
         except Exception:
             pass
-    if to:
+    if to_val:
         try:
-            q = q.filter(Submission.created_at <= dateutil_parser.parse(to))
+            to_dt = dateutil_parser.parse(to_val)
+            if getattr(to_dt, "hour", 0) == 0 and getattr(to_dt, "minute", 0) == 0:
+                q = q.filter(Submission.created_at < to_dt + timedelta(days=1))
+            else:
+                q = q.filter(Submission.created_at <= to_dt)
         except Exception:
             pass
     reason_col = func.coalesce(Submission.fail_reason, Submission.global_fail_reason, "(기타)")
@@ -4631,10 +4635,74 @@ async def admin_dashboard_reject_reasons(
         q.with_entities(reason_col.label("reason"), func.count(Submission.submission_id))
         .group_by(reason_col)
         .order_by(func.count(Submission.submission_id).desc())
-        .limit(limit)
+        .limit(row_limit)
         .all()
     )
-    return [AdminRejectReasonItem(reason=(r[0] or "(기타)").strip(), count=r[1]) for r in rows]
+    return [((r[0] or "(기타)").strip(), r[1]) for r in rows]
+
+
+def _reject_reasons_to_stat_response(
+    rows: List[Tuple[str, int]], limit: int
+) -> AdminRejectReasonStatResponse:
+    """(reason_text, count) 목록을 reason_code·reason_label로 묶어 Stat 응답으로 변환."""
+    code_agg: Dict[Tuple[str, str], int] = {}
+    for raw, cnt in rows:
+        code, label = _reason_text_to_code_label(raw)
+        key = (code, label)
+        code_agg[key] = code_agg.get(key, 0) + cnt
+    sorted_items = sorted(code_agg.items(), key=lambda x: -x[1])[:limit]
+    items = [
+        AdminRejectReasonStatItem(reason_code=code, reason_label=label, count=count)
+        for (code, label), count in sorted_items
+    ]
+    return AdminRejectReasonStatResponse(total=sum(c for _, c in code_agg.items()), items=items)
+
+
+@app.get(
+    "/api/v1/admin/stats/reject-reasons",
+    response_model=AdminRejectReasonStatResponse,
+    summary="주요 반려 사유 집계 (대시보드용)",
+    description="campaignId, from, to, limit(기본 3). 반려 건을 reason_code·reason_label별 집계. FE는 상위 N건을 '주요 반려 사유' 카드에 표시.",
+    tags=["Admin - Submissions"],
+)
+async def admin_stats_reject_reasons(
+    campaignId: Optional[int] = Query(None),
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = Query(None),
+    limit: int = Query(3, ge=1, le=50),
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    """반려 건을 fail_reason 기준 집계 후 reason_code·reason_label로 매핑해 반환."""
+    rows = _query_reject_reasons(db, ctx, campaignId, from_, to, limit * 3)
+    return _reject_reasons_to_stat_response(rows, limit)
+
+
+@app.get(
+    "/api/v1/admin/dashboard/reject-reasons",
+    summary="반려 사유별 건수(대시보드 Top N용). format=stat 이면 stats/reject-reasons와 동일 형식.",
+    description="fail_reason/global_fail_reason 기준 집계. campaignId, from, to, limit. format=stat 시 reason_code·reason_label·count 반환(404 폴백용).",
+    tags=["Admin - Submissions"],
+)
+@app.get(
+    "/api/v1/admin/receipts/reject-reasons",
+    summary="반려 사유별 건수(영수증·FE 문서 경로). format=stat 이면 stats 형식.",
+    tags=["Admin - Submissions"],
+)
+async def admin_dashboard_reject_reasons(
+    campaignId: Optional[int] = Query(None),
+    from_: Optional[str] = Query(None, alias="from"),
+    to: Optional[str] = Query(None),
+    limit: int = Query(10, ge=1, le=50),
+    format: Optional[str] = Query(None, description="stat 이면 stats/reject-reasons와 동일 응답 형식"),
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    if (format or "").strip().lower() == "stat":
+        rows = _query_reject_reasons(db, ctx, campaignId, from_, to, limit * 3)
+        return _reject_reasons_to_stat_response(rows, limit)
+    rows = _query_reject_reasons(db, ctx, campaignId, from_, to, limit)
+    return [AdminRejectReasonItem(reason=r, count=c) for r, c in rows]
 
 
 class AdminSubmissionDetailResponse(BaseModel):
@@ -6633,6 +6701,36 @@ def _global_fail_reason(code: Optional[str]) -> Optional[str]:
         "ERROR_OCR": "ERROR_OCR (판독 불가)",
     }
     return mapping.get(code, _fail_message(code))
+
+
+# 주요 반려 사유 API: fail_reason(한글/영문) 텍스트 → reason_code, reason_label 매핑 (백엔드_요청사항_정리 §4)
+REJECT_REASON_TO_CODE_LABEL: List[Tuple[str, str, str]] = [
+    ("BIZ_003", "합산 금액 미달", "UNFIT_TOTAL_AMOUNT|BIZ_003|합산 금액 미달"),
+    ("AMOUNT_MISMATCH", "금액 불일치", "금액 불일치|AMOUNT_MISMATCH"),
+    ("ERROR_OCR", "영수증 판독 불가", "ERROR_OCR|OCR_001|판독 불가|영수증 판독"),
+    ("IMAGE_BLUR", "이미지 흐림", "이미지 흐림|IMAGE_BLUR"),
+    ("UNFIT_REGION", "지역 불일치", "UNFIT_REGION|BIZ_004|지역 불일치|지역"),
+    ("UNFIT_DATE", "기간/날짜 불일치", "UNFIT_DATE|BIZ_002|기간|결제일"),
+    ("UNFIT_DUPLICATE", "중복 제출", "UNFIT_DUPLICATE|BIZ_001|중복"),
+    ("DUPLICATE", "중복 제출", "DUPLICATE"),
+    ("UNFIT_CATEGORY", "제외 업종", "UNFIT_CATEGORY|BIZ_008|부적격 업종|제외 업종"),
+    ("BIZ_010", "문서 구성 요건 불충족", "BIZ_010|문서 구성"),
+    ("PENDING_VERIFICATION", "인식 불량·수동 검수", "PENDING_VERIFICATION|OCR_004|인식 불량"),
+    ("PENDING_NEW", "신규 상점 확인 필요", "PENDING_NEW|신규 상점"),
+    ("OUT_OF_PERIOD", "기간 외", "OUT_OF_PERIOD|기간 외"),
+]
+
+
+def _reason_text_to_code_label(reason: str) -> Tuple[str, str]:
+    """DB에 저장된 fail_reason 텍스트를 reason_code, reason_label(한글)로 변환. 주요 반려 사유 API용."""
+    if not reason or not (reason := (reason or "").strip()):
+        return "OTHER", "기타"
+    r = reason.upper()
+    for code, label, patterns in REJECT_REASON_TO_CODE_LABEL:
+        for p in patterns.split("|"):
+            if p.strip().upper() in r or (p.strip() and p.strip() in reason):
+                return code, label
+    return "OTHER", reason[:50] if len(reason) > 50 else reason
 
 
 def _status_for_code(code: Optional[str]) -> str:

@@ -76,8 +76,8 @@
 | **Method** | `GET` |
 | **Path** | `/api/v1/admin/submissions` |
 | **Query** | `status`, `userUuid`, `receiptId`, `dateFrom`, `dateTo`, `limit`(기본 50, 1~200), `offset`(기본 0) |
-| **Response** | `{ "total": number, "items": [ { "receiptId", "userUuid", "project_type", "status", "total_amount", "created_at" } ] }` |
-| **용도** | 검수 대상 목록 조회, receiptId/상태/기간 필터 |
+| **Response** | `{ "total": number, "items": [ { "receiptId", "userUuid", "project_type", "status", "total_amount", **"final_amount"** / **"corrected_total_amount"** (선택, 있으면 검수 큐 목록에서 교정 금액 표시·상세와 일치), "created_at" } ] }` |
+| **용도** | 검수 대상 목록 조회, receiptId/상태/기간 필터. items[]에 final_amount/corrected_total_amount 포함 시 영수증검수큐와 서브미션 상세 간 금액 일치. |
 
 ---
 
@@ -88,7 +88,7 @@
 | **Method** | `GET` |
 | **Path** | `/api/v1/admin/submissions/{receiptId}` |
 | **Response** | `{ "receiptId", "submission": { "submission_id", "user_uuid", "project_type", "campaign_id", "status", "total_amount", "global_fail_reason", "fail_reason", "audit_trail", "created_at", **"user_input_snapshot"** }, "statusPayload": { "submission_id", "project_type", "overall_status", "total_amount", "global_fail_reason", "items": [ { **"item_id"**, "status", "error_code", "error_message", "extracted_data": { "store_name", "amount", "pay_date", "address", "card_num" }, "image_url", **"ocr_raw"** (관리자용만 포함) }, ... ], "audit_trail", "shouldPoll", "reviewRequired", "statusStage", "payloadMeta" } }` |
-| **용도** | 상세 화면의 **FE 입력(user_input_snapshot)** 과 **OCR 인식 결과(statusPayload.items[])** 표시, 장별 비교 |
+| **용도** | 상세 화면의 **FE 입력(user_input_snapshot)** 과 **OCR 인식 결과(statusPayload.items[])** 표시, 장별 비교. **total_amount가 0**이어도 **items[].extracted_data.amount**가 있으면 FE가 합산해 표시·판단에 사용 가능. |
 
 **user_input_snapshot** 구조(방식2 기준):  
 - `items`: 배열. 각 요소는 FE가 제출한 장별 폼 데이터(예: amount, payDate, location, storeName 등).  

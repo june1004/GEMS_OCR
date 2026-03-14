@@ -140,6 +140,13 @@ FE가 로컬에 저장하는 구조와 동일한 필드를 API Body로 보냅니
 - [x] (권장) 교정 API 호출에 대한 Audit Log 기록 — **구현됨** (`admin_audit_log`, 실패 시에도 200 반환)
 - [x] FE 연동: FE는 이미 해당 API를 호출함. BE 배포 및 `CORS_ORIGINS` 설정만 확인하면 됨.
 
+### 5.1 목록 API에서 최종 확정 금액 반영 (영수증검수큐·상세 일치)
+
+| 항목 | 설명 |
+|------|------|
+| **목록 items[]** | 목록 API **items[]**에 **final_amount** / **corrected_total_amount**를 포함하면 **검수 큐(영수증검수큐)** 목록에서도 교정 금액이 그대로 보이므로, 영수증검수큐와 서브미션 상세(검증) 화면 간 금액이 일치합니다. 상세는 [§10.5 목록 금액](./백엔드_요청사항_정리.md#105-목록-금액-최종-확정교정-금액-반영) 참고. |
+| **상세/status API total_amount=0 시** | 상세·status API에서 **total_amount가 0**이어도 **items[].extracted_data.amount**가 있으면 FE가 해당 값을 **합산해 표시·판단에 사용**할 수 있습니다. BE는 가능하면 제출 단위 `total_amount`를 장별 합산으로 채우는 것을 권장하며, 미반영 시 FE는 items 합산으로 폴백합니다. |
+
 ---
 
 ## 6. API 서버(api.nanum.online) 환경 설정

@@ -638,7 +638,7 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,  # 기본 openapi.json 비활성화 → FE/Admin 스키마만 별도 URL로 노출
 )
-# CORS: FE/관리자 페이지 오리진 (관리자 페이지 169.254.240.5:8080 포함)
+# CORS: FE/관리자 페이지 오리진. gems.nanum.online 등 사용 도메인 포함 (로그인 후 401 방지)
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").strip()
 _cors_list = [
     "http://localhost:5173",
@@ -646,6 +646,7 @@ _cors_list = [
     "http://169.254.240.5:8080",
     "https://easy.gwd.go.kr",
     "https://api.nanum.online",
+    "https://gems.nanum.online",
 ]
 if CORS_ORIGINS:
     _cors_list = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]

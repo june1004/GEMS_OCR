@@ -252,6 +252,9 @@ class AdminUser(Base):
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # 운영 컨텍스트: 사용자당 마지막 선택 캠페인 1건 (PUT /admin/context 저장, GET 응답 projectId로 반환)
+    last_selected_campaign_id = Column(Integer, nullable=True)
+    last_selected_project_id = Column(Integer, nullable=True)
 
 
 class PendingSignup(Base):
@@ -2115,10 +2118,15 @@ class MeResponse(BaseModel):
     # 행정구역 통계 고도화: 캠페인 기본 지역(시도) — 타 시도 Dimmed 등 FE용
     adminSidoCode: Optional[str] = None
     adminSidoName: Optional[str] = None
+    # 운영 컨텍스트: PUT /admin/context 로 저장한 마지막 선택 캠페인. FE는 projectId와 선택한 캠페인 일치 시 폼에 반영
+    projectId: Optional[int] = Field(None, description="마지막 선택 캠페인(프로젝트) ID. GET 후 선택 값과 같을 때만 폼 채움")
+    lastSelectedCampaignId: Optional[int] = Field(None, description="projectId와 동일 용도(camelCase)")
+    lastSelectedProjectId: Optional[int] = Field(None, description="마지막 선택 프로젝트 ID")
 
 
 class AdminContextUpdateRequest(BaseModel):
     """PUT /api/v1/admin/context 요청. FE 선택 캠페인 등 컨텍스트 저장용."""
+    projectId: Optional[int] = Field(None, description="선택 캠페인 ID. lastSelectedProjectId와 동일 취급")
     lastSelectedCampaignId: Optional[int] = None
     lastSelectedProjectId: Optional[int] = None
 
@@ -2263,10 +2271,10 @@ async def auth_signup(body: SignupRequest, db: Session = Depends(get_db)):
 )
 async def admin_me(ctx: AdminContext = Depends(get_admin_context), db: Session = Depends(get_db)):
     if ctx.is_super and ctx.admin_user_id is None:
-        return MeResponse(id=0, email=ctx.actor, role="SUPER_ADMIN", isSuper=True, campaignIds=[])
+        return MeResponse(id=0, email=ctx.actor, role="SUPER_ADMIN", isSuper=True, campaignIds=[], projectId=None, lastSelectedCampaignId=None, lastSelectedProjectId=None)
     user = db.query(AdminUser).filter(AdminUser.id == ctx.admin_user_id).first()
     if not user:
-        return MeResponse(id=0, email=ctx.actor, role="SUPER_ADMIN", isSuper=True, campaignIds=[])
+        return MeResponse(id=0, email=ctx.actor, role="SUPER_ADMIN", isSuper=True, campaignIds=[], projectId=None, lastSelectedCampaignId=None, lastSelectedProjectId=None)
     org_name = user.org_name
     org_type = getattr(user, "org_type", None)
     org = None
@@ -2288,6 +2296,8 @@ async def admin_me(ctx: AdminContext = Depends(get_admin_context), db: Session =
                     break
         except Exception:
             pass
+    project_id = getattr(user, "last_selected_project_id", None) or getattr(user, "last_selected_campaign_id", None)
+    campaign_id = getattr(user, "last_selected_campaign_id", None) or project_id
     return MeResponse(
         id=user.id,
         email=user.email,
@@ -2304,6 +2314,9 @@ async def admin_me(ctx: AdminContext = Depends(get_admin_context), db: Session =
         isSuper=ctx.is_super,
         adminSidoCode=admin_sido_code,
         adminSidoName=admin_sido_name,
+        projectId=project_id,
+        lastSelectedCampaignId=campaign_id,
+        lastSelectedProjectId=project_id,
     )
 
 
@@ -2322,7 +2335,7 @@ async def admin_context_get(ctx: AdminContext = Depends(get_admin_context), db: 
     "/api/v1/admin/context",
     response_model=MeResponse,
     summary="담당자 컨텍스트 저장 (FE 호환)",
-    description="FE 선택 캠페인 등 컨텍스트를 받고, 현재 담당자 정보(동일한 MeResponse)를 반환. 405 방지용.",
+    description="FE 선택 캠페인(projectId/campaignId)을 받아 사용자당 1건만 저장. GET 시 projectId로 반환되며, FE는 선택한 캠페인과 일치할 때만 폼에 반영.",
     tags=["Admin - Auth"],
 )
 async def admin_context_put(
@@ -2330,8 +2343,105 @@ async def admin_context_put(
     ctx: AdminContext = Depends(get_admin_context),
     db: Session = Depends(get_db),
 ):
-    # body는 추후 DB/세션 저장 시 사용. 현재는 GET과 동일 응답으로 FE 호환만 제공.
+    if body and ctx.admin_user_id is not None:
+        user = db.query(AdminUser).filter(AdminUser.id == ctx.admin_user_id).first()
+        if user and hasattr(AdminUser, "last_selected_campaign_id"):
+            old_cid = getattr(user, "last_selected_campaign_id", None)
+            old_pid = getattr(user, "last_selected_project_id", None)
+            proj = body.lastSelectedProjectId if body.lastSelectedProjectId is not None else body.projectId
+            camp = body.lastSelectedCampaignId
+            if camp is not None:
+                user.last_selected_campaign_id = int(camp)
+                if proj is None:
+                    user.last_selected_project_id = int(camp)
+            if proj is not None:
+                user.last_selected_project_id = int(proj)
+                if camp is None:
+                    user.last_selected_campaign_id = int(proj)
+            db.commit()
+            db.refresh(user)
+            new_cid = getattr(user, "last_selected_campaign_id", None)
+            new_pid = getattr(user, "last_selected_project_id", None)
+            if (old_cid != new_cid or old_pid != new_pid) and (new_cid is not None or new_pid is not None):
+                _audit_log(
+                    db,
+                    actor=ctx.actor or "",
+                    action="CONTEXT_UPDATE",
+                    target_type="admin_context",
+                    target_id=str(ctx.admin_user_id),
+                    before_json={"projectId": old_pid, "lastSelectedCampaignId": old_cid},
+                    after_json={"projectId": new_pid, "lastSelectedCampaignId": new_cid},
+                    meta={"email": ctx.actor, "admin_user_id": ctx.admin_user_id},
+                )
+                db.commit()
     return await admin_me(ctx, db)
+
+
+class AdminContextHistoryItem(BaseModel):
+    """캠페인 선택(관리 주체·기관명) 변경 이력 한 건. FE '변경 이력 보기'용."""
+    id: int
+    created_at: Optional[str] = None
+    actor: Optional[str] = None
+    projectId: Optional[int] = Field(None, description="변경 후 선택된 프로젝트(캠페인) ID")
+    lastSelectedCampaignId: Optional[int] = Field(None, description="변경 후 선택된 캠페인 ID")
+    before_projectId: Optional[int] = None
+    before_lastSelectedCampaignId: Optional[int] = None
+
+
+class AdminContextHistoryResponse(BaseModel):
+    total: int = 0
+    items: List[AdminContextHistoryItem] = Field(default_factory=list)
+
+
+@app.get(
+    "/api/v1/admin/context/history",
+    response_model=AdminContextHistoryResponse,
+    summary="캠페인 선택 변경 이력 (감사 연동)",
+    description="현재 담당자의 운영 컨텍스트(캠페인/관리 주체·기관명 선택) 변경 이력. FE '변경 이력 보기' 토스트 대신 이 API 연동 시 목록 표시.",
+    tags=["Admin - Auth"],
+)
+async def admin_context_history(
+    limit: int = Query(20, ge=1, le=100),
+    ctx: AdminContext = Depends(get_admin_context),
+    db: Session = Depends(get_db),
+):
+    if ctx.admin_user_id is None:
+        return AdminContextHistoryResponse(total=0, items=[])
+    q = (
+        db.query(AdminAuditLog)
+        .filter(
+            AdminAuditLog.target_type == "admin_context",
+            AdminAuditLog.target_id == str(ctx.admin_user_id),
+            AdminAuditLog.action == "CONTEXT_UPDATE",
+        )
+        .order_by(AdminAuditLog.created_at.desc())
+    )
+    total = q.count()
+    rows = q.limit(limit).all()
+    def _int_or_none(v: Any) -> Optional[int]:
+        if v is None:
+            return None
+        try:
+            return int(v)
+        except (TypeError, ValueError):
+            return None
+
+    items = []
+    for r in rows:
+        after = _dict_for_jsonb(r.after_json) or {}
+        before = _dict_for_jsonb(r.before_json) or {}
+        items.append(
+            AdminContextHistoryItem(
+                id=int(r.id),
+                created_at=r.created_at.isoformat() if r.created_at else None,
+                actor=r.actor,
+                projectId=_int_or_none(after.get("projectId")),
+                lastSelectedCampaignId=_int_or_none(after.get("lastSelectedCampaignId")),
+                before_projectId=_int_or_none(before.get("projectId")),
+                before_lastSelectedCampaignId=_int_or_none(before.get("lastSelectedCampaignId")),
+            )
+        )
+    return AdminContextHistoryResponse(total=total, items=items)
 
 
 def _require_super(ctx: AdminContext) -> None:

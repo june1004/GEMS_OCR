@@ -4014,7 +4014,9 @@ class AdminSubmissionListItem(BaseModel):
     project_type: Optional[str] = None
     projectType: Optional[str] = None  # FE 대시보드 유형별 비중 차트용 (project_type과 동일)
     status: Optional[str] = None
-    total_amount: int = 0
+    total_amount: int = Field(0, description="OCR 인식 금액(또는 방법 A 적용 시 교정 반영된 최종 금액). 서브미션 검증 리스트 금액 표기용.")
+    amount: Optional[int] = Field(None, description="total_amount와 동일. FE 별칭용.")
+    totalAmount: Optional[int] = Field(None, description="total_amount와 동일(camelCase). FE 별칭용.")
     # §10.5 목록 금액: FE는 final_amount ?? total_amount 로 표시. 방법 A 적용 시 교정 저장 시 total_amount 갱신하므로 동일값.
     final_amount: Optional[int] = Field(None, description="최종 확정(교정) 금액. 있으면 목록/집계에 사용, 없으면 total_amount 사용. 방법 A: total_amount와 동일.")
     correctedTotalAmount: Optional[int] = Field(None, description="final_amount와 동일(camelCase). FE getDisplayAmount()용.")
@@ -4251,6 +4253,8 @@ async def admin_list_submissions(
                 projectType=_normalize_project_type_for_response(r.project_type),
                 status=r.status,
                 total_amount=amt,
+                amount=amt,
+                totalAmount=amt,
                 final_amount=amt,
                 correctedTotalAmount=amt,
                 created_at=r.created_at.isoformat() if r.created_at else None,

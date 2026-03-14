@@ -76,8 +76,8 @@
 | **Method** | `GET` |
 | **Path** | `/api/v1/admin/submissions` |
 | **Query** | `status`, `userUuid`, `receiptId`, `dateFrom`, `dateTo`, `limit`(기본 50, 1~200), `offset`(기본 0) |
-| **Response** | `{ "total": number, "items": [ { "receiptId", "userUuid", "project_type", "status", "total_amount", **"final_amount"** / **"corrected_total_amount"** (선택, 있으면 검수 큐 목록에서 교정 금액 표시·상세와 일치), "created_at" } ] }` |
-| **용도** | 검수 대상 목록 조회, receiptId/상태/기간 필터. items[]에 final_amount/corrected_total_amount 포함 시 영수증검수큐와 서브미션 상세 간 금액 일치. |
+| **Response** | `{ "total": number, "items": [ { "receiptId", "userUuid", "project_type", "status", **"total_amount"** (OCR 인식 금액), **"amount"** / **"totalAmount"** (동일 값 별칭), **"final_amount"** / **"correctedTotalAmount"** (교정 시 FE 우선 사용), "created_at" } ] }` |
+| **용도** | 검수 대상 목록 조회, receiptId/상태/기간 필터. 서브미션 검증 리스트 금액 표기: items[]에 OCR 인식 금액(total_amount/amount/totalAmount) 포함. 교정된 건은 FE가 final_amount·correctedTotalAmount 우선 사용. |
 
 ---
 
@@ -116,6 +116,7 @@
 | **Body** | `{ "status": "FIT" | "UNFIT", "reason": "사유 문자열", "override_reward_amount": number (선택), "resend_callback": boolean (기본 false, **검수 완료 시 true 권장**) }` |
 | **Response** | `{ "receiptId", "previous_status", "new_status", "updated_at" }` |
 | **용도** | 담당자가 입력폼·이미지·OCR 확인 후 **최종 판정** 적용. `resend_callback=true` 시 FE 콜백 URL로 결과 즉시 재전송. |
+| **목록 반영** | **적합/부적합으로 검수 저장 시** 반드시 이 **Override API**를 호출해야 DB에 status가 저장됨. 교정 API(PATCH correction)만 호출하면 status는 바뀌지 않음. Override 성공(200) 후 **목록/검수큐 쿼리를 무효화하고 다시 요청**해야 화면에 "적합"/OK가 갱신됨. (BE는 Override 시 DB에 즉시 반영하고, 목록 API는 매 요청마다 DB를 조회함.) |
 
 ---
 

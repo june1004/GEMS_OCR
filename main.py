@@ -4217,6 +4217,7 @@ async def admin_list_submissions(
     submission_ids = [r.submission_id for r in rows]
     first_item_per_sub: Dict[str, ReceiptItem] = {}
     min_confidence_per_sub: Dict[str, Optional[int]] = {}
+    amount_from_items_per_sub: Dict[str, int] = {}  # UNFIT_REGION 등 total_amount 미반영 시 receipt_items 합산으로 표기
     if submission_ids:
         receipt_items = (
             db.query(ReceiptItem)
@@ -4237,6 +4238,17 @@ async def admin_list_submissions(
             if sid not in min_confidence_per_sub and sid in first_item_per_sub:
                 fc = getattr(first_item_per_sub[sid], "confidence_score", None)
                 min_confidence_per_sub[sid] = max(0, min(100, int(fc))) if fc is not None else None
+        # submission.total_amount가 0인 경우(UNFIT_REGION 등)에도 OCR 인식 금액 표기: receipt_items 기준 합산 (§10.5, §10.6 STAY는 첫 장만)
+        sub_to_type: Dict[str, str] = {r.submission_id: (r.project_type or "TOUR") for r in rows}
+        for sid in submission_ids:
+            subs_items = [x for x in receipt_items if x.submission_id == sid]
+            if not subs_items:
+                continue
+            pt = (sub_to_type.get(sid) or "TOUR").strip().upper()
+            if pt == "STAY":
+                amount_from_items_per_sub[sid] = int(subs_items[0].amount or 0)
+            else:
+                amount_from_items_per_sub[sid] = sum(int(x.amount or 0) for x in subs_items)
 
     items = []
     for r in rows:
@@ -4245,6 +4257,8 @@ async def admin_list_submissions(
         conf = min_confidence_per_sub.get(r.submission_id)
         integrity_ok = bool(r.status == "FIT" and not (r.fail_reason or r.global_fail_reason))
         amt = r.total_amount or 0
+        if amt <= 0 and r.submission_id in amount_from_items_per_sub:
+            amt = amount_from_items_per_sub[r.submission_id]
         items.append(
             AdminSubmissionListItem(
                 receiptId=r.submission_id,

@@ -4258,7 +4258,6 @@ async def admin_list_submissions(
         first_item = first_item_per_sub.get(r.submission_id)
         thumb_url = _presigned_get_url_for_key(first_item.image_key) if first_item and (first_item.image_key or "").strip() else None
         conf = min_confidence_per_sub.get(r.submission_id)
-        integrity_ok = bool(r.status == "FIT" and not (r.fail_reason or r.global_fail_reason))
         amt = r.total_amount or 0
         if amt <= 0 and r.submission_id in amount_from_items_per_sub:
             amt = amount_from_items_per_sub[r.submission_id]
@@ -4266,13 +4265,27 @@ async def admin_list_submissions(
         code, label = _reason_text_to_code_label(fail_text or "") if fail_text else ("", "")
         reject_reason_val = fail_text if fail_text else (label if code and code != "OTHER" else None)
         reason_code_val = code if code and code != "OTHER" else None
+        status_val = r.status
+        # §10.3 로직 오류 보정: 소비(TOUR) 50,000원 이상 / 숙박(STAY) 60,000원 이상인데 합산 금액 미달(BIZ_003)로만 부적합된 건은 적합으로 표시
+        min_tour, min_stay = 50000, 60000
+        if status_val and status_val != "FIT" and amt > 0 and (code == "BIZ_003" or (fail_text and ("합산" in fail_text or "금액 미달" in fail_text or "BIZ_003" in (fail_text or "")))):
+            pt = _normalize_project_type_for_response(r.project_type)
+            if pt == "TOUR" and amt >= min_tour:
+                status_val = "FIT"
+                reject_reason_val = None
+                reason_code_val = None
+            elif pt == "STAY" and amt >= min_stay:
+                status_val = "FIT"
+                reject_reason_val = None
+                reason_code_val = None
+        integrity_ok = bool(status_val == "FIT" and not reject_reason_val)
         items.append(
             AdminSubmissionListItem(
                 receiptId=r.submission_id,
                 userUuid=r.user_uuid,
                 project_type=_normalize_project_type_for_response(r.project_type),
                 projectType=_normalize_project_type_for_response(r.project_type),
-                status=r.status,
+                status=status_val,
                 total_amount=amt,
                 amount=amt,
                 totalAmount=amt,
@@ -7472,10 +7485,19 @@ async def analyze_receipt_task(req: CompleteRequest):
         # 4) 부모 상태 업데이트 (§10.3): total_amount = 장별 FIT 합산(API가 내려줄 금액). 한 장이라도 정상이면 FIT.
         total_amount = sum(it.amount or 0 for it in item_rows if it.status == "FIT")
         min_criteria = min_amount_stay if req.type == "STAY" else min_amount_tour
-        # 장별 금액 합산(전체 item 금액 합): 기준 충족 시 "합산 금액 미달"(BIZ_003) 사유 사용 금지.
+        # 장별 금액 합산(전체 item 금액 합): 기준 충족 시 "합산 금액 미달"(BIZ_003) 사유 사용 금지. BIZ_003만 있을 때만 FIT로 올림.
         total_all_amounts = sum(it.amount or 0 for it in item_rows)
         if fail_code == "BIZ_003" and total_all_amounts >= min_criteria:
-            fail_code = "PENDING_NEW" if pending_new_cnt > 0 else ("PENDING_VERIFICATION" if pending_verification_cnt > 0 else None)
+            other_fail = None
+            for it in item_rows:
+                ec = (getattr(it, "error_code", None) or "").strip()
+                if ec and ec not in ("BIZ_003", "PENDING_NEW", "PENDING_VERIFICATION"):
+                    other_fail = ec
+                    break
+            if other_fail:
+                fail_code = other_fail
+            else:
+                fail_code = "PENDING_NEW" if pending_new_cnt > 0 else ("PENDING_VERIFICATION" if pending_verification_cnt > 0 else None)
         # 최대 3장 중 한 장이라도 정상조건 충족(금액 기준 이상)이면 FIT 판정.
         condition_met = fit_cnt >= 1 and total_amount >= min_criteria
         if not condition_met:

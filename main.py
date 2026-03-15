@@ -120,7 +120,16 @@ if RECEIPT_DATA_CUTOFF_UTC is not None:
     logger.info("RECEIPT_DATA_CUTOFF_UTC 적용: %s (이 시각 이후 데이터만 중복 판정)", RECEIPT_DATA_CUTOFF_UTC.isoformat())
 
 # 2. DB 및 S3 클라이언트 초기화
-engine = create_engine(DATABASE_URL)
+# 연결 풀: 대시보드 등 동시 요청 다수 시 QueuePool exhausted 방지 (pool_size + max_overflow > 동시 요청 수)
+_pool_size = int(os.getenv("DB_POOL_SIZE", "10"))
+_pool_overflow = int(os.getenv("DB_POOL_OVERFLOW", "20"))
+engine = create_engine(
+    DATABASE_URL,
+    pool_size=_pool_size,
+    max_overflow=_pool_overflow,
+    pool_pre_ping=True,
+    pool_recycle=300,
+)
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
 
@@ -4035,6 +4044,9 @@ class AdminSubmissionListItem(BaseModel):
     # 부적합(UNFIT/REJECTED) 목록 시 실제 사유 표기용. 최소 하나 포함 권장 (백엔드_요청사항_정리)
     reject_reason: Optional[str] = Field(None, description="부적합 사유 한글 문구. FE 미제공 시 '사유 확인 필요'로 표시")
     reason_code: Optional[str] = Field(None, description="부적합 사유 코드(BIZ_003, UNFIT_REGION 등). FE가 한글로 매핑해 표시 가능")
+    # 콜백 전송 완료·부적합 검수완료(콜백) 표시용 (백엔드_요청사항_정리 MANUAL_UNFIT)
+    callback_sent: Optional[bool] = Field(None, description="콜백 전송 완료 여부. True 시 FE에서 '콜백 전송 완료' 배지 표시")
+    callbackSent: Optional[bool] = Field(None, description="callback_sent와 동일(camelCase). FE 배지 표시용")
 
 
 class AdminSubmissionListResponse(BaseModel):
@@ -4101,6 +4113,13 @@ async def admin_list_submissions(
         # 검수 대기: FE의 statusStage=MANUAL_REVIEW에 대응해 DB의 검수대기 상태 전체 포함 (백엔드_요청사항_정리 §2.3)
         if s == "MANUAL_REVIEW":
             q = q.filter(Submission.status.in_(["MANUAL_REVIEW", "PENDING_VERIFICATION", "PENDING_NEW", "VERIFYING"]))
+        elif s == "MANUAL_UNFIT":
+            # 부적합 검수완료(콜백 전송) 건만: UNFIT 이며 sidecar에 callback_sent 기록된 건
+            q = q.filter(
+                Submission.status == "UNFIT",
+                Submission.submission_sidecar.isnot(None),
+                Submission.submission_sidecar.op("?")("callback_sent"),
+            )
         else:
             q = q.filter(Submission.status == s)
     if cid is not None:
@@ -4286,6 +4305,11 @@ async def admin_list_submissions(
                 status_val = "FIT"
                 reject_reason_val = None
                 reason_code_val = None
+        # 콜백 전송 여부: submission_sidecar에 기록된 값 (Override/재전송 시 저장)
+        sidecar = getattr(r, "submission_sidecar", None)
+        callback_sent_val = isinstance(sidecar, dict) and (sidecar.get("callback_sent") is True or sidecar.get("callback_sent") == True)
+        if (status_val or "").strip().upper() == "UNFIT" and callback_sent_val:
+            status_val = "MANUAL_UNFIT"
         integrity_ok = bool(status_val == "FIT" and not reject_reason_val)
         items.append(
             AdminSubmissionListItem(
@@ -4305,6 +4329,8 @@ async def admin_list_submissions(
                 integrityCheck=integrity_ok,
                 reject_reason=reject_reason_val,
                 reason_code=reason_code_val,
+                callback_sent=callback_sent_val,
+                callbackSent=callback_sent_val,
             )
         )
     return AdminSubmissionListResponse(total=total, items=items, approvedAmountSum=approved_amount_sum)
@@ -5525,6 +5551,14 @@ async def admin_override_submission(
             target_id=rid,
             meta={"trigger": "override"},
         )
+        # 목록 API에서 '콜백 전송 완료' 배지·MANUAL_UNFIT 표시용으로 sidecar에 기록
+        try:
+            sidecar = dict(submission.submission_sidecar) if getattr(submission, "submission_sidecar", None) else {}
+            sidecar["callback_sent"] = True
+            sidecar["callback_sent_at"] = datetime.utcnow().isoformat() + "Z"
+            submission.submission_sidecar = sidecar
+        except Exception:
+            pass
         db.commit()
     return AdminOverrideResponse(
         receiptId=rid,
@@ -5675,6 +5709,13 @@ async def admin_resend_callback(
         target_id=rid,
         meta={"target_url": body.target_url},
     )
+    try:
+        sidecar = dict(submission.submission_sidecar) if getattr(submission, "submission_sidecar", None) else {}
+        sidecar["callback_sent"] = True
+        sidecar["callback_sent_at"] = datetime.utcnow().isoformat() + "Z"
+        submission.submission_sidecar = sidecar
+    except Exception:
+        pass
     db.commit()
     return AdminCallbackResendResponse(receiptId=rid, sent=True)
 

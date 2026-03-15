@@ -4391,8 +4391,10 @@ class AdminDashboardStatsResponse(BaseModel):
     yesterdayCount: int = 0
     pendingCount: int = 0
     approvedAmountSum: int = 0
-    byCategory: Dict[str, int] = Field(default_factory=dict, description="STAY, TOUR 등 유형별 건수")
+    byCategory: Dict[str, int] = Field(default_factory=dict, description="STAY, TOUR 등 유형별 건수(project_type 집계)")
     dailyCounts: List[Dict[str, Any]] = Field(default_factory=list, description="[{ date, count }] 일자별 제출 건수")
+    monthlyCounts: List[Dict[str, Any]] = Field(default_factory=list, description="[{ month, count }] 월별 제출 건수. month=YYYY-MM. 대시보드 월별 막대 차트용")
+    hourlyCounts: List[Dict[str, Any]] = Field(default_factory=list, description="[{ hour, count }] 0~23시 시간대별 건수. 대시보드 히트맵용")
     byStatus: Dict[str, int] = Field(default_factory=dict, description="상태별 건수(FIT, UNFIT, PENDING_VERIFICATION 등). Status Cards·Reason Analysis 도넛용")
     minAmountStay: int = Field(60000, description="캠페인 정책 STAY 최소 금액(원). Policy Chart·정책 대비 달성률용")
     minAmountTour: int = Field(50000, description="캠페인 정책 TOUR 최소 금액(원)")
@@ -4515,6 +4517,39 @@ async def admin_dashboard_stats(
                 daily.append({"date": k, "count": v})
     except Exception:
         pass
+    # 월별 집계 (대시보드_강화_개발_지침 §2.1)
+    monthly: List[Dict[str, Any]] = []
+    try:
+        month_expr = func.date_trunc("month", Submission.created_at)
+        for row in (
+            base_q.with_entities(month_expr.label("m"), func.count(Submission.submission_id))
+            .group_by(month_expr)
+            .order_by(month_expr.asc())
+            .all()
+        ):
+            m = row[0]
+            if m:
+                key = m.strftime("%Y-%m") if hasattr(m, "strftime") else str(m)[:7]
+                monthly.append({"month": key, "count": row[1]})
+    except Exception:
+        pass
+    # 시간대별 집계 0~23 (대시보드_강화_개발_지침 §2.3)
+    hourly: List[Dict[str, Any]] = []
+    try:
+        hour_expr = func.extract("hour", Submission.created_at)
+        for row in (
+            base_q.with_entities(hour_expr.label("h"), func.count(Submission.submission_id))
+            .group_by(hour_expr)
+            .order_by(hour_expr.asc())
+            .all()
+        ):
+            h = int(row[0]) if row[0] is not None else 0
+            hourly.append({"hour": h, "count": row[1]})
+        # 0~23 모두 있도록 빈 시간대는 0으로 채움
+        hour_map = {x["hour"]: x["count"] for x in hourly}
+        hourly = [{"hour": h, "count": hour_map.get(h, 0)} for h in range(24)]
+    except Exception:
+        pass
     by_status: Dict[str, int] = {}
     try:
         for row in (
@@ -4535,6 +4570,8 @@ async def admin_dashboard_stats(
         approvedAmountSum=int(approved_sum),
         byCategory=by_category,
         dailyCounts=daily,
+        monthlyCounts=monthly,
+        hourlyCounts=hourly,
         byStatus=by_status,
         minAmountStay=min_stay,
         minAmountTour=min_tour,

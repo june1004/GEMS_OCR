@@ -117,6 +117,7 @@
 | **Response** | `{ "receiptId", "previous_status", "new_status", "updated_at" }` |
 | **용도** | 담당자가 입력폼·이미지·OCR 확인 후 **최종 판정** 적용. `resend_callback=true` 시 FE 콜백 URL로 결과 즉시 재전송. |
 | **목록 반영** | **적합/부적합으로 검수 저장 시** 반드시 이 **Override API**를 호출해야 DB에 status가 저장됨. 교정 API(PATCH correction)만 호출하면 status는 바뀌지 않음. Override 성공(200) 후 **목록/검수큐 쿼리를 무효화하고 다시 요청**해야 화면에 "적합"/OK가 갱신됨. (BE는 Override 시 DB에 즉시 반영하고, 목록 API는 매 요청마다 DB를 조회함.) |
+| **리스트가 비어 보일 때** | API는 **동일 쿼리**(status=UNFIT&limit=50&offset=0 등)에 대해 total·items를 정상 반환함. 검수(Override) 후 **재요청 시 이전과 같은 status/limit/offset**으로 호출하고, 응답 **items[]** 를 그대로 목록에 표시할 것. 검수한 1건은 해당 status에서 빠지므로 items가 1건 줄어드는 것이 정상. 목록을 비우거나 한 건만 남기지 말 것. |
 
 ---
 

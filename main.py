@@ -4579,6 +4579,74 @@ async def admin_dashboard_stats(
     )
 
 
+# 대시보드 "본 이벤트 전체 현황"용 1회 집계 (백엔드_요청사항_정리 §2.2.1). FE가 제출 API N회 호출 없이 사용.
+class AdminDashboardBreakdownResponse(BaseModel):
+    total: int = Field(0, description="전체 제출 건수")
+    stayTotal: int = Field(0, description="숙박(STAY) 건수")
+    tourTotal: int = Field(0, description="소비(TOUR) 건수")
+    stayFit: int = Field(0, description="숙박 FIT 건수")
+    tourFit: int = Field(0, description="소비 FIT 건수")
+    byStatus: Dict[str, Dict[str, int]] = Field(
+        default_factory=dict,
+        description="상태별 숙박/소비 건수. 예: { FIT: { stay: N, tour: M }, UNFIT: { stay, tour }, ... }",
+    )
+
+
+@app.get(
+    "/api/v1/admin/dashboard/breakdown",
+    response_model=AdminDashboardBreakdownResponse,
+    summary="대시보드 상태별·업종별 집계 (1회 호출)",
+    description="백엔드_요청사항_정리 §2.2.1. 본 이벤트 전체 현황용. FE가 제출 API 페이지네이션 없이 1회 호출로 집계 사용. 404/422 시 FE는 제출 API 폴백(최대 20페이지).",
+    tags=["Admin - Submissions"],
+)
+async def admin_dashboard_breakdown(
+    campaignId: Optional[int] = Query(None),
+    projectId: Optional[int] = Query(None),
+    db: Session = Depends(get_db),
+    ctx: AdminContext = Depends(get_admin_context),
+):
+    q = db.query(Submission)
+    if not ctx.is_super and ctx.campaign_ids:
+        q = q.filter(Submission.campaign_id.in_(ctx.campaign_ids))
+    elif not ctx.is_super:
+        q = q.filter(Submission.campaign_id == -1)
+    if campaignId is not None:
+        q = q.filter(Submission.campaign_id == campaignId)
+    if projectId is not None:
+        q = q.filter(Submission.campaign_id == projectId)
+    total = q.count()
+    stay_total = q.filter(Submission.project_type == "STAY").count()
+    tour_total = q.filter(Submission.project_type == "TOUR").count()
+    stay_fit = q.filter(Submission.status == "FIT", Submission.project_type == "STAY").count()
+    tour_fit = q.filter(Submission.status == "FIT", Submission.project_type == "TOUR").count()
+    by_status: Dict[str, Dict[str, int]] = {}
+    try:
+        for row in (
+            q.with_entities(Submission.status, Submission.project_type, func.count(Submission.submission_id))
+            .group_by(Submission.status, Submission.project_type)
+            .all()
+        ):
+            st = (row[0] or "UNKNOWN").strip() or "UNKNOWN"
+            pt = (row[1] or "").strip().upper() if row[1] else ""
+            if st not in by_status:
+                by_status[st] = {"stay": 0, "tour": 0}
+            cnt = row[2]
+            if pt == "STAY":
+                by_status[st]["stay"] = by_status[st].get("stay", 0) + cnt
+            else:
+                by_status[st]["tour"] = by_status[st].get("tour", 0) + cnt
+    except Exception:
+        pass
+    return AdminDashboardBreakdownResponse(
+        total=total,
+        stayTotal=stay_total,
+        tourTotal=tour_total,
+        stayFit=stay_fit,
+        tourFit=tour_fit,
+        byStatus=by_status,
+    )
+
+
 class AdminAssetizationKpiResponse(BaseModel):
     """데이터 자산화 대시보드 KPI (백엔드_요청사항_정리 §11, 상태별_집계_디자인_지침 §3). 미집계 시 null/0 placeholder."""
     ocrAccuracyRaw: Optional[float] = Field(None, description="OCR 인식 정확도(Raw): 수정 없이 AI 판독값 그대로 승인된 비율")

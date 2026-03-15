@@ -4024,6 +4024,9 @@ class AdminSubmissionListItem(BaseModel):
     thumbnail_url: Optional[str] = Field(None, description="목록·호버 썸네일 미리보기용 presigned URL(첫 장)")
     confidence: Optional[int] = Field(None, description="신뢰도 0~100, 슬라이더 필터용(첫 장 또는 최소값)")
     integrityCheck: Optional[bool] = Field(None, description="무결성 OK 표시용. FIT이고 반려사유 없으면 True")
+    # 부적합(UNFIT/REJECTED) 목록 시 실제 사유 표기용. 최소 하나 포함 권장 (백엔드_요청사항_정리)
+    reject_reason: Optional[str] = Field(None, description="부적합 사유 한글 문구. FE 미제공 시 '사유 확인 필요'로 표시")
+    reason_code: Optional[str] = Field(None, description="부적합 사유 코드(BIZ_003, UNFIT_REGION 등). FE가 한글로 매핑해 표시 가능")
 
 
 class AdminSubmissionListResponse(BaseModel):
@@ -4259,6 +4262,10 @@ async def admin_list_submissions(
         amt = r.total_amount or 0
         if amt <= 0 and r.submission_id in amount_from_items_per_sub:
             amt = amount_from_items_per_sub[r.submission_id]
+        fail_text = (r.fail_reason or r.global_fail_reason or "").strip() or None
+        code, label = _reason_text_to_code_label(fail_text or "") if fail_text else ("", "")
+        reject_reason_val = fail_text if fail_text else (label if code and code != "OTHER" else None)
+        reason_code_val = code if code and code != "OTHER" else None
         items.append(
             AdminSubmissionListItem(
                 receiptId=r.submission_id,
@@ -4275,6 +4282,8 @@ async def admin_list_submissions(
                 thumbnail_url=thumb_url,
                 confidence=conf,
                 integrityCheck=integrity_ok,
+                reject_reason=reject_reason_val,
+                reason_code=reason_code_val,
             )
         )
     return AdminSubmissionListResponse(total=total, items=items, approvedAmountSum=approved_amount_sum)

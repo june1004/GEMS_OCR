@@ -641,18 +641,21 @@ app = FastAPI(
     redoc_url=None,
     openapi_url=None,  # 기본 openapi.json 비활성화 → FE/Admin 스키마만 별도 URL로 노출
 )
-# CORS: FE/관리자 페이지 오리진. gems.nanum.online 등 사용 도메인 포함 (로그인 후 401 방지)
+# CORS: FE/관리자 페이지 오리진. 로컬 개발(localhost:8080 등)·gems.nanum.online 포함 (로그인 후 401·CORS 차단 방지)
 CORS_ORIGINS = os.getenv("CORS_ORIGINS", "").strip()
 _cors_list = [
     "http://localhost:5173",
     "http://localhost:8080",
+    "http://127.0.0.1:8080",
+    "http://127.0.0.1:5173",
     "http://169.254.240.5:8080",
     "https://easy.gwd.go.kr",
     "https://api.nanum.online",
     "https://gems.nanum.online",
 ]
 if CORS_ORIGINS:
-    _cors_list = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
+    extra = [o.strip() for o in CORS_ORIGINS.split(",") if o.strip()]
+    _cors_list = list(dict.fromkeys(_cors_list + extra))
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_cors_list,
@@ -662,14 +665,19 @@ app.add_middleware(
 )
 
 
-# 전역 예외 핸들러: 5xx 시에도 JSONResponse로 반환해 CORS 미들웨어가 적용되도록 (백엔드_요청사항_정리 §13)
+# 전역 예외 핸들러: 5xx 시에도 CORS 헤더를 넣어 브라우저가 응답을 읽을 수 있도록 (백엔드_요청사항_정리 §13)
 @app.exception_handler(Exception)
 async def _global_exception_handler(request: Request, exc: Exception):
     logger.exception("Unhandled exception: %s", exc)
-    return JSONResponse(
+    resp = JSONResponse(
         status_code=500,
         content={"detail": "Internal server error"},
     )
+    origin = (request.headers.get("origin") or "").strip()
+    if origin and origin in _cors_list:
+        resp.headers["Access-Control-Allow-Origin"] = origin
+        resp.headers["Access-Control-Allow-Credentials"] = "true"
+    return resp
 
 
 # Swagger 문서 분리: FE(외부)·Admin(관리자) 구분 노출로 보안 강화

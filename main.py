@@ -2139,6 +2139,11 @@ class MeResponse(BaseModel):
     projectId: Optional[int] = Field(None, description="마지막 선택 캠페인(프로젝트) ID. GET 후 선택 값과 같을 때만 폼 채움")
     lastSelectedCampaignId: Optional[int] = Field(None, description="projectId와 동일 용도(camelCase)")
     lastSelectedProjectId: Optional[int] = Field(None, description="마지막 선택 프로젝트 ID")
+    # 통합운영 리포트·캠페인 컨텍스트: 선택 캠페인 상세(사업명·기간). projectId 있을 때만 채움
+    campaignName: Optional[str] = Field(None, description="선택 캠페인 사업명. 리포트 좌상단 '캠페인 컨텍스트' 사업명용")
+    campaign_name: Optional[str] = Field(None, description="campaignName과 동일(snake_case)")
+    campaignStartDate: Optional[str] = Field(None, description="캠페인 기간 시작(YYYY-MM-DD). 리포트 기간 표시용")
+    campaignEndDate: Optional[str] = Field(None, description="캠페인 기간 종료(YYYY-MM-DD). 리포트 기간 표시용")
 
 
 class AdminContextUpdateRequest(BaseModel):
@@ -2315,6 +2320,25 @@ async def admin_me(ctx: AdminContext = Depends(get_admin_context), db: Session =
             pass
     project_id = getattr(user, "last_selected_project_id", None) or getattr(user, "last_selected_campaign_id", None)
     campaign_id = getattr(user, "last_selected_campaign_id", None) or project_id
+    campaign_name_val: Optional[str] = None
+    campaign_start: Optional[str] = None
+    campaign_end: Optional[str] = None
+    if campaign_id is not None or project_id is not None:
+        cid = int(campaign_id if campaign_id is not None else project_id)
+        if not ctx.is_super and ctx.campaign_ids and cid not in ctx.campaign_ids:
+            pass
+        else:
+            try:
+                rows = _admin_fetch_campaign_rows(db)
+                r = next((x for x in rows if int(x.get("campaign_id")) == cid), None)
+                if r:
+                    campaign_name_val = (r.get("campaign_name") or "").strip() or None
+                    sd = _parse_date_any(r.get("start_date"))
+                    ed = _parse_date_any(r.get("end_date"))
+                    campaign_start = sd.isoformat() if sd else None
+                    campaign_end = ed.isoformat() if ed else None
+            except Exception:
+                pass
     return MeResponse(
         id=user.id,
         email=user.email,
@@ -2334,6 +2358,10 @@ async def admin_me(ctx: AdminContext = Depends(get_admin_context), db: Session =
         projectId=project_id,
         lastSelectedCampaignId=campaign_id,
         lastSelectedProjectId=project_id,
+        campaignName=campaign_name_val,
+        campaign_name=campaign_name_val,
+        campaignStartDate=campaign_start,
+        campaignEndDate=campaign_end,
     )
 
 
